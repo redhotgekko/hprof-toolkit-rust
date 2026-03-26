@@ -1,0 +1,7 @@
+/target
+*.dump
+*.lock
+*.indexes
+.mcp.json
+*indexes/
+.claude/
