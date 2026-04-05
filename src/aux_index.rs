@@ -36,9 +36,8 @@
 use crate::hprof::record::RecordTag;
 use crate::hprof::{HprofError, HprofFile};
 use crate::record_index::entry::{INDEX_ENTRY_SIZE, IndexEntry};
-use crate::vfs::{ByteSource, MMapReader, MMapWriter};
+use crate::vfs::{MMapReader, MMapWriter};
 use std::io::Write;
-use std::path::Path;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -54,37 +53,32 @@ const RECORD_HEADER_SIZE: usize = 9;
 ///
 /// All five index types share the same 16-byte record layout, so a single
 /// generic reader covers them all.
-pub struct AuxIndexReader {
-    data: ByteSource,
+pub struct AuxIndexReader<'a> {
+    data: &'a [u8],
 }
 
-impl AuxIndexReader {
-    /// Open `path` as a read-only memory-mapped auxiliary index.
-    pub fn open(path: &Path) -> Result<Self, HprofError> {
-        let mmap = crate::hprof::map_file(path)?;
-        if mmap.len() % AUX_ENTRY_SIZE != 0 {
+impl<'a> AuxIndexReader<'a> {
+    pub fn from_ref(source: &'a [u8]) -> Result<Self, HprofError> {
+        if !source.len().is_multiple_of(AUX_ENTRY_SIZE) {
             return Err(HprofError::InvalidIndexFile);
         }
-        Ok(Self {
-            data: ByteSource::MMapSource(mmap),
-        })
+        Ok(Self { data: source })
     }
 
-    /// Create a reader from raw bytes.
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, HprofError> {
-        if !bytes.len().is_multiple_of(AUX_ENTRY_SIZE) {
-            return Err(HprofError::InvalidIndexFile);
-        }
-        Ok(Self {
-            data: ByteSource::VecSource(bytes),
-        })
+    /// Construct from a slice that is already known to be a valid index.
+    ///
+    /// The caller must guarantee that `source.len()` is a multiple of
+    /// [`AUX_ENTRY_SIZE`]; this is checked with `debug_assert`.
+    pub(crate) fn from_slice(source: &'a [u8]) -> Self {
+        debug_assert!(source.len().is_multiple_of(AUX_ENTRY_SIZE));
+        Self { data: source }
     }
 
     /// Return the `hprof_offset` stored for `key`, or `None` if not found.
     ///
     /// Uses leftmost binary search on the sorted key field (bytes 0..8).
     pub fn find(&self, key: u64) -> Option<u64> {
-        let data = self.data.as_ref();
+        let data = self.data;
         let n = data.len() / AUX_ENTRY_SIZE;
         let lo = leftmost_search(data, n, key);
         if lo < n && read_u64_le(data, lo * AUX_ENTRY_SIZE) == key {
@@ -98,14 +92,14 @@ impl AuxIndexReader {
     ///
     /// Panics in debug builds if `idx >= self.len()`.
     pub fn entry_at(&self, idx: usize) -> (u64, u64) {
-        let data = self.data.as_ref();
+        let data = self.data;
         let base = idx * AUX_ENTRY_SIZE;
         (read_u64_le(data, base), read_u64_le(data, base + 8))
     }
 
     /// Total number of records in this index.
     pub fn len(&self) -> usize {
-        self.data.as_ref().len() / AUX_ENTRY_SIZE
+        self.data.len() / AUX_ENTRY_SIZE
     }
 
     /// Returns `true` if the index contains no records.
@@ -115,19 +109,19 @@ impl AuxIndexReader {
 }
 
 /// Typed alias for a frame index reader (sorted by `frame_id`).
-pub type FrameIndexReader = AuxIndexReader;
+pub type FrameIndexReader<'a> = AuxIndexReader<'a>;
 
 /// Typed alias for a trace index reader (sorted by `trace_serial`).
-pub type TraceIndexReader = AuxIndexReader;
+pub type TraceIndexReader<'a> = AuxIndexReader<'a>;
 
 /// Typed alias for a start-thread index reader (sorted by `thread_serial`).
-pub type StartThreadIndexReader = AuxIndexReader;
+pub type StartThreadIndexReader<'a> = AuxIndexReader<'a>;
 
 /// Typed alias for an end-thread index reader (sorted by `thread_serial`).
-pub type EndThreadIndexReader = AuxIndexReader;
+pub type EndThreadIndexReader<'a> = AuxIndexReader<'a>;
 
 /// Typed alias for an unload-class index reader (sorted by `class_serial`).
-pub type UnloadClassIndexReader = AuxIndexReader;
+pub type UnloadClassIndexReader<'a> = AuxIndexReader<'a>;
 
 // ── Index builders ────────────────────────────────────────────────────────────
 
@@ -141,11 +135,11 @@ pub type UnloadClassIndexReader = AuxIndexReader;
 ///
 /// Returns the number of entries written.
 pub fn build_frame_index(
-    hprof_source: &impl MMapReader,
+    hprof_source: &[u8],
     record_index_source: &impl MMapReader,
     output: &mut impl MMapWriter,
 ) -> Result<u64, HprofError> {
-    let hprof = HprofFile::from_source(hprof_source.open_mmap()?)?;
+    let hprof = HprofFile::from_ref(hprof_source)?;
     let record_index = record_index_source.open_mmap()?;
     let id_size = hprof.header.id_size as usize;
     let hprof_data = hprof.data();
@@ -178,11 +172,11 @@ pub fn build_frame_index(
 ///
 /// Returns the number of entries written.
 pub fn build_trace_index(
-    hprof_source: &impl MMapReader,
+    hprof_source: &[u8],
     record_index_source: &impl MMapReader,
     output: &mut impl MMapWriter,
 ) -> Result<u64, HprofError> {
-    let hprof = HprofFile::from_source(hprof_source.open_mmap()?)?;
+    let hprof = HprofFile::from_ref(hprof_source)?;
     let record_index = record_index_source.open_mmap()?;
     let hprof_data = hprof.data();
     let tag = u8::from(RecordTag::Trace);
@@ -214,11 +208,11 @@ pub fn build_trace_index(
 ///
 /// Returns the number of entries written.
 pub fn build_start_thread_index(
-    hprof_source: &impl MMapReader,
+    hprof_source: &[u8],
     record_index_source: &impl MMapReader,
     output: &mut impl MMapWriter,
 ) -> Result<u64, HprofError> {
-    let hprof = HprofFile::from_source(hprof_source.open_mmap()?)?;
+    let hprof = HprofFile::from_ref(hprof_source)?;
     let record_index = record_index_source.open_mmap()?;
     let hprof_data = hprof.data();
     let tag = u8::from(RecordTag::StartThread);
@@ -246,11 +240,11 @@ pub fn build_start_thread_index(
 ///
 /// Returns the number of entries written.
 pub fn build_end_thread_index(
-    hprof_source: &impl MMapReader,
+    hprof_source: &[u8],
     record_index_source: &impl MMapReader,
     output: &mut impl MMapWriter,
 ) -> Result<u64, HprofError> {
-    let hprof = HprofFile::from_source(hprof_source.open_mmap()?)?;
+    let hprof = HprofFile::from_ref(hprof_source)?;
     let record_index = record_index_source.open_mmap()?;
     let hprof_data = hprof.data();
     let tag = u8::from(RecordTag::EndThread);
@@ -278,11 +272,11 @@ pub fn build_end_thread_index(
 ///
 /// Returns the number of entries written.
 pub fn build_unload_class_index(
-    hprof_source: &impl MMapReader,
+    hprof_source: &[u8],
     record_index_source: &impl MMapReader,
     output: &mut impl MMapWriter,
 ) -> Result<u64, HprofError> {
-    let hprof = HprofFile::from_source(hprof_source.open_mmap()?)?;
+    let hprof = HprofFile::from_ref(hprof_source)?;
     let record_index = record_index_source.open_mmap()?;
     let hprof_data = hprof.data();
     let tag = u8::from(RecordTag::UnloadClass);

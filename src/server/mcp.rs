@@ -27,6 +27,8 @@
 //! | `gc_roots`          | `type?: string`                |
 //! | `resolve_string`    | `id: string` (hex)             |
 //! | `heap_diff`         | `top_n?: number`               |
+//! | `retained_histogram`| `top_n?: number`               |
+//! | `dominator_info`    | `id: string` (hex)             |
 
 use super::{AppState, parse_hex_id, prim_type_name};
 use crate::heap_parser::SubRecord;
@@ -254,6 +256,33 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
                             }
                         }
                     }
+                },
+                {
+                    "name": "retained_histogram",
+                    "description": "Return the top N objects by retained heap size (the memory freed if that object were collected). Requires the dominator/retained index to have been built.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "top_n": {
+                                "type": "integer",
+                                "description": "Number of objects to return (default 50, max 1000)."
+                            }
+                        }
+                    }
+                },
+                {
+                    "name": "dominator_info",
+                    "description": "Show retained size and immediate dominator for an object, and list the objects it directly dominates (its dominatees). Requires the dominator/retained index.",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["id"],
+                        "properties": {
+                            "id": {
+                                "type": "string",
+                                "description": "Object ID as a hex string (e.g. \"0x1a2b3c\")."
+                            }
+                        }
+                    }
                 }
             ]
         }),
@@ -311,6 +340,8 @@ fn dispatch_tool(state: &AppState, tool_name: &str, args: &Value) -> Result<Stri
         "gc_roots" => tool_gc_roots(state, args),
         "resolve_string" => tool_resolve_string(state, args),
         "heap_diff" => tool_heap_diff(state, args),
+        "retained_histogram" => tool_retained_histogram(state, args),
+        "dominator_info" => tool_dominator_info(state, args),
         other => Ok(format!("Unknown tool: {other}")),
     }
 }
@@ -452,6 +483,21 @@ fn tool_find_object(state: &AppState, args: &Value) -> Result<String, HprofError
     if !refs_to.is_empty() {
         let ids: Vec<_> = refs_to.iter().map(|id| format!("0x{id:x}")).collect();
         out.push_str(&format!("\nReferenced by: {}", ids.join(", ")));
+    }
+    if q.has_retained_heap() {
+        if let Some(retained) = q.retained_size(object_id) {
+            out.push_str(&format!("\nRetained size: {}", format_bytes(retained)));
+        }
+        match q.dominator_of(object_id) {
+            Some(0) => out.push_str("\nDominator: (GC root — virtual root)"),
+            Some(dom_id) => {
+                let dom_type = q
+                    .object_type_name(dom_id)
+                    .unwrap_or_else(|_| "?".to_owned());
+                out.push_str(&format!("\nDominator: 0x{dom_id:x}  {dom_type}"));
+            }
+            None => {}
+        }
     }
     Ok(out)
 }
@@ -726,4 +772,141 @@ fn gc_root_label(rt: GcRootType) -> &'static str {
 
 fn parse_root_type(s: &str) -> Option<GcRootType> {
     super::handlers::parse_root_type(s)
+}
+
+// ── retained_histogram ────────────────────────────────────────────────────────
+
+fn tool_retained_histogram(state: &AppState, args: &Value) -> Result<String, HprofError> {
+    let top_n = args
+        .get("top_n")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50)
+        .min(1000) as usize;
+
+    let q = &state.query;
+    if !q.has_retained_heap() {
+        return Ok(
+            "Retained heap index not available. Run `hprof-toolkit index` to build it.".to_owned(),
+        );
+    }
+
+    let iter = q.iter_retained().ok_or(HprofError::InvalidIndexFile)?;
+    let mut entries: Vec<(u64, u64)> = iter.map(|(id, ret)| (ret, id)).collect();
+    entries.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    let total = entries.len();
+
+    let mut out = format!(
+        "{total} reachable objects with retained size data (showing top {top_n}):\n\n\
+         {:<12} {:>14}  {:<20}  Dominator\n",
+        "Object ID", "Retained", "Type"
+    );
+    out.push_str(&"-".repeat(80));
+    out.push('\n');
+
+    for (retained_bytes, object_id) in entries.iter().take(top_n) {
+        let type_name = q
+            .object_type_name(*object_id)
+            .unwrap_or_else(|_| "?".to_owned());
+        let dom_str = match q.dominator_of(*object_id) {
+            None | Some(0) => "(root)".to_owned(),
+            Some(dom_id) => format!("0x{dom_id:x}"),
+        };
+        out.push_str(&format!(
+            "0x{:<10x} {:>14}  {:<20}  {dom_str}\n",
+            object_id,
+            format_bytes(*retained_bytes),
+            if type_name.len() > 20 {
+                &type_name[..20]
+            } else {
+                &type_name
+            }
+        ));
+    }
+    Ok(out)
+}
+
+// ── dominator_info ────────────────────────────────────────────────────────────
+
+fn tool_dominator_info(state: &AppState, args: &Value) -> Result<String, HprofError> {
+    let id_str = args
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or(HprofError::InvalidIndexFile)?;
+    let object_id = parse_hex_id(id_str).ok_or(HprofError::InvalidIndexFile)?;
+
+    let q = &state.query;
+    if !q.has_retained_heap() {
+        return Ok(
+            "Retained heap index not available. Run `hprof-toolkit index` to build it.".to_owned(),
+        );
+    }
+
+    let type_name = q
+        .object_type_name(object_id)
+        .unwrap_or_else(|_| "?".to_owned());
+
+    let retained = q.retained_size(object_id);
+    let dominator = q.dominator_of(object_id);
+
+    if retained.is_none() && dominator.is_none() {
+        return Ok(format!(
+            "Object 0x{object_id:x} is not in the retained heap index (unreachable or not found)."
+        ));
+    }
+
+    let retained_str = retained
+        .map(format_bytes)
+        .unwrap_or_else(|| "n/a".to_owned());
+
+    let dom_str = match dominator {
+        None => "n/a".to_owned(),
+        Some(0) => "(GC root — virtual root)".to_owned(),
+        Some(dom_id) => {
+            let dom_type = q
+                .object_type_name(dom_id)
+                .unwrap_or_else(|_| "?".to_owned());
+            format!("0x{dom_id:x}  {dom_type}")
+        }
+    };
+
+    // Find objects directly dominated by object_id (dominatees).
+    // We scan the full dominator index for entries whose dominator == object_id.
+    let mut dominatees: Vec<(u64, u64)> = q
+        .iter_retained()
+        .ok_or(HprofError::InvalidIndexFile)?
+        .filter_map(|(child_id, child_ret)| {
+            if q.dominator_of(child_id) == Some(object_id) {
+                Some((child_ret, child_id))
+            } else {
+                None
+            }
+        })
+        .collect();
+    dominatees.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+
+    let mut out = format!(
+        "Object 0x{object_id:x}  {type_name}\n\
+         Retained size: {retained_str}\n\
+         Immediate dominator: {dom_str}\n\
+         Directly dominates: {} object(s)\n",
+        dominatees.len()
+    );
+
+    if !dominatees.is_empty() {
+        out.push_str("\nTop dominatees (by retained size):\n");
+        for (ret, child_id) in dominatees.iter().take(20) {
+            let child_type = q
+                .object_type_name(*child_id)
+                .unwrap_or_else(|_| "?".to_owned());
+            out.push_str(&format!(
+                "  0x{child_id:<10x}  {:>14}  {child_type}\n",
+                format_bytes(*ret)
+            ));
+        }
+        if dominatees.len() > 20 {
+            out.push_str(&format!("  … {} more\n", dominatees.len() - 20));
+        }
+    }
+
+    Ok(out)
 }

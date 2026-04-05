@@ -48,14 +48,15 @@ use crate::aux_query::{
     AuxRecordIndex, Frame, FrameIter, ResolvedFrame, ResolvedThread, StartThread, StartThreadIter,
     Trace, TraceIter,
 };
+use crate::dominator::{DominatorIndex, RetainedIndex};
 use crate::heap_index::sub_record::SubIndexEntry;
 use crate::heap_parser::{ClassDump, InstanceDump, SubIndexIter, SubRecord};
 use crate::heap_query::{HprofIndex, JavaValue, ResolvedField};
-use crate::hprof::HprofError;
+use crate::hprof::{HprofError, HprofHeader};
 use crate::pipeline::IndexPaths;
 use crate::ref_index::RefIndex;
 use crate::root_index::{GcRootType, RootIndexEntry, RootIndexReader, RootIter};
-use crate::vfs::MMapReader;
+use crate::vfs::{ByteSource, MMapReader};
 use std::path::Path;
 
 // ── RootPathResult ────────────────────────────────────────────────────────────
@@ -84,14 +85,22 @@ pub enum RootPathResult {
 /// All data is accessed via memory-mapped files; no dump data is loaded into
 /// process memory.
 pub struct HeapQuery {
-    heap: HprofIndex,
+    hprof_data: ByteSource,
+    hprof_header: HprofHeader,
+    combined_data: ByteSource,
+    utf8_data: ByteSource,
+    lc_data: ByteSource,
     aux: AuxRecordIndex,
-    /// Per-type GC root readers, indexed by [`GcRootType::index()`].
-    roots: [RootIndexReader; 9],
-    /// Back-reference index.
-    refs: RefIndex,
-    /// Per-kind array size indexes, indexed by [`ArrayKind::index()`].
-    array_sizes: [ArraySizeReader; 9],
+    /// Per-type GC root data, indexed by [`GcRootType::index()`].
+    roots: [ByteSource; 9],
+    /// Back-reference index data.
+    refs: ByteSource,
+    /// Per-kind array size index data, indexed by [`ArrayKind::index()`].
+    array_sizes: [ByteSource; 9],
+    /// Dominator tree index data (optional — present only when built).
+    dominator: Option<ByteSource>,
+    /// Retained heap size index data (optional — present only when built).
+    retained: Option<ByteSource>,
 }
 
 impl HeapQuery {
@@ -100,47 +109,151 @@ impl HeapQuery {
     /// All index files must already exist (run [`crate::pipeline::build_all_indexes`]
     /// first).
     pub fn open(hprof_path: &Path, paths: &IndexPaths) -> Result<Self, HprofError> {
-        // PathBuf implements MMapReader (Sized); &Path does not (unsized).
         let hprof_pb = hprof_path.to_path_buf();
+        let hprof_data = hprof_pb.open_mmap()?;
+        let combined_data = paths.object_store.open_mmap()?;
+        let utf8_data = paths.utf8.open_mmap()?;
+        let lc_data = paths.load_class.open_mmap()?;
+        let hprof_header = HprofIndex::from_ref(
+            hprof_data.as_ref(),
+            combined_data.as_ref(),
+            utf8_data.as_ref(),
+            lc_data.as_ref(),
+        )?
+        .hprof_header();
+
+        let roots = [
+            {
+                let s = paths.root_unknown.open_mmap()?;
+                RootIndexReader::from_ref(s.as_ref())?;
+                s
+            },
+            {
+                let s = paths.root_jni_global.open_mmap()?;
+                RootIndexReader::from_ref(s.as_ref())?;
+                s
+            },
+            {
+                let s = paths.root_jni_local.open_mmap()?;
+                RootIndexReader::from_ref(s.as_ref())?;
+                s
+            },
+            {
+                let s = paths.root_java_frame.open_mmap()?;
+                RootIndexReader::from_ref(s.as_ref())?;
+                s
+            },
+            {
+                let s = paths.root_native_stack.open_mmap()?;
+                RootIndexReader::from_ref(s.as_ref())?;
+                s
+            },
+            {
+                let s = paths.root_sticky_class.open_mmap()?;
+                RootIndexReader::from_ref(s.as_ref())?;
+                s
+            },
+            {
+                let s = paths.root_thread_block.open_mmap()?;
+                RootIndexReader::from_ref(s.as_ref())?;
+                s
+            },
+            {
+                let s = paths.root_monitor_used.open_mmap()?;
+                RootIndexReader::from_ref(s.as_ref())?;
+                s
+            },
+            {
+                let s = paths.root_thread_obj.open_mmap()?;
+                RootIndexReader::from_ref(s.as_ref())?;
+                s
+            },
+        ];
+        let refs = {
+            let s = paths.refs.open_mmap()?;
+            RefIndex::from_ref(s.as_ref())?;
+            s
+        };
+        let array_sizes = [
+            {
+                let s = paths.array_size(ArrayKind::Boolean).open_mmap()?;
+                ArraySizeReader::from_ref(s.as_ref())?;
+                s
+            },
+            {
+                let s = paths.array_size(ArrayKind::Char).open_mmap()?;
+                ArraySizeReader::from_ref(s.as_ref())?;
+                s
+            },
+            {
+                let s = paths.array_size(ArrayKind::Float).open_mmap()?;
+                ArraySizeReader::from_ref(s.as_ref())?;
+                s
+            },
+            {
+                let s = paths.array_size(ArrayKind::Double).open_mmap()?;
+                ArraySizeReader::from_ref(s.as_ref())?;
+                s
+            },
+            {
+                let s = paths.array_size(ArrayKind::Byte).open_mmap()?;
+                ArraySizeReader::from_ref(s.as_ref())?;
+                s
+            },
+            {
+                let s = paths.array_size(ArrayKind::Short).open_mmap()?;
+                ArraySizeReader::from_ref(s.as_ref())?;
+                s
+            },
+            {
+                let s = paths.array_size(ArrayKind::Int).open_mmap()?;
+                ArraySizeReader::from_ref(s.as_ref())?;
+                s
+            },
+            {
+                let s = paths.array_size(ArrayKind::Long).open_mmap()?;
+                ArraySizeReader::from_ref(s.as_ref())?;
+                s
+            },
+            {
+                let s = paths.array_size(ArrayKind::Object).open_mmap()?;
+                ArraySizeReader::from_ref(s.as_ref())?;
+                s
+            },
+        ];
+
         Ok(Self {
-            heap: HprofIndex::open(
-                &hprof_pb,
-                &paths.object_store,
-                &paths.utf8,
-                &paths.load_class,
-            )?,
+            hprof_data,
+            hprof_header,
+            combined_data,
+            utf8_data,
+            lc_data,
             aux: AuxRecordIndex::open(
-                &hprof_pb,
-                &paths.frames,
-                &paths.traces,
-                &paths.start_threads,
-                &paths.end_threads,
-                &paths.unload_classes,
-                &paths.utf8,
+                hprof_pb.open_mmap()?,
+                paths.frames.open_mmap()?,
+                paths.traces.open_mmap()?,
+                paths.start_threads.open_mmap()?,
+                paths.end_threads.open_mmap()?,
+                paths.unload_classes.open_mmap()?,
+                paths.utf8.open_mmap()?,
             )?,
-            roots: [
-                RootIndexReader::open(&paths.root_unknown)?,
-                RootIndexReader::open(&paths.root_jni_global)?,
-                RootIndexReader::open(&paths.root_jni_local)?,
-                RootIndexReader::open(&paths.root_java_frame)?,
-                RootIndexReader::open(&paths.root_native_stack)?,
-                RootIndexReader::open(&paths.root_sticky_class)?,
-                RootIndexReader::open(&paths.root_thread_block)?,
-                RootIndexReader::open(&paths.root_monitor_used)?,
-                RootIndexReader::open(&paths.root_thread_obj)?,
-            ],
-            refs: RefIndex::open(&paths.refs)?,
-            array_sizes: [
-                ArraySizeReader::open(&paths.array_size(ArrayKind::Boolean))?,
-                ArraySizeReader::open(&paths.array_size(ArrayKind::Char))?,
-                ArraySizeReader::open(&paths.array_size(ArrayKind::Float))?,
-                ArraySizeReader::open(&paths.array_size(ArrayKind::Double))?,
-                ArraySizeReader::open(&paths.array_size(ArrayKind::Byte))?,
-                ArraySizeReader::open(&paths.array_size(ArrayKind::Short))?,
-                ArraySizeReader::open(&paths.array_size(ArrayKind::Int))?,
-                ArraySizeReader::open(&paths.array_size(ArrayKind::Long))?,
-                ArraySizeReader::open(&paths.array_size(ArrayKind::Object))?,
-            ],
+            roots,
+            refs,
+            array_sizes,
+            dominator: if paths.dominators.exists() {
+                let src = paths.dominators.open_mmap()?;
+                DominatorIndex::from_ref(src.as_ref())?;
+                Some(src)
+            } else {
+                None
+            },
+            retained: if paths.retained.exists() {
+                let src = paths.retained.open_mmap()?;
+                RetainedIndex::from_ref(src.as_ref())?;
+                Some(src)
+            } else {
+                None
+            },
         })
     }
 
@@ -154,97 +267,140 @@ impl HeapQuery {
     /// (boolean, char, float, double, byte, short, int, long, object).
     #[allow(clippy::too_many_arguments)]
     pub fn from_sources(
-        hprof_source: &impl MMapReader,
-        combined_source: &impl MMapReader,
-        utf8_source: &impl MMapReader,
-        lc_source: &impl MMapReader,
-        frame_source: &impl MMapReader,
-        trace_source: &impl MMapReader,
-        start_thread_source: &impl MMapReader,
-        end_thread_source: &impl MMapReader,
-        unload_class_source: &impl MMapReader,
-        refs_source: &impl MMapReader,
-        root_sources: [&dyn MMapReader; 9],
-        array_sources: [&dyn MMapReader; 9],
+        hprof_source: &[u8],
+        combined_source: &[u8],
+        utf8_source: &[u8],
+        lc_source: &[u8],
+        frame_source: &[u8],
+        trace_source: &[u8],
+        start_thread_source: &[u8],
+        end_thread_source: &[u8],
+        unload_class_source: &[u8],
+        refs_source: &[u8],
+        root_sources: [&[u8]; 9],
+        array_sources: [&[u8]; 9],
     ) -> Result<Self, HprofError> {
-        let root_bytes: Result<Vec<Vec<u8>>, HprofError> = root_sources
-            .iter()
-            .map(|r| {
-                r.open_mmap()
-                    .map(|bs| bs.as_ref().to_vec())
-                    .map_err(HprofError::from)
-            })
-            .collect();
-        let root_bytes = root_bytes?;
-        let array_bytes: Result<Vec<Vec<u8>>, HprofError> = array_sources
-            .iter()
-            .map(|r| {
-                r.open_mmap()
-                    .map(|bs| bs.as_ref().to_vec())
-                    .map_err(HprofError::from)
-            })
-            .collect();
-        let array_bytes = array_bytes?;
+        let hprof_data = ByteSource::from(hprof_source.to_vec());
+        let combined_data = ByteSource::from(combined_source.to_vec());
+        let utf8_data = ByteSource::from(utf8_source.to_vec());
+        let lc_data = ByteSource::from(lc_source.to_vec());
+        let hprof_header = HprofIndex::from_ref(
+            hprof_data.as_ref(),
+            combined_data.as_ref(),
+            utf8_data.as_ref(),
+            lc_data.as_ref(),
+        )?
+        .hprof_header();
+
+        let make_root = |s: &[u8]| -> Result<ByteSource, HprofError> {
+            RootIndexReader::from_ref(s)?;
+            Ok(ByteSource::from(s.to_vec()))
+        };
+        let make_array = |s: &[u8]| -> Result<ByteSource, HprofError> {
+            ArraySizeReader::from_ref(s)?;
+            Ok(ByteSource::from(s.to_vec()))
+        };
+        let refs = {
+            RefIndex::from_ref(refs_source)?;
+            ByteSource::from(refs_source.to_vec())
+        };
+
         Ok(Self {
-            heap: HprofIndex::open(hprof_source, combined_source, utf8_source, lc_source)?,
+            hprof_data,
+            hprof_header,
+            combined_data,
+            utf8_data,
+            lc_data,
             aux: AuxRecordIndex::open(
-                hprof_source,
-                frame_source,
-                trace_source,
-                start_thread_source,
-                end_thread_source,
-                unload_class_source,
-                utf8_source,
+                ByteSource::from(hprof_source.to_vec()),
+                ByteSource::from(frame_source.to_vec()),
+                ByteSource::from(trace_source.to_vec()),
+                ByteSource::from(start_thread_source.to_vec()),
+                ByteSource::from(end_thread_source.to_vec()),
+                ByteSource::from(unload_class_source.to_vec()),
+                ByteSource::from(utf8_source.to_vec()),
             )?,
             roots: [
-                RootIndexReader::from_bytes(root_bytes[0].clone())?,
-                RootIndexReader::from_bytes(root_bytes[1].clone())?,
-                RootIndexReader::from_bytes(root_bytes[2].clone())?,
-                RootIndexReader::from_bytes(root_bytes[3].clone())?,
-                RootIndexReader::from_bytes(root_bytes[4].clone())?,
-                RootIndexReader::from_bytes(root_bytes[5].clone())?,
-                RootIndexReader::from_bytes(root_bytes[6].clone())?,
-                RootIndexReader::from_bytes(root_bytes[7].clone())?,
-                RootIndexReader::from_bytes(root_bytes[8].clone())?,
+                make_root(root_sources[0])?,
+                make_root(root_sources[1])?,
+                make_root(root_sources[2])?,
+                make_root(root_sources[3])?,
+                make_root(root_sources[4])?,
+                make_root(root_sources[5])?,
+                make_root(root_sources[6])?,
+                make_root(root_sources[7])?,
+                make_root(root_sources[8])?,
             ],
-            refs: RefIndex::from_bytes(refs_source.open_mmap()?.as_ref().to_vec())?,
+            refs,
             array_sizes: [
-                ArraySizeReader::from_bytes(array_bytes[0].clone())?,
-                ArraySizeReader::from_bytes(array_bytes[1].clone())?,
-                ArraySizeReader::from_bytes(array_bytes[2].clone())?,
-                ArraySizeReader::from_bytes(array_bytes[3].clone())?,
-                ArraySizeReader::from_bytes(array_bytes[4].clone())?,
-                ArraySizeReader::from_bytes(array_bytes[5].clone())?,
-                ArraySizeReader::from_bytes(array_bytes[6].clone())?,
-                ArraySizeReader::from_bytes(array_bytes[7].clone())?,
-                ArraySizeReader::from_bytes(array_bytes[8].clone())?,
+                make_array(array_sources[0])?,
+                make_array(array_sources[1])?,
+                make_array(array_sources[2])?,
+                make_array(array_sources[3])?,
+                make_array(array_sources[4])?,
+                make_array(array_sources[5])?,
+                make_array(array_sources[6])?,
+                make_array(array_sources[7])?,
+                make_array(array_sources[8])?,
             ],
+            dominator: None,
+            retained: None,
         })
+    }
+
+    // ── Private reader helpers ────────────────────────────────────────────────
+
+    fn hprof_index(&self) -> HprofIndex<'_> {
+        HprofIndex::from_slice(
+            self.hprof_data.as_ref(),
+            self.combined_data.as_ref(),
+            self.utf8_data.as_ref(),
+            self.lc_data.as_ref(),
+            self.hprof_header.clone(),
+        )
+    }
+
+    fn root_reader(&self, rt: GcRootType) -> RootIndexReader<'_> {
+        RootIndexReader::from_slice(self.roots[rt.index()].as_ref())
+    }
+
+    fn ref_index(&self) -> RefIndex<'_> {
+        RefIndex::from_slice(self.refs.as_ref())
+    }
+
+    fn array_size_reader(&self, kind: ArrayKind) -> ArraySizeReader<'_> {
+        ArraySizeReader::from_slice(self.array_sizes[kind.index()].as_ref())
+    }
+
+    fn retained_index(&self) -> Option<RetainedIndex<'_>> {
+        self.retained
+            .as_ref()
+            .map(|src| RetainedIndex::from_slice(src.as_ref()))
     }
 
     // ── Basic accessors ───────────────────────────────────────────────────────
 
     /// hprof identifier size in bytes (4 or 8).
     pub fn id_size(&self) -> u32 {
-        self.heap.id_size()
+        self.hprof_index().id_size()
     }
 
     /// Total number of sub-records in the combined index (classes, instances,
     /// arrays, and GC roots).
     pub fn object_count(&self) -> usize {
-        self.heap.object_count()
+        self.hprof_index().object_count()
     }
 
     // ── Array size indexes ────────────────────────────────────────────────────
 
     /// Iterate arrays of `kind` in descending byte-size order (largest first).
     pub fn iter_arrays_by_size(&self, kind: ArrayKind) -> ArraySizeIter<'_> {
-        self.array_sizes[kind.index()].iter()
+        self.array_size_reader(kind).iter()
     }
 
     /// Total number of arrays indexed for `kind`.
     pub fn array_count(&self, kind: ArrayKind) -> usize {
-        self.array_sizes[kind.index()].len()
+        self.array_size_reader(kind).len()
     }
 
     // ── Object lookup by ID ───────────────────────────────────────────────────
@@ -253,17 +409,17 @@ impl HeapQuery {
     ///
     /// Returns `None` when the ID is not present. O(log n) binary search.
     pub fn find(&self, object_id: u64) -> Result<Option<SubRecord<'_>>, HprofError> {
-        self.heap.find_object(object_id)
+        self.hprof_index().find_object(object_id)
     }
 
     /// Find a `CLASS_DUMP` sub-record by class ID.
     pub fn find_class(&self, class_id: u64) -> Result<Option<SubRecord<'_>>, HprofError> {
-        self.heap.find_class_dump(class_id)
+        self.hprof_index().find_class_dump(class_id)
     }
 
     /// Find an `INSTANCE_DUMP` sub-record by object ID.
     pub fn find_instance(&self, object_id: u64) -> Result<Option<SubRecord<'_>>, HprofError> {
-        self.heap.find_instance(object_id)
+        self.hprof_index().find_instance(object_id)
     }
 
     // ── Sequential iteration ──────────────────────────────────────────────────
@@ -286,8 +442,8 @@ impl HeapQuery {
     /// ```
     pub fn iter_objects(&self) -> ObjectIter<'_> {
         ObjectIter {
+            inner: SubIndexIter::new(self.combined_data.as_ref()),
             query: self,
-            inner: self.heap.iter_entries(),
         }
     }
 
@@ -298,7 +454,7 @@ impl HeapQuery {
     /// the lightweight `(tag, object_id, position)` tuple and can choose to
     /// parse selectively with [`Self::parse_entry`].
     pub fn iter_entries(&self) -> SubIndexIter<'_> {
-        self.heap.iter_entries()
+        SubIndexIter::new(self.combined_data.as_ref())
     }
 
     /// Parse the sub-record described by `entry` directly from the hprof mmap.
@@ -306,7 +462,7 @@ impl HeapQuery {
     /// Use this when you already hold a [`SubIndexEntry`] (e.g. from iterating
     /// via [`Self::iter_entries`]) and want to avoid a redundant binary search.
     pub fn parse_entry<'a>(&'a self, entry: &SubIndexEntry) -> Result<SubRecord<'a>, HprofError> {
-        self.heap.parse_entry(entry)
+        self.hprof_index().parse_entry(entry)
     }
 
     // ── Parallel iteration ────────────────────────────────────────────────────
@@ -330,10 +486,10 @@ impl HeapQuery {
         F: for<'a> Fn(SubRecord<'a>) -> Result<(), HprofError> + Send + Sync,
     {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        (0..self.heap.object_count())
+        (0..self.hprof_index().object_count())
             .into_par_iter()
             .try_for_each(|i| {
-                if let Some(record) = self.heap.parse_at(i)? {
+                if let Some(record) = self.hprof_index().parse_at(i)? {
                     f(record)
                 } else {
                     Ok(())
@@ -477,7 +633,7 @@ impl HeapQuery {
 
     /// Look up the UTF-8 string for `name_id`.
     pub fn lookup_name(&self, name_id: u64) -> Result<Option<String>, HprofError> {
-        self.heap.lookup_name(name_id)
+        self.hprof_index().lookup_name(name_id)
     }
 
     /// Find a class by its dot-notation name (e.g. `"java.lang.String"`).
@@ -487,18 +643,18 @@ impl HeapQuery {
     /// index linearly (O(n_classes)), so call this once and then filter
     /// instance records by the returned `class_id`.
     pub fn find_class_by_name(&self, name: &str) -> Result<Option<u64>, HprofError> {
-        self.heap.find_class_by_name(name)
+        self.hprof_index().find_class_by_name(name)
     }
 
     /// Return the dot-notation class name for `class_id`
     /// (e.g. `"java.lang.String"`).
     pub fn class_name(&self, class_id: u64) -> Result<Option<String>, HprofError> {
-        self.heap.class_name(class_id)
+        self.hprof_index().class_name(class_id)
     }
 
     /// Resolve the runtime type name of the object at `object_id`.
     pub fn object_type_name(&self, object_id: u64) -> Result<String, HprofError> {
-        self.heap.object_type_name(object_id)
+        self.hprof_index().object_type_name(object_id)
     }
 
     // ── Field resolution ──────────────────────────────────────────────────────
@@ -509,7 +665,7 @@ impl HeapQuery {
         &self,
         instance: &InstanceDump<'_>,
     ) -> Result<Vec<ResolvedField>, HprofError> {
-        self.heap.instance_fields(instance)
+        self.hprof_index().instance_fields(instance)
     }
 
     /// Attempt to resolve `object_id` as a primitive Java wrapper value.
@@ -518,7 +674,7 @@ impl HeapQuery {
     /// `Byte`, `Boolean`, and `Character`.  Anything else returns
     /// [`JavaValue::Object`].
     pub fn resolve_value(&self, object_id: u64) -> Result<JavaValue, HprofError> {
-        self.heap.resolve_value(object_id)
+        self.hprof_index().resolve_value(object_id)
     }
 
     // ── Auxiliary record lookup ───────────────────────────────────────────────
@@ -587,27 +743,27 @@ impl HeapQuery {
     /// Returns `Some(entry)` if `object_id` appears as a root of that type,
     /// `None` otherwise.  O(log n) binary search.
     pub fn find_root(&self, object_id: u64, root_type: GcRootType) -> Option<RootIndexEntry> {
-        self.roots[root_type.index()].find(object_id)
+        self.root_reader(root_type).find(object_id)
     }
 
     /// Iterate all root entries for the given `root_type` in ascending
     /// `object_id` order.
     pub fn iter_roots(&self, root_type: GcRootType) -> RootIter<'_> {
-        self.roots[root_type.index()].iter()
+        self.root_reader(root_type).iter()
     }
 
     /// Returns `true` if `object_id` appears in any of the nine GC root indexes.
     pub fn is_gc_root(&self, object_id: u64) -> bool {
         GcRootType::ALL
             .iter()
-            .any(|&rt| self.roots[rt.index()].find(object_id).is_some())
+            .any(|&rt| self.root_reader(rt).find(object_id).is_some())
     }
 
     /// Return all root types for which `object_id` has a root entry.
     pub fn root_types_of(&self, object_id: u64) -> Vec<GcRootType> {
         GcRootType::ALL
             .iter()
-            .filter(|&&rt| self.roots[rt.index()].find(object_id).is_some())
+            .filter(|&&rt| self.root_reader(rt).find(object_id).is_some())
             .copied()
             .collect()
     }
@@ -619,7 +775,7 @@ impl HeapQuery {
     /// Results are bounded by [`crate::ref_index::MAX_BACK_REFS`].  Uses the
     /// pre-built reference index for O(log n) lookup.
     pub fn refs_to(&self, object_id: u64) -> Vec<u64> {
-        self.refs.find(object_id)
+        self.ref_index().find(object_id)
     }
 
     /// Walk backwards through the reference graph from `object_id` to find
@@ -684,7 +840,57 @@ impl HeapQuery {
 
     /// Total number of reference records in the reference index.
     pub fn ref_count(&self) -> usize {
-        self.refs.len()
+        self.ref_index().len()
+    }
+
+    // ── Retained heap / dominator tree ────────────────────────────────────────
+
+    /// Returns `true` if the dominator tree and retained heap size indexes are
+    /// available (i.e. were built by the indexing pipeline).
+    pub fn has_retained_heap(&self) -> bool {
+        self.retained.is_some() && self.dominator.is_some()
+    }
+
+    /// Return the retained heap size in bytes for `object_id`.
+    ///
+    /// The retained size is the total memory that would be freed if this object
+    /// were garbage-collected — i.e. the shallow size of this object plus the
+    /// retained sizes of all objects it exclusively dominates.
+    ///
+    /// Returns `None` when:
+    /// * The retained heap index was not built (run the indexing pipeline).
+    /// * `object_id` is not a live (reachable) heap object.
+    pub fn retained_size(&self, object_id: u64) -> Option<u64> {
+        self.retained_index()?.find(object_id)
+    }
+
+    /// Return the `object_id` of the immediate dominator of `object_id`.
+    ///
+    /// Object A dominates object B if every path from any GC root to B passes
+    /// through A.  The immediate dominator is the closest such A.
+    ///
+    /// Returns [`crate::dominator::VIRTUAL_ROOT_ID`] (`0`) when `object_id` is
+    /// itself a GC root (dominated only by the synthetic virtual root).
+    ///
+    /// Returns `None` when:
+    /// * The dominator index was not built.
+    /// * `object_id` is not a live (reachable) heap object.
+    fn dominator_index(&self) -> Option<DominatorIndex<'_>> {
+        self.dominator
+            .as_ref()
+            .map(|src| DominatorIndex::from_slice(src.as_ref()))
+    }
+
+    pub fn dominator_of(&self, object_id: u64) -> Option<u64> {
+        self.dominator_index()?.find(object_id)
+    }
+
+    /// Iterate all `(object_id, retained_bytes)` pairs from the retained heap
+    /// index in ascending `object_id` order.
+    ///
+    /// Returns `None` when the retained heap index was not built.
+    pub fn iter_retained(&self) -> Option<crate::dominator::RetainedIter<'_>> {
+        self.retained_index().map(|r| r.iter())
     }
 
     // ── Object resolution ─────────────────────────────────────────────────────
@@ -729,7 +935,7 @@ impl<'a> Iterator for ObjectIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let entry = self.inner.next()?;
-        Some(self.query.heap.parse_entry(&entry))
+        Some(self.query.hprof_index().parse_entry(&entry))
     }
 }
 
@@ -750,7 +956,7 @@ mod tests {
     use crate::object_store::combine_sort_and_split;
     use crate::record_index::index_hprof;
     use crate::ref_index::build_reference_index;
-    use crate::vfs::{MMapReader, SubIndexDir};
+    use crate::vfs::SubIndexDir;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     // ── Test hprof builder ────────────────────────────────────────────────────
@@ -943,27 +1149,10 @@ mod tests {
             &et,
             &uc,
             &refs,
+            [&r0, &r1, &r2, &r3, &r4, &r5, &r6, &r7, &r8],
             [
-                &r0 as &dyn MMapReader,
-                &r1,
-                &r2,
-                &r3,
-                &r4,
-                &r5,
-                &r6,
-                &r7,
-                &r8,
-            ],
-            [
-                &arrays[0] as &dyn MMapReader,
-                &arrays[1],
-                &arrays[2],
-                &arrays[3],
-                &arrays[4],
-                &arrays[5],
-                &arrays[6],
-                &arrays[7],
-                &arrays[8],
+                &arrays[0], &arrays[1], &arrays[2], &arrays[3], &arrays[4], &arrays[5], &arrays[6],
+                &arrays[7], &arrays[8],
             ],
         )
         .unwrap()

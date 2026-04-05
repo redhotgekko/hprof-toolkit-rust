@@ -31,11 +31,13 @@ pub mod resolve;
 pub use name_index::{LoadClassReader, Utf8IndexReader};
 pub use resolve::{JavaValue, ResolvedField};
 
-use crate::heap_index::sub_record::{TAG_CLASS_DUMP, TAG_INSTANCE_DUMP, TAG_PRIM_ARRAY_DUMP};
+use crate::heap_index::sub_record::{
+    SUB_INDEX_ENTRY_SIZE, TAG_CLASS_DUMP, TAG_INSTANCE_DUMP, TAG_PRIM_ARRAY_DUMP,
+};
 use crate::heap_parser::record::FieldValue;
 use crate::heap_parser::{InstanceFieldDescriptor, SubIndexReader, SubRecord, parse_sub_record};
-use crate::hprof::{HprofError, HprofFile};
-use crate::vfs::{MMapReader, MMapWriter};
+use crate::hprof::{HprofError, HprofFile, HprofHeader};
+use crate::vfs::MMapWriter;
 use name_index::{build_load_class_index, build_utf8_index};
 use resolve::{decode_char_array, decode_string_bytes, read_field_value};
 
@@ -48,16 +50,15 @@ use resolve::{decode_char_array, decode_string_bytes, read_field_value};
 ///
 /// Returns `(utf8_count, load_class_count)`.
 pub fn build_name_indexes(
-    hprof_source: &impl MMapReader,
-    record_index_source: &impl MMapReader,
+    hprof_source: &[u8],
+    record_index_source: &[u8],
     utf8_path: &mut impl MMapWriter,
     load_class_path: &mut impl MMapWriter,
 ) -> Result<(u64, u64), HprofError> {
-    let hprof = HprofFile::from_source(hprof_source.open_mmap()?)?;
-    let record_index_mmap = record_index_source.open_mmap()?;
+    let hprof = HprofFile::from_ref(hprof_source)?;
 
-    let utf8_count = build_utf8_index(&hprof, record_index_mmap.as_ref(), utf8_path)?;
-    let lc_count = build_load_class_index(&hprof, record_index_mmap.as_ref(), load_class_path)?;
+    let utf8_count = build_utf8_index(&hprof, record_index_source, utf8_path)?;
+    let lc_count = build_load_class_index(&hprof, record_index_source, load_class_path)?;
 
     Ok((utf8_count, lc_count))
 }
@@ -66,65 +67,112 @@ pub fn build_name_indexes(
 
 /// High-level analysis API over a heap dump and its index files.
 ///
-/// All index files are kept as memory maps; no data is copied into
-/// process-owned structures.  Each method performs O(log n) binary searches
-/// against the sorted index files.
-pub struct HprofIndex {
-    hprof: HprofFile,
-    /// Object store (combined + sorted sub-record index).
-    combined: SubIndexReader,
-    utf8: Utf8IndexReader,
-    load_class: LoadClassReader,
+/// All index files are accessed via borrowed byte slices.  Each method performs
+/// O(log n) binary searches against the sorted index files using short-lived
+/// reader temporaries.
+pub struct HprofIndex<'a> {
+    hprof_data: &'a [u8],
+    hprof_header: HprofHeader,
+    combined_data: &'a [u8],
+    utf8_data: &'a [u8],
+    lc_data: &'a [u8],
 }
 
-impl HprofIndex {
-    /// Open all required index files.
+impl<'a> HprofIndex<'a> {
+    /// Create a validated index from byte slices.
     ///
-    /// * `hprof_source`    — the hprof file or bytes.
-    /// * `combined_source` — object store index (sorted by object ID).
-    /// * `utf8_source`     — UTF-8 name index (sorted by name ID).
-    /// * `lc_source`       — load-class index (sorted by class ID).
-    pub fn open(
-        hprof_source: &impl MMapReader,
-        combined_source: &impl MMapReader,
-        utf8_source: &impl MMapReader,
-        lc_source: &impl MMapReader,
+    /// * `hprof`    — the raw hprof file bytes.
+    /// * `combined` — object store index (sorted by object ID).
+    /// * `utf8`     — UTF-8 name index (sorted by name ID).
+    /// * `lc`       — load-class index (sorted by class ID).
+    pub fn from_ref(
+        hprof: &'a [u8],
+        combined: &'a [u8],
+        utf8: &'a [u8],
+        lc: &'a [u8],
     ) -> Result<Self, HprofError> {
+        let hprof_header = HprofFile::from_ref(hprof)?.header;
+        SubIndexReader::from_ref(combined)?;
+        Utf8IndexReader::from_ref(utf8)?;
+        LoadClassReader::from_ref(lc)?;
         Ok(Self {
-            hprof: HprofFile::from_source(hprof_source.open_mmap()?)?,
-            combined: SubIndexReader::from_bytes(combined_source.open_mmap()?.as_ref().to_vec())?,
-            utf8: Utf8IndexReader::from_bytes(utf8_source.open_mmap()?.as_ref().to_vec())?,
-            load_class: LoadClassReader::from_bytes(lc_source.open_mmap()?.as_ref().to_vec())?,
+            hprof_data: hprof,
+            hprof_header,
+            combined_data: combined,
+            utf8_data: utf8,
+            lc_data: lc,
         })
+    }
+
+    /// Create an index from slices already known to be valid, with a
+    /// pre-parsed header.
+    pub(crate) fn from_slice(
+        hprof: &'a [u8],
+        combined: &'a [u8],
+        utf8: &'a [u8],
+        lc: &'a [u8],
+        hprof_header: HprofHeader,
+    ) -> Self {
+        Self {
+            hprof_data: hprof,
+            hprof_header,
+            combined_data: combined,
+            utf8_data: utf8,
+            lc_data: lc,
+        }
+    }
+
+    // ── Short-lived reader helpers ────────────────────────────────────────────
+
+    fn hprof_file(&self) -> HprofFile<'a> {
+        HprofFile::from_parts(self.hprof_data, self.hprof_header.clone())
+    }
+
+    fn combined_reader(&self) -> Result<SubIndexReader<'a>, HprofError> {
+        SubIndexReader::from_ref(self.combined_data)
+    }
+
+    fn utf8_reader(&self) -> Result<Utf8IndexReader<'a>, HprofError> {
+        Utf8IndexReader::from_ref(self.utf8_data)
+    }
+
+    fn lc_reader(&self) -> Result<LoadClassReader<'a>, HprofError> {
+        LoadClassReader::from_ref(self.lc_data)
     }
 
     // ── Basic accessors ───────────────────────────────────────────────────────
 
+    /// Return the parsed hprof file header.
+    pub fn hprof_header(&self) -> HprofHeader {
+        self.hprof_header.clone()
+    }
+
     /// hprof identifier size in bytes (4 or 8).
     pub fn id_size(&self) -> u32 {
-        self.hprof.header.id_size
+        self.hprof_header.id_size
     }
 
     /// Total number of sub-records in the combined index (classes, instances,
     /// arrays, and GC roots).
     pub fn object_count(&self) -> usize {
-        self.combined.len()
+        self.combined_data.len() / SUB_INDEX_ENTRY_SIZE
     }
 
     /// Iterate over all sub-record index entries in the combined index.
     ///
     /// Entries are in object-ID order (ascending).  Call
     /// [`parse_sub_record`] to obtain full record details.
-    pub fn iter_entries(&self) -> crate::heap_parser::SubIndexIter<'_> {
-        self.combined.iter()
+    pub fn iter_entries(&self) -> crate::heap_parser::SubIndexIter<'a> {
+        crate::heap_parser::SubIndexIter::new(self.combined_data)
     }
 
     /// Parse the sub-record at position `i` in the combined index.
     ///
     /// Returns `None` when `i >= object_count()`.
-    pub fn parse_at(&self, i: usize) -> Result<Option<SubRecord<'_>>, HprofError> {
-        match self.combined.entry_at(i) {
-            Some(entry) => Ok(Some(parse_sub_record(&self.hprof, &entry)?)),
+    pub fn parse_at(&self, i: usize) -> Result<Option<SubRecord<'a>>, HprofError> {
+        let hprof = self.hprof_file();
+        match self.combined_reader()?.entry_at(i) {
+            Some(entry) => Ok(Some(parse_sub_record(&hprof, &entry)?)),
             None => Ok(None),
         }
     }
@@ -135,9 +183,10 @@ impl HprofIndex {
     ///
     /// Uses the object store index for O(log n) lookup.
     /// Returns `None` when the object ID is not present.
-    pub fn find_object<'a>(&'a self, object_id: u64) -> Result<Option<SubRecord<'a>>, HprofError> {
-        match self.combined.find_by_object_id(object_id) {
-            Some(entry) => Ok(Some(parse_sub_record(&self.hprof, &entry)?)),
+    pub fn find_object(&self, object_id: u64) -> Result<Option<SubRecord<'a>>, HprofError> {
+        let hprof = self.hprof_file();
+        match self.combined_reader()?.find_by_object_id(object_id) {
+            Some(entry) => Ok(Some(parse_sub_record(&hprof, &entry)?)),
             None => Ok(None),
         }
     }
@@ -147,29 +196,25 @@ impl HprofIndex {
     /// Searches specifically for a `CLASS_DUMP` tag so that other sub-records
     /// that happen to share the same object ID (e.g. `ROOT_*` entries for
     /// class objects) are skipped.
-    pub fn find_class_dump<'a>(
-        &'a self,
-        class_id: u64,
-    ) -> Result<Option<SubRecord<'a>>, HprofError> {
+    pub fn find_class_dump(&self, class_id: u64) -> Result<Option<SubRecord<'a>>, HprofError> {
+        let hprof = self.hprof_file();
         match self
-            .combined
+            .combined_reader()?
             .find_by_object_id_and_tag(class_id, Some(TAG_CLASS_DUMP))
         {
-            Some(entry) => Ok(Some(parse_sub_record(&self.hprof, &entry)?)),
+            Some(entry) => Ok(Some(parse_sub_record(&hprof, &entry)?)),
             None => Ok(None),
         }
     }
 
     /// Parse the INSTANCE_DUMP sub-record for `object_id`.
-    pub fn find_instance<'a>(
-        &'a self,
-        object_id: u64,
-    ) -> Result<Option<SubRecord<'a>>, HprofError> {
+    pub fn find_instance(&self, object_id: u64) -> Result<Option<SubRecord<'a>>, HprofError> {
+        let hprof = self.hprof_file();
         match self
-            .combined
+            .combined_reader()?
             .find_by_object_id_and_tag(object_id, Some(TAG_INSTANCE_DUMP))
         {
-            Some(entry) => Ok(Some(parse_sub_record(&self.hprof, &entry)?)),
+            Some(entry) => Ok(Some(parse_sub_record(&hprof, &entry)?)),
             None => Ok(None),
         }
     }
@@ -178,18 +223,20 @@ impl HprofIndex {
     ///
     /// Use this when you already hold a [`SubIndexEntry`] (e.g. from iterating
     /// the combined index) and want to avoid a redundant binary search.
-    pub fn parse_entry<'a>(
-        &'a self,
+    pub fn parse_entry(
+        &self,
         entry: &crate::heap_index::sub_record::SubIndexEntry,
     ) -> Result<SubRecord<'a>, HprofError> {
-        parse_sub_record(&self.hprof, entry)
+        let hprof = self.hprof_file();
+        parse_sub_record(&hprof, entry)
     }
 
     // ── Name resolution ───────────────────────────────────────────────────────
 
     /// Look up the string for `name_id` in the UTF-8 name index.
     pub fn lookup_name(&self, name_id: u64) -> Result<Option<String>, HprofError> {
-        self.utf8.lookup(&self.hprof, name_id)
+        let hprof = self.hprof_file();
+        self.utf8_reader()?.lookup(&hprof, name_id)
     }
 
     /// Find a class by its dot-notation name (e.g. `"java.lang.String"`).
@@ -206,8 +253,10 @@ impl HprofIndex {
     pub fn find_class_by_name(&self, name: &str) -> Result<Option<u64>, HprofError> {
         // Stored names use JVM internal slash notation; convert the input once.
         let slash_name = name.replace('.', "/");
-        for (class_id, name_id) in self.load_class.iter() {
-            if let Some(raw) = self.utf8.lookup(&self.hprof, name_id)?
+        let hprof = self.hprof_file();
+        let utf8 = self.utf8_reader()?;
+        for (class_id, name_id) in self.lc_reader()?.iter() {
+            if let Some(raw) = utf8.lookup(&hprof, name_id)?
                 && raw == slash_name
             {
                 return Ok(Some(class_id));
@@ -221,11 +270,12 @@ impl HprofIndex {
     /// Uses the load-class index → UTF-8 index chain. Returns `None` when the
     /// class is not found in either index.
     pub fn class_name(&self, class_id: u64) -> Result<Option<String>, HprofError> {
-        let name_id = match self.load_class.find_class_name_id(class_id) {
+        let name_id = match self.lc_reader()?.find_class_name_id(class_id) {
             Some(id) => id,
             None => return Ok(None),
         };
-        let raw = match self.utf8.lookup(&self.hprof, name_id)? {
+        let hprof = self.hprof_file();
+        let raw = match self.utf8_reader()?.lookup(&hprof, name_id)? {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -468,14 +518,15 @@ impl HprofIndex {
 
         // Look up the backing array.
         let arr_entry = match self
-            .combined
+            .combined_reader()?
             .find_by_object_id_and_tag(arr_id, Some(TAG_PRIM_ARRAY_DUMP))
         {
             Some(e) => e,
             None => return Ok(JavaValue::String(inst.object_id, String::new())),
         };
 
-        let arr_record = parse_sub_record(&self.hprof, &arr_entry)?;
+        let hprof = self.hprof_file();
+        let arr_record = parse_sub_record(&hprof, &arr_entry)?;
         let SubRecord::PrimArrayDump(arr) = arr_record else {
             return Ok(JavaValue::String(inst.object_id, String::new()));
         };
@@ -613,19 +664,44 @@ mod tests {
     }
 
     /// Run the full build pipeline on `hprof_data` and open a [`HprofIndex`].
-    fn full_pipeline(hprof_data: &[u8]) -> HprofIndex {
+    fn full_pipeline(hprof_data: &[u8]) -> Pipeline {
+        let hprof_vec = hprof_data.to_vec();
         let mut p1_idx = Vec::new();
         let p2_dir = SubIndexDir::mem();
         let mut combined = Vec::new();
         let mut utf8_idx = Vec::new();
         let mut lc_idx = Vec::new();
 
-        index_hprof(&hprof_data.to_vec(), &mut p1_idx).unwrap();
-        index_heap_dumps(&hprof_data.to_vec(), &p1_idx, &p2_dir).unwrap();
+        index_hprof(&hprof_vec, &mut p1_idx).unwrap();
+        index_heap_dumps(&hprof_vec, &p1_idx, &p2_dir).unwrap();
         combine_and_sort_sub_index(&p2_dir, &mut combined).unwrap();
-        build_name_indexes(&hprof_data.to_vec(), &p1_idx, &mut utf8_idx, &mut lc_idx).unwrap();
+        build_name_indexes(&hprof_vec, &p1_idx, &mut utf8_idx, &mut lc_idx).unwrap();
 
-        HprofIndex::open(&hprof_data.to_vec(), &combined, &utf8_idx, &lc_idx).unwrap()
+        Pipeline {
+            hprof_data: hprof_vec,
+            combined,
+            utf8_idx,
+            lc_idx,
+        }
+    }
+
+    struct Pipeline {
+        hprof_data: Vec<u8>,
+        combined: Vec<u8>,
+        utf8_idx: Vec<u8>,
+        lc_idx: Vec<u8>,
+    }
+
+    impl Pipeline {
+        fn create_hprof_index(&self) -> HprofIndex<'_> {
+            HprofIndex::from_ref(
+                &self.hprof_data,
+                &self.combined,
+                &self.utf8_idx,
+                &self.lc_idx,
+            )
+            .unwrap()
+        }
     }
 
     #[test]
@@ -633,7 +709,7 @@ mod tests {
         let hprof_data = build_test_hprof();
         let index = full_pipeline(&hprof_data);
 
-        let name = index.class_name(0x200).unwrap();
+        let name = index.create_hprof_index().class_name(0x200).unwrap();
         assert_eq!(name, Some("java.lang.Integer".to_string()));
     }
 
@@ -642,7 +718,7 @@ mod tests {
         let hprof_data = build_test_hprof();
         let index = full_pipeline(&hprof_data);
 
-        assert_eq!(index.class_name(0xDEAD).unwrap(), None);
+        assert_eq!(index.create_hprof_index().class_name(0xDEAD).unwrap(), None);
     }
 
     #[test]
@@ -650,12 +726,13 @@ mod tests {
         let hprof_data = build_test_hprof();
         let index = full_pipeline(&hprof_data);
 
-        let sub = index.find_instance(0x100).unwrap().unwrap();
+        let hprof_index = index.create_hprof_index();
+        let sub = hprof_index.find_instance(0x100).unwrap().unwrap();
         let SubRecord::InstanceDump(inst) = sub else {
             panic!("expected InstanceDump");
         };
 
-        let fields = index.instance_fields(&inst).unwrap();
+        let fields = index.create_hprof_index().instance_fields(&inst).unwrap();
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].name, "value");
         assert_eq!(fields[0].value, FieldValue::Int(42));
@@ -666,7 +743,7 @@ mod tests {
         let hprof_data = build_test_hprof();
         let index = full_pipeline(&hprof_data);
 
-        let java_val = index.resolve_value(0x100).unwrap();
+        let java_val = index.create_hprof_index().resolve_value(0x100).unwrap();
         assert!(
             matches!(java_val, JavaValue::Integer(0x100, 42)),
             "expected Integer(0x100, 42), got {:?}",
@@ -679,6 +756,9 @@ mod tests {
         let hprof_data = build_test_hprof();
         let index = full_pipeline(&hprof_data);
 
-        assert!(matches!(index.resolve_value(0).unwrap(), JavaValue::Null));
+        assert!(matches!(
+            index.create_hprof_index().resolve_value(0).unwrap(),
+            JavaValue::Null
+        ));
     }
 }

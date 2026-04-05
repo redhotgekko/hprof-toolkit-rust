@@ -47,18 +47,69 @@ use crate::aux_index::{
     build_end_thread_index, build_frame_index, build_start_thread_index, build_trace_index,
     build_unload_class_index,
 };
+use crate::dominator::build_dominator_and_retained;
 use crate::heap_index::index_heap_dumps;
 use crate::heap_query::build_name_indexes;
-use crate::hprof::HprofError;
+use crate::hprof::{HprofError, map_file};
 use crate::object_store::combine_sort_and_split;
 use crate::record_index::index_hprof;
 use crate::ref_index::build_reference_index;
-use crate::vfs::SubIndexDir;
+use crate::root_index::RootIndexReader;
+use crate::vfs::{ByteSource, MMapReader, SubIndexDir};
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+
+pub struct IndexData {
+    /// The index directory (`{hprof_stem}.indexes/`).
+    pub dir: ByteSource,
+    /// Top-level record index.
+    pub record_index: ByteSource,
+    /// Heap sub-record index directory.
+    pub heap_index_dir: ByteSource,
+    /// Sorted combined sub-record index.
+    pub object_store: ByteSource,
+    /// UTF-8 name index.
+    pub utf8: ByteSource,
+    /// Load-class index.
+    pub load_class: ByteSource,
+    /// Object reference index.
+    pub refs: ByteSource,
+    /// HPROF_FRAME index.
+    pub frames: ByteSource,
+    /// HPROF_TRACE index.
+    pub traces: ByteSource,
+    /// HPROF_START_THREAD index.
+    pub start_threads: ByteSource,
+    /// HPROF_END_THREAD index.
+    pub end_threads: ByteSource,
+    /// HPROF_UNLOAD_CLASS index.
+    pub unload_classes: ByteSource,
+    /// GC_ROOT_UNKNOWN index.
+    pub root_unknown: ByteSource,
+    /// GC_ROOT_JNI_GLOBAL index.
+    pub root_jni_global: ByteSource,
+    /// GC_ROOT_JNI_LOCAL index.
+    pub root_jni_local: ByteSource,
+    /// GC_ROOT_JAVA_FRAME index.
+    pub root_java_frame: ByteSource,
+    /// GC_ROOT_NATIVE_STACK index.
+    pub root_native_stack: ByteSource,
+    /// GC_ROOT_STICKY_CLASS index.
+    pub root_sticky_class: ByteSource,
+    /// GC_ROOT_THREAD_BLOCK index.
+    pub root_thread_block: ByteSource,
+    /// GC_ROOT_MONITOR_USED index.
+    pub root_monitor_used: ByteSource,
+    /// GC_ROOT_THREAD_OBJ index.
+    pub root_thread_obj: ByteSource,
+    /// Dominator tree index (`dominators.bin`).
+    pub dominators: ByteSource,
+    /// Retained heap size index (`retained.bin`).
+    pub retained: ByteSource,
+}
 
 // ── IndexPaths ────────────────────────────────────────────────────────────────
 
@@ -108,6 +159,10 @@ pub struct IndexPaths {
     pub root_monitor_used: PathBuf,
     /// GC_ROOT_THREAD_OBJ index.
     pub root_thread_obj: PathBuf,
+    /// Dominator tree index (`dominators.bin`).
+    pub dominators: PathBuf,
+    /// Retained heap size index (`retained.bin`).
+    pub retained: PathBuf,
 }
 
 impl IndexPaths {
@@ -149,8 +204,39 @@ impl IndexPaths {
             root_thread_block: dir.join("root_thread_block.bin"),
             root_monitor_used: dir.join("root_monitor_used.bin"),
             root_thread_obj: dir.join("root_thread_obj.bin"),
+            dominators: dir.join("dominators.bin"),
+            retained: dir.join("retained.bin"),
             dir,
         }
+    }
+
+    pub fn to_data(&self) -> Result<IndexData, HprofError> {
+        use crate::vfs::MMapReader;
+        Ok(IndexData {
+            dir: ByteSource::VecSource(Vec::new()),
+            record_index: self.record_index.open_mmap()?,
+            heap_index_dir: ByteSource::VecSource(Vec::new()),
+            object_store: self.object_store.open_mmap()?,
+            utf8: self.utf8.open_mmap()?,
+            load_class: self.load_class.open_mmap()?,
+            refs: self.refs.open_mmap()?,
+            frames: self.frames.open_mmap()?,
+            traces: self.traces.open_mmap()?,
+            start_threads: self.start_threads.open_mmap()?,
+            end_threads: self.end_threads.open_mmap()?,
+            unload_classes: self.unload_classes.open_mmap()?,
+            root_unknown: self.root_unknown.open_mmap()?,
+            root_jni_global: self.root_jni_global.open_mmap()?,
+            root_jni_local: self.root_jni_local.open_mmap()?,
+            root_java_frame: self.root_java_frame.open_mmap()?,
+            root_native_stack: self.root_native_stack.open_mmap()?,
+            root_sticky_class: self.root_sticky_class.open_mmap()?,
+            root_thread_block: self.root_thread_block.open_mmap()?,
+            root_monitor_used: self.root_monitor_used.open_mmap()?,
+            root_thread_obj: self.root_thread_obj.open_mmap()?,
+            dominators: self.dominators.open_mmap()?,
+            retained: self.retained.open_mmap()?,
+        })
     }
 }
 
@@ -164,8 +250,11 @@ impl IndexPaths {
 pub fn build_all_indexes(hprof_path: &Path) -> Result<IndexPaths, HprofError> {
     let mut p = IndexPaths::for_hprof(hprof_path);
     std::fs::create_dir_all(&p.dir)?;
-    // PathBuf implements MMapReader (Sized); &Path does not (unsized).
     let hprof_pb: PathBuf = hprof_path.to_path_buf();
+
+    // Memory-map the hprof file once; reused across all build steps.
+    let hprof_mmap = map_file(&hprof_pb)?;
+    let hprof_bytes: &[u8] = hprof_mmap.as_ref();
 
     // ── Record index ──────────────────────────────────────────────────────────
     if p.record_index.exists() {
@@ -173,7 +262,7 @@ pub fn build_all_indexes(hprof_path: &Path) -> Result<IndexPaths, HprofError> {
     } else {
         print!("Record index: indexing records … ");
         let t = Instant::now();
-        let n = index_hprof(&hprof_pb, &mut p.record_index)?;
+        let n = index_hprof(hprof_bytes, &mut p.record_index)?;
         println!("{n} records  ({:.1}s)", t.elapsed().as_secs_f64());
     }
 
@@ -255,8 +344,13 @@ pub fn build_all_indexes(hprof_path: &Path) -> Result<IndexPaths, HprofError> {
     } else {
         print!("Name indexes: building … ");
         let t = Instant::now();
-        let (utf8_n, lc_n) =
-            build_name_indexes(&hprof_pb, &p.record_index, &mut p.utf8, &mut p.load_class)?;
+        let record_index_mmap = map_file(&p.record_index)?;
+        let (utf8_n, lc_n) = build_name_indexes(
+            hprof_bytes,
+            record_index_mmap.as_ref(),
+            &mut p.utf8,
+            &mut p.load_class,
+        )?;
         println!(
             "{utf8_n} UTF-8 names, {lc_n} classes  ({:.1}s)",
             t.elapsed().as_secs_f64()
@@ -269,14 +363,59 @@ pub fn build_all_indexes(hprof_path: &Path) -> Result<IndexPaths, HprofError> {
     } else {
         print!("Reference index: building … ");
         let t = Instant::now();
+        let object_store_mmap = map_file(&p.object_store)?;
+        let utf8_mmap = map_file(&p.utf8)?;
+        let lc_mmap = map_file(&p.load_class)?;
         let n = build_reference_index(
-            &hprof_pb,
-            &p.object_store,
-            &p.utf8,
-            &p.load_class,
+            hprof_bytes,
+            object_store_mmap.as_ref(),
+            utf8_mmap.as_ref(),
+            lc_mmap.as_ref(),
             &mut p.refs,
         )?;
         println!("{n} references  ({:.1}s)", t.elapsed().as_secs_f64());
+    }
+
+    // ── Dominator tree + retained heap sizes ─────────────────────────────────
+    let dominator_done = p.dominators.exists() && p.retained.exists();
+    if dominator_done {
+        println!("Dominator tree + retained sizes: skipping");
+    } else {
+        print!("Dominator tree + retained sizes: building … ");
+        let t = Instant::now();
+        let root_mmaps = [
+            p.root_unknown.open_mmap()?,
+            p.root_jni_global.open_mmap()?,
+            p.root_jni_local.open_mmap()?,
+            p.root_java_frame.open_mmap()?,
+            p.root_native_stack.open_mmap()?,
+            p.root_sticky_class.open_mmap()?,
+            p.root_thread_block.open_mmap()?,
+            p.root_monitor_used.open_mmap()?,
+            p.root_thread_obj.open_mmap()?,
+        ];
+        let root_readers = [
+            RootIndexReader::from_ref(root_mmaps[0].as_ref())?,
+            RootIndexReader::from_ref(root_mmaps[1].as_ref())?,
+            RootIndexReader::from_ref(root_mmaps[2].as_ref())?,
+            RootIndexReader::from_ref(root_mmaps[3].as_ref())?,
+            RootIndexReader::from_ref(root_mmaps[4].as_ref())?,
+            RootIndexReader::from_ref(root_mmaps[5].as_ref())?,
+            RootIndexReader::from_ref(root_mmaps[6].as_ref())?,
+            RootIndexReader::from_ref(root_mmaps[7].as_ref())?,
+            RootIndexReader::from_ref(root_mmaps[8].as_ref())?,
+        ];
+        let (dom_n, ret_n) = build_dominator_and_retained(
+            &hprof_pb,
+            &p.object_store,
+            &root_readers,
+            &mut p.dominators,
+            &mut p.retained,
+        )?;
+        println!(
+            "{dom_n} dominator entries, {ret_n} retained entries  ({:.1}s)",
+            t.elapsed().as_secs_f64()
+        );
     }
 
     // ── Auxiliary indexes ─────────────────────────────────────────────────────
@@ -291,13 +430,13 @@ pub fn build_all_indexes(hprof_path: &Path) -> Result<IndexPaths, HprofError> {
     } else {
         print!("Auxiliary indexes: building … ");
         let t = Instant::now();
-        let frames = build_frame_index(&hprof_pb, &p.record_index, &mut p.frames)?;
-        let traces = build_trace_index(&hprof_pb, &p.record_index, &mut p.traces)?;
+        let frames = build_frame_index(hprof_bytes, &p.record_index, &mut p.frames)?;
+        let traces = build_trace_index(hprof_bytes, &p.record_index, &mut p.traces)?;
         let start_threads =
-            build_start_thread_index(&hprof_pb, &p.record_index, &mut p.start_threads)?;
-        let end_threads = build_end_thread_index(&hprof_pb, &p.record_index, &mut p.end_threads)?;
+            build_start_thread_index(hprof_bytes, &p.record_index, &mut p.start_threads)?;
+        let end_threads = build_end_thread_index(hprof_bytes, &p.record_index, &mut p.end_threads)?;
         let unload_classes =
-            build_unload_class_index(&hprof_pb, &p.record_index, &mut p.unload_classes)?;
+            build_unload_class_index(hprof_bytes, &p.record_index, &mut p.unload_classes)?;
         println!(
             "{frames} frames, {traces} traces, {start_threads} threads, \
              {end_threads} ends, {unload_classes} unloads  ({:.1}s)",
@@ -323,7 +462,9 @@ pub fn build_all_indexes(hprof_path: &Path) -> Result<IndexPaths, HprofError> {
             p.dir.join(ArrayKind::Long.file_name()),
             p.dir.join(ArrayKind::Object.file_name()),
         ];
-        let counts = build_array_size_indexes(&hprof_pb, &p.object_store, &mut array_outputs)?;
+        let object_store_mmap2 = map_file(&p.object_store)?;
+        let counts =
+            build_array_size_indexes(hprof_bytes, object_store_mmap2.as_ref(), &mut array_outputs)?;
         let mut summary = String::new();
         for (kind, count) in ArrayKind::ALL.iter().zip(counts.iter()) {
             if *count > 0 {

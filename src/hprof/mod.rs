@@ -10,8 +10,6 @@ use memmap2::Mmap;
 use std::fs::File;
 use std::path::Path;
 
-use crate::vfs::ByteSource;
-
 /// Open a file read-only and memory-map it.
 ///
 /// Used by both `HprofFile::open` and the heap parser's `SubIndexReader`.
@@ -27,44 +25,36 @@ pub fn map_file(path: &Path) -> Result<Mmap, HprofError> {
 ///
 /// Keeps the mmap alive for the lifetime of this struct. All data is accessed
 /// through the mmap slice — no heap dump content is loaded into memory.
-pub struct HprofFile {
-    mmap: ByteSource,
+pub struct HprofFile<'a> {
+    mmap: &'a [u8],
     pub header: HprofHeader,
 }
 
-impl HprofFile {
-    /// Open an hprof file via memory mapping.
-    pub fn open(path: &Path) -> Result<Self, HprofError> {
-        let mmap = map_file(path)?;
-        let header = HprofHeader::parse(&mmap)?;
-
-        let mmap = ByteSource::MMapSource(mmap);
-        Ok(Self { mmap, header })
+impl<'a> HprofFile<'a> {
+    pub fn from_ref(data: &'a [u8]) -> Result<Self, HprofError> {
+        let header = HprofHeader::parse(data)?;
+        Ok(Self { mmap: data, header })
     }
 
-    pub fn from_source(source: ByteSource) -> Result<Self, HprofError> {
-        let header = HprofHeader::parse(source.as_ref())?;
-        Ok(Self {
-            mmap: source,
-            header,
-        })
-    }
-
-    pub fn from_bytes(data: Vec<u8>) -> Result<Self, HprofError> {
-        let header = HprofHeader::parse(data.as_ref())?;
-        let mmap = ByteSource::VecSource(data);
-        Ok(Self { mmap, header })
+    /// Construct from pre-parsed header (avoids re-parsing on every access).
+    pub fn from_parts(data: &'a [u8], header: HprofHeader) -> Self {
+        Self { mmap: data, header }
     }
 
     /// Return the full file contents as a byte slice.
-    pub fn data(&self) -> &[u8] {
-        self.mmap.as_ref()
+    ///
+    /// The returned slice has lifetime `'a` — the same lifetime as the
+    /// underlying data — not the lifetime of `&self`.  This allows callers
+    /// holding a `&HprofFile<'a>` (without tying the reference lifetime to
+    /// `'a`) to still produce values that borrow from the data for `'a`.
+    pub fn data(&self) -> &'a [u8] {
+        self.mmap
     }
 
     /// Iterate over record headers in file order without loading record bodies.
     pub fn record_headers(&self) -> RecordHeaderIter<'_> {
         RecordHeaderIter {
-            data: self.mmap.as_ref(),
+            data: self.mmap,
             pos: self.header.data_offset,
         }
     }

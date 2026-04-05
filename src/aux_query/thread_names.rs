@@ -148,8 +148,9 @@ fn resolve_thread_name_from_heap(
             Some(e) => e,
             None => return Ok(None),
         };
-    let (thread_class_id, thread_data) = match parse_sub_record(hprof, &thread_entry)? {
-        SubRecord::InstanceDump(i) => (i.class_id, i.data.to_vec()),
+    let thread_sub = parse_sub_record(hprof, &thread_entry)?;
+    let (thread_class_id, thread_data) = match thread_sub {
+        SubRecord::InstanceDump(i) => (i.class_id, i.data),
         _ => return Ok(None),
     };
 
@@ -159,7 +160,7 @@ fn resolve_thread_name_from_heap(
         object_store_data,
         utf8,
         thread_class_id,
-        &thread_data,
+        thread_data,
         "name",
     )? {
         Some(id) if id != 0 => id,
@@ -171,8 +172,9 @@ fn resolve_thread_name_from_heap(
         Some(e) => e,
         None => return Ok(None),
     };
-    let (str_class_id, str_data) = match parse_sub_record(hprof, &str_entry)? {
-        SubRecord::InstanceDump(i) => (i.class_id, i.data.to_vec()),
+    let str_sub = parse_sub_record(hprof, &str_entry)?;
+    let (str_class_id, str_data) = match str_sub {
+        SubRecord::InstanceDump(i) => (i.class_id, i.data),
         _ => return Ok(None),
     };
 
@@ -182,7 +184,7 @@ fn resolve_thread_name_from_heap(
         object_store_data,
         utf8,
         str_class_id,
-        &str_data,
+        str_data,
         "value",
     )? {
         Some(id) if id != 0 => id,

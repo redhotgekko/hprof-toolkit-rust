@@ -24,6 +24,7 @@ use crate::heap_parser::SubRecord;
 use crate::hprof::HprofError;
 use crate::query::{ROOT_PATH_SEARCH_LIMIT, RootPathResult};
 use crate::root_index::GcRootType;
+use crate::vfs::MMapReader;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -871,8 +872,39 @@ fn render_object_page(
         ),
     };
 
+    let retained_html = if q.has_retained_heap() {
+        let retained = q
+            .retained_size(object_id)
+            .map(fmt_bytes)
+            .unwrap_or_else(|| "<span class=\"muted\">not reachable</span>".to_owned());
+        let dom_html = match q.dominator_of(object_id) {
+            None => "<span class=\"muted\">not reachable</span>".to_owned(),
+            Some(0) => "<span class=\"muted\">(GC root — virtual root)</span>".to_owned(),
+            Some(dom_id) => {
+                let dom_type = q
+                    .object_type_name(dom_id)
+                    .unwrap_or_else(|_| "?".to_owned());
+                format!(
+                    "{} <span class=\"muted\">{}</span>",
+                    obj_link(dom_id),
+                    esc(&dom_type)
+                )
+            }
+        };
+        format!(
+            "<h2>Retained heap</h2>\
+             <table>\
+             <tr><td>Retained size</td><td class=\"num\">{retained}</td></tr>\
+             <tr><td>Immediate dominator</td><td>{dom_html}</td></tr>\
+             </table>"
+        )
+    } else {
+        String::new()
+    };
+
     let content = format!(
         "{header_html}{body}
+{retained_html}
 <h2>GC root status</h2>
 {root_html}
 <h2>Referenced by</h2>
@@ -1833,7 +1865,8 @@ pub async fn diff_removed(
             Some(p) => p,
             None => return Ok(page("Diff: Removed", "<p>No diff configured.</p>")),
         };
-        let reader = DiffEntryReader::open(&paths.removed)?;
+        let removed_mmap = paths.removed.open_mmap()?;
+        let reader = DiffEntryReader::from_ref(removed_mmap.as_ref())?;
         let q = &state.query;
         let class_filter = p.class.as_deref().and_then(parse_hex_id);
 
@@ -1919,7 +1952,8 @@ pub async fn diff_added(
             Some(p) => p,
             None => return Ok(page("Diff: Added", "<p>No diff configured.</p>")),
         };
-        let reader = DiffEntryReader::open(&paths.added)?;
+        let added_mmap = paths.added.open_mmap()?;
+        let reader = DiffEntryReader::from_ref(added_mmap.as_ref())?;
         // Added objects live in dump 2; use diff_query for class resolution.
         let q = match state.diff_query.as_ref() {
             Some(q) => q,
@@ -2010,7 +2044,8 @@ pub async fn diff_common(
             Some(p) => p,
             None => return Ok(page("Diff: Common", "<p>No diff configured.</p>")),
         };
-        let reader = CommonEntryReader::open(&paths.common)?;
+        let common_mmap = paths.common.open_mmap()?;
+        let reader = CommonEntryReader::from_ref(common_mmap.as_ref())?;
         let q = &state.query;
         let class_filter = p.class.as_deref().and_then(parse_hex_id);
         // changed filter: "0" = unchanged only, "1" = changed only, absent = all
@@ -2233,6 +2268,89 @@ pub async fn diff_summary(State(state): State<Arc<AppState>>) -> impl IntoRespon
         );
 
         Ok(page("Heap Diff", &content))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(html)) => ok(html).into_response(),
+        Ok(Err(e)) => internal(e).into_response(),
+        Err(e) => internal(e).into_response(),
+    }
+}
+
+// ── /retained — Retained heap histogram ──────────────────────────────────────
+
+pub async fn retained_histogram(
+    State(state): State<Arc<AppState>>,
+    Query(p): Query<PageParams>,
+) -> impl IntoResponse {
+    let result = tokio::task::spawn_blocking(move || -> Result<String, HprofError> {
+        let q = &state.query;
+
+        if !q.has_retained_heap() {
+            let content = "<p class=\"muted\">Retained heap index not available. \
+                           Run <code>hprof-toolkit index</code> to build it.</p>";
+            return Ok(page("Retained Heap", content));
+        }
+
+        // Collect all (retained_bytes, object_id) pairs and sort descending.
+        let iter = q.iter_retained().ok_or(HprofError::InvalidIndexFile)?;
+        let mut entries: Vec<(u64, u64)> = iter.map(|(id, ret)| (ret, id)).collect();
+        entries.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+
+        let total_count = entries.len();
+        let page_entries: Vec<(u64, u64)> =
+            entries.into_iter().skip(p.offset).take(p.limit).collect();
+
+        let mut rows = String::new();
+        for (retained_bytes, object_id) in &page_entries {
+            let type_name = q
+                .object_type_name(*object_id)
+                .unwrap_or_else(|_| "?".to_owned());
+            let dom_cell = match q.dominator_of(*object_id) {
+                None | Some(0) => "<span class=\"muted\">(root)</span>".to_owned(),
+                Some(dom_id) => obj_link(dom_id),
+            };
+            rows.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td><td class=\"num\">{}</td><td>{dom_cell}</td></tr>",
+                obj_link(*object_id),
+                esc(&type_name),
+                fmt_bytes(*retained_bytes),
+            ));
+        }
+
+        let note = if total_count > p.offset + p.limit {
+            format!(
+                "<p><a href=\"/retained?offset={}&limit={}\">Next {} →</a></p>",
+                p.offset + p.limit,
+                p.limit,
+                p.limit
+            )
+        } else {
+            String::new()
+        };
+
+        let prev = if p.offset > 0 {
+            format!(
+                "<p><a href=\"/retained?offset={}&limit={}\">← Prev {}</a></p>",
+                p.offset.saturating_sub(p.limit),
+                p.limit,
+                p.limit
+            )
+        } else {
+            String::new()
+        };
+
+        let content = format!(
+            r#"<p>{total_count} reachable objects with retained size data</p>
+{prev}
+<table>
+<tr><th>Object ID</th><th>Type</th><th>Retained size</th><th>Dominator</th></tr>
+{rows}
+</table>
+{note}"#
+        );
+        Ok(page("Retained Heap", &content))
     })
     .await;
 

@@ -22,9 +22,8 @@
 use crate::hprof::record::RecordTag;
 use crate::hprof::{HprofError, HprofFile};
 use crate::record_index::entry::{INDEX_ENTRY_SIZE, IndexEntry};
-use crate::vfs::{ByteSource, MMapWriter};
+use crate::vfs::MMapWriter;
 use std::io::Write;
-use std::path::Path;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -37,35 +36,23 @@ const RECORD_HEADER_SIZE: usize = 9; // tag(1) + time_offset(4) + body_length(4)
 
 /// Memory-mapped reader for the UTF-8 name index produced by
 /// [`build_utf8_index`].
-pub struct Utf8IndexReader {
-    mmap: ByteSource,
+pub struct Utf8IndexReader<'a> {
+    mmap: &'a [u8],
 }
 
-impl Utf8IndexReader {
-    pub fn open(path: &Path) -> Result<Self, HprofError> {
-        let mmap = crate::hprof::map_file(path)?;
-        if mmap.len() % UTF8_ENTRY_SIZE != 0 {
-            return Err(HprofError::InvalidIndexFile);
-        }
-        Ok(Self {
-            mmap: ByteSource::MMapSource(mmap),
-        })
-    }
-
-    pub fn from_bytes(mmap: Vec<u8>) -> Result<Self, HprofError> {
+impl<'a> Utf8IndexReader<'a> {
+    pub fn from_ref(mmap: &'a [u8]) -> Result<Self, HprofError> {
         if !mmap.len().is_multiple_of(UTF8_ENTRY_SIZE) {
             return Err(HprofError::InvalidIndexFile);
         }
-        Ok(Self {
-            mmap: ByteSource::VecSource(mmap),
-        })
+        Ok(Self { mmap })
     }
 
     /// Look up the string for `name_id`, reading its bytes from `hprof`.
     ///
     /// Returns `None` if `name_id` is not in the index.
     pub fn lookup(&self, hprof: &HprofFile, name_id: u64) -> Result<Option<String>, HprofError> {
-        let data = self.mmap.as_ref();
+        let data = self.mmap;
         let n = data.len() / UTF8_ENTRY_SIZE;
 
         let lo = leftmost_search(data, n, UTF8_ENTRY_SIZE, 0, name_id);
@@ -92,34 +79,22 @@ impl Utf8IndexReader {
 
 /// Memory-mapped reader for the load-class index produced by
 /// [`build_load_class_index`].
-pub struct LoadClassReader {
-    data: ByteSource,
+pub struct LoadClassReader<'a> {
+    data: &'a [u8],
 }
 
-impl LoadClassReader {
-    pub fn open(path: &Path) -> Result<Self, HprofError> {
-        let mmap = crate::hprof::map_file(path)?;
-        if mmap.len() % LOAD_CLASS_ENTRY_SIZE != 0 {
-            return Err(HprofError::InvalidIndexFile);
-        }
-        Ok(Self {
-            data: ByteSource::MMapSource(mmap),
-        })
-    }
-
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, HprofError> {
+impl<'a> LoadClassReader<'a> {
+    pub fn from_ref(bytes: &'a [u8]) -> Result<Self, HprofError> {
         if !bytes.len().is_multiple_of(LOAD_CLASS_ENTRY_SIZE) {
             return Err(HprofError::InvalidIndexFile);
         }
-        Ok(Self {
-            data: ByteSource::VecSource(bytes),
-        })
+        Ok(Self { data: bytes })
     }
 
     /// Return the `class_name_id` for the given `class_id`, or `None` if not
     /// found.
     pub fn find_class_name_id(&self, class_id: u64) -> Option<u64> {
-        let data = self.data.as_ref();
+        let data = self.data;
         let n = data.len() / LOAD_CLASS_ENTRY_SIZE;
 
         let lo = leftmost_search(data, n, LOAD_CLASS_ENTRY_SIZE, 0, class_id);
@@ -135,7 +110,7 @@ impl LoadClassReader {
     /// Entries are yielded in ascending `class_id` order (the index sort
     /// order).  Used for name-based class lookup.
     pub fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
-        let data = self.data.as_ref();
+        let data = self.data;
         let n = data.len() / LOAD_CLASS_ENTRY_SIZE;
         (0..n).map(move |i| {
             let base = i * LOAD_CLASS_ENTRY_SIZE;
@@ -435,7 +410,7 @@ mod tests {
     fn record_index_for(hprof_data: &[u8]) -> Vec<u8> {
         use crate::record_index::index_hprof;
         let mut idx_buf = Vec::new();
-        index_hprof(&hprof_data.to_vec(), &mut idx_buf).unwrap();
+        index_hprof(hprof_data, &mut idx_buf).unwrap();
         idx_buf
     }
 
@@ -443,13 +418,13 @@ mod tests {
     fn utf8_index_lookup() {
         let hprof_data = minimal_hprof();
         let record_index_bytes = record_index_for(&hprof_data);
-        let hprof = crate::hprof::HprofFile::from_bytes(hprof_data.clone()).unwrap();
+        let hprof = crate::hprof::HprofFile::from_ref(&hprof_data).unwrap();
 
         let mut data: Vec<u8> = vec![];
         let count = build_utf8_index(&hprof, &record_index_bytes, &mut data).unwrap();
         assert_eq!(count, 2);
 
-        let reader = Utf8IndexReader::from_bytes(data).unwrap();
+        let reader = Utf8IndexReader::from_ref(&data).unwrap();
         assert_eq!(reader.lookup(&hprof, 1).unwrap(), Some("hello".to_string()));
         assert_eq!(
             reader.lookup(&hprof, 2).unwrap(),
@@ -462,13 +437,13 @@ mod tests {
     fn load_class_index_lookup() {
         let hprof_data = minimal_hprof();
         let record_index_bytes = record_index_for(&hprof_data);
-        let hprof = crate::hprof::HprofFile::from_bytes(hprof_data.clone()).unwrap();
+        let hprof = crate::hprof::HprofFile::from_ref(&hprof_data).unwrap();
 
         let mut lc_buf = Vec::new();
         let count = build_load_class_index(&hprof, &record_index_bytes, &mut lc_buf).unwrap();
         assert_eq!(count, 1);
 
-        let reader = LoadClassReader::from_bytes(lc_buf).unwrap();
+        let reader = LoadClassReader::from_ref(&lc_buf).unwrap();
         assert_eq!(reader.find_class_name_id(0x100), Some(2));
         assert_eq!(reader.find_class_name_id(0x200), None);
     }

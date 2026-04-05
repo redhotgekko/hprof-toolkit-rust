@@ -2,6 +2,7 @@ use super::error::HprofError;
 use super::record::{read_u32_be, read_u64_be};
 
 /// Parsed hprof file header.
+#[derive(Clone)]
 pub struct HprofHeader {
     /// e.g. "JAVA PROFILE 1.0.2"
     pub version: String,

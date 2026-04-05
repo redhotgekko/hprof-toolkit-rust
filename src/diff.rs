@@ -10,6 +10,7 @@ use crate::diff_index::{CommonEntryReader, DiffEntryReader, DiffIndexPaths};
 use crate::heap_parser::SubRecord;
 use crate::hprof::HprofError;
 use crate::query::HeapQuery;
+use crate::vfs::MMapReader;
 use std::collections::HashMap;
 
 // ── Synthetic class-ID flags (mirrors server/mod.rs) ─────────────────────────
@@ -109,9 +110,12 @@ pub fn compute_diff_summary(
     query2: &HeapQuery,
     paths: &DiffIndexPaths,
 ) -> Result<DiffSummary, HprofError> {
-    let removed_reader = DiffEntryReader::open(&paths.removed)?;
-    let added_reader = DiffEntryReader::open(&paths.added)?;
-    let common_reader = CommonEntryReader::open(&paths.common)?;
+    let removed_mmap = paths.removed.open_mmap()?;
+    let added_mmap = paths.added.open_mmap()?;
+    let common_mmap = paths.common.open_mmap()?;
+    let removed_reader = DiffEntryReader::from_ref(removed_mmap.as_ref())?;
+    let added_reader = DiffEntryReader::from_ref(added_mmap.as_ref())?;
+    let common_reader = CommonEntryReader::from_ref(common_mmap.as_ref())?;
 
     let mut counts: HashMap<u64, RawCounts> = HashMap::new();
     let mut total_added = 0u64;

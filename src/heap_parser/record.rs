@@ -385,7 +385,7 @@ pub enum SubRecord<'a> {
 /// The returned `SubRecord<'a>` borrows from `hprof` — no data is copied or
 /// stored on the heap.
 pub fn parse_sub_record<'a>(
-    hprof: &'a HprofFile,
+    hprof: &HprofFile<'a>,
     entry: &SubIndexEntry,
 ) -> Result<SubRecord<'a>, HprofError> {
     let data = hprof.data();
@@ -710,8 +710,8 @@ mod tests {
     /// data_offset = 31; first sub-record body_start = 31 + 9 = 40.
     const BODY_START: u64 = 40;
 
-    fn open_hprof(data: &[u8]) -> HprofFile {
-        HprofFile::from_bytes(data.to_vec()).unwrap()
+    fn open_hprof(data: &[u8]) -> HprofFile<'_> {
+        HprofFile::from_ref(data).unwrap()
     }
 
     // ── Root record tests ────────────────────────────────────────────────────

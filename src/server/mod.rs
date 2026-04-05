@@ -381,6 +381,7 @@ h1{{margin-top:0}}
   <a href="/allClasses">All Classes</a>
   <a href="/roots">GC Roots</a>
   <a href="/threads">Threads</a>
+  <a href="/retained">Retained Heap</a>
   <a href="/diff">Diff</a>
 </nav>
 <h1>{title}</h1>
@@ -416,6 +417,7 @@ pub async fn start_server(state: Arc<AppState>, port: u16) -> Result<(), std::io
         .route("/diff/added", get(handlers::diff_added))
         .route("/diff/common", get(handlers::diff_common))
         .route("/diff/object/:id", get(handlers::diff_object_detail))
+        .route("/retained", get(handlers::retained_histogram))
         .route("/mcp", post(mcp::handle_mcp))
         .with_state(state);
 

@@ -36,7 +36,6 @@ use crate::heap_index::sub_record::{
 use crate::heap_parser::SubRecord;
 use crate::hprof::HprofError;
 use crate::query::HeapQuery;
-use crate::vfs::MMapReader;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -319,20 +318,24 @@ fn records_changed(
 
 // ── DiffEntryReader ───────────────────────────────────────────────────────────
 
-/// Memory-mapped reader for `removed.bin` or `added.bin`.
-pub struct DiffEntryReader {
-    data: Vec<u8>,
+/// Reader for `removed.bin` or `added.bin`.
+pub struct DiffEntryReader<'a> {
+    data: &'a [u8],
 }
 
-impl DiffEntryReader {
-    /// Open a diff entry file (removed or added) for reading.
-    pub fn open(path: &Path) -> Result<Self, HprofError> {
-        let mmap = path.to_path_buf().open_mmap()?;
-        let bytes = mmap.as_ref().to_vec();
-        if bytes.len() % DIFF_ENTRY_SIZE != 0 {
+impl<'a> DiffEntryReader<'a> {
+    /// Create a validated reader from a byte slice.
+    pub fn from_ref(data: &'a [u8]) -> Result<Self, HprofError> {
+        if !data.len().is_multiple_of(DIFF_ENTRY_SIZE) {
             return Err(HprofError::InvalidIndexFile);
         }
-        Ok(Self { data: bytes })
+        Ok(Self { data })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_slice(data: &'a [u8]) -> Self {
+        debug_assert!(data.len().is_multiple_of(DIFF_ENTRY_SIZE));
+        Self { data }
     }
 
     /// Number of entries in the file.
@@ -357,9 +360,9 @@ impl DiffEntryReader {
     }
 
     /// Iterate all entries in ascending `object_id` order.
-    pub fn iter(&self) -> DiffEntryIter<'_> {
+    pub fn iter(&self) -> DiffEntryIter<'a> {
         DiffEntryIter {
-            data: &self.data,
+            data: self.data,
             pos: 0,
         }
     }
@@ -387,20 +390,24 @@ impl Iterator for DiffEntryIter<'_> {
 
 // ── CommonEntryReader ─────────────────────────────────────────────────────────
 
-/// Memory-mapped reader for `common.bin`.
-pub struct CommonEntryReader {
-    data: Vec<u8>,
+/// Reader for `common.bin`.
+pub struct CommonEntryReader<'a> {
+    data: &'a [u8],
 }
 
-impl CommonEntryReader {
-    /// Open the common diff index file for reading.
-    pub fn open(path: &Path) -> Result<Self, HprofError> {
-        let mmap = path.to_path_buf().open_mmap()?;
-        let bytes = mmap.as_ref().to_vec();
-        if bytes.len() % COMMON_ENTRY_SIZE != 0 {
+impl<'a> CommonEntryReader<'a> {
+    /// Create a validated reader from a byte slice.
+    pub fn from_ref(data: &'a [u8]) -> Result<Self, HprofError> {
+        if !data.len().is_multiple_of(COMMON_ENTRY_SIZE) {
             return Err(HprofError::InvalidIndexFile);
         }
-        Ok(Self { data: bytes })
+        Ok(Self { data })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_slice(data: &'a [u8]) -> Self {
+        debug_assert!(data.len().is_multiple_of(COMMON_ENTRY_SIZE));
+        Self { data }
     }
 
     /// Number of entries in the file.
@@ -425,9 +432,9 @@ impl CommonEntryReader {
     }
 
     /// Iterate all entries in ascending `object_id` order.
-    pub fn iter(&self) -> CommonEntryIter<'_> {
+    pub fn iter(&self) -> CommonEntryIter<'a> {
         CommonEntryIter {
-            data: &self.data,
+            data: self.data,
             pos: 0,
         }
     }
@@ -505,7 +512,7 @@ mod tests {
         for e in &entries {
             data.extend_from_slice(&e.to_bytes());
         }
-        let reader = DiffEntryReader { data };
+        let reader = DiffEntryReader::from_slice(&data);
         let collected: Vec<DiffEntry> = reader.iter().collect();
         assert_eq!(collected, entries);
     }
@@ -532,7 +539,7 @@ mod tests {
         for e in &entries {
             data.extend_from_slice(&e.to_bytes());
         }
-        let reader = CommonEntryReader { data };
+        let reader = CommonEntryReader::from_slice(&data);
         let collected: Vec<CommonEntry> = reader.iter().collect();
         assert_eq!(collected, entries);
     }

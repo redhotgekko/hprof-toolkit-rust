@@ -27,7 +27,8 @@ pub fn index_heap_dumps(
     record_index_source: &impl MMapReader,
     output: &SubIndexDir,
 ) -> Result<u64, HprofError> {
-    let hprof = HprofFile::from_source(hprof_source.open_mmap()?)?;
+    let hprof_mmap = hprof_source.open_mmap()?;
+    let hprof = HprofFile::from_ref(hprof_mmap.as_ref())?;
     let id_size = hprof.header.id_size;
     let hprof_data: &[u8] = hprof.data();
 

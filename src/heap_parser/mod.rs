@@ -8,8 +8,7 @@ pub use record::{
 };
 
 use crate::heap_index::sub_record::{SUB_INDEX_ENTRY_SIZE, SubIndexEntry};
-use crate::hprof::{HprofError, map_file};
-use crate::vfs::{ByteSource, SubIndexDir};
+use crate::hprof::HprofError;
 use std::path::{Path, PathBuf};
 
 // ── SubIndexReader ────────────────────────────────────────────────────────────
@@ -18,34 +17,20 @@ use std::path::{Path, PathBuf};
 ///
 /// Each file was produced by [`crate::heap_index::index_heap_dumps`] for one
 /// `HPROF_HEAP_DUMP` / `HPROF_HEAP_DUMP_SEGMENT` record.
-pub struct SubIndexReader {
-    data: ByteSource,
+pub struct SubIndexReader<'a> {
+    data: &'a [u8],
 }
 
-impl SubIndexReader {
-    /// Open a heap index sub-index file for reading.
-    pub fn open(path: &Path) -> Result<Self, HprofError> {
-        let mmap = map_file(path)?;
-        if mmap.len() % SUB_INDEX_ENTRY_SIZE != 0 {
-            return Err(HprofError::InvalidIndexFile);
-        }
-        Ok(Self {
-            data: ByteSource::MMapSource(mmap),
-        })
-    }
-
-    /// Create a reader from raw bytes (e.g. from an in-memory `SubIndexDir`).
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, HprofError> {
+impl<'a> SubIndexReader<'a> {
+    pub fn from_ref(bytes: &'a [u8]) -> Result<Self, HprofError> {
         if !bytes.len().is_multiple_of(SUB_INDEX_ENTRY_SIZE) {
             return Err(HprofError::InvalidIndexFile);
         }
-        Ok(Self {
-            data: ByteSource::VecSource(bytes),
-        })
+        Ok(Self { data: bytes })
     }
 
     fn as_slice(&self) -> &[u8] {
-        self.data.as_ref()
+        self.data
     }
 
     /// Number of sub-index entries in this file.
@@ -59,9 +44,12 @@ impl SubIndexReader {
     }
 
     /// Iterate over all [`SubIndexEntry`] values in file order.
-    pub fn iter(&self) -> SubIndexIter<'_> {
+    ///
+    /// The returned iterator borrows from the underlying data slice (`'a`),
+    /// so it can outlive the `SubIndexReader` struct itself.
+    pub fn iter(&self) -> SubIndexIter<'a> {
         SubIndexIter {
-            data: self.as_slice(),
+            data: self.data,
             pos: 0,
         }
     }
@@ -141,6 +129,18 @@ pub struct SubIndexIter<'a> {
     pos: usize,
 }
 
+impl<'a> SubIndexIter<'a> {
+    /// Construct an iterator directly from a validated data slice.
+    ///
+    /// The caller must ensure `data.len()` is a multiple of
+    /// [`SUB_INDEX_ENTRY_SIZE`]; this is guaranteed when the slice comes from
+    /// a [`ByteSource`] that was validated at index-open time.
+    pub(crate) fn new(data: &'a [u8]) -> Self {
+        debug_assert!(data.len().is_multiple_of(SUB_INDEX_ENTRY_SIZE));
+        SubIndexIter { data, pos: 0 }
+    }
+}
+
 impl Iterator for SubIndexIter<'_> {
     type Item = SubIndexEntry;
 
@@ -185,18 +185,6 @@ pub fn sub_index_paths(output_dir: &Path) -> Result<Vec<PathBuf>, HprofError> {
     Ok(paths)
 }
 
-/// Return a list of [`SubIndexReader`] instances from a [`SubIndexDir`].
-///
-/// For filesystem-backed directories, this reads each file via mmap.
-/// For in-memory directories, this wraps each value as `VecSource`.
-pub fn sub_index_readers(dir: &SubIndexDir) -> Result<Vec<SubIndexReader>, HprofError> {
-    let all_bytes = dir.all_file_bytes()?;
-    all_bytes
-        .into_iter()
-        .map(SubIndexReader::from_bytes)
-        .collect()
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -206,6 +194,14 @@ mod tests {
     use crate::heap_index::sub_record::TAG_ROOT_STICKY_CLASS;
     use crate::record_index::index_hprof;
     use crate::vfs::SubIndexDir;
+
+    fn sub_index_readers(all_bytes: &[Vec<u8>]) -> Result<Vec<SubIndexReader<'_>>, HprofError> {
+        all_bytes
+            .iter()
+            .map(|data| data.as_ref())
+            .map(SubIndexReader::from_ref)
+            .collect()
+    }
 
     fn minimal_hprof_two_sticky_classes() -> Vec<u8> {
         let mut buf = Vec::new();
@@ -235,7 +231,8 @@ mod tests {
         index_hprof(&hprof_data, &mut idx_buf).unwrap();
         index_heap_dumps(&hprof_data, &idx_buf, &out_dir).unwrap();
 
-        let readers = sub_index_readers(&out_dir).unwrap();
+        let all_bytes = out_dir.all_file_bytes().unwrap();
+        let readers = sub_index_readers(&all_bytes).unwrap();
         assert_eq!(readers.len(), 1);
 
         let reader = &readers[0];
@@ -257,8 +254,9 @@ mod tests {
         index_hprof(&hprof_data, &mut idx_buf).unwrap();
         index_heap_dumps(&hprof_data, &idx_buf, &out_dir).unwrap();
 
-        let hprof = crate::hprof::HprofFile::from_bytes(hprof_data).unwrap();
-        let readers = sub_index_readers(&out_dir).unwrap();
+        let hprof = crate::hprof::HprofFile::from_ref(&hprof_data).unwrap();
+        let all_bytes = out_dir.all_file_bytes().unwrap();
+        let readers = sub_index_readers(&all_bytes).unwrap();
         let reader = &readers[0];
 
         let class_ids: Vec<u64> = reader

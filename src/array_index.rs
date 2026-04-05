@@ -30,10 +30,9 @@ use crate::heap_index::sub_record::{
 };
 use crate::hprof::record::read_u32_be;
 use crate::hprof::{HprofError, HprofFile};
-use crate::vfs::{ByteSource, MMapReader, MMapWriter};
+use crate::vfs::MMapWriter;
 use rayon::prelude::*;
 use std::io::Write;
-use std::path::Path;
 
 // ── ArrayKind ─────────────────────────────────────────────────────────────────
 
@@ -239,16 +238,14 @@ impl ArraySizeEntry {
 /// Returns the number of entries written for each [`ArrayKind`] in canonical
 /// order (same order as [`ArrayKind::ALL`]).
 pub fn build_array_size_indexes(
-    hprof_source: &impl MMapReader,
-    combined_source: &impl MMapReader,
+    hprof_source: &[u8],
+    combined_mmap: &[u8],
     outputs: &mut [impl MMapWriter; 9],
 ) -> Result<[u64; 9], HprofError> {
-    let hprof = HprofFile::from_source(hprof_source.open_mmap()?)?;
+    let hprof = HprofFile::from_ref(hprof_source)?;
     let id_size = hprof.header.id_size as usize;
     let hprof_data = hprof.data();
 
-    let combined_bs = combined_source.open_mmap()?;
-    let combined_mmap: &[u8] = combined_bs.as_ref();
     if !combined_mmap.len().is_multiple_of(SUB_INDEX_ENTRY_SIZE) {
         return Err(HprofError::InvalidIndexFile);
     }
@@ -342,34 +339,27 @@ fn read_le_u64(data: &[u8], offset: usize) -> u64 {
 /// Read-only handle to a single array size index file.
 ///
 /// Entries are in descending `byte_size` order (largest arrays first).
-pub struct ArraySizeReader {
-    data: ByteSource,
+pub struct ArraySizeReader<'a> {
+    data: &'a [u8],
 }
 
-impl ArraySizeReader {
-    /// Open `path` as a read-only memory-mapped array size index file.
-    pub fn open(path: &Path) -> Result<Self, HprofError> {
-        let mmap = crate::hprof::map_file(path)?;
-        if mmap.len() % ARRAY_SIZE_ENTRY_SIZE != 0 {
+impl<'a> ArraySizeReader<'a> {
+    /// Create a validated reader from a byte slice.
+    pub fn from_ref(data: &'a [u8]) -> Result<Self, HprofError> {
+        if !data.len().is_multiple_of(ARRAY_SIZE_ENTRY_SIZE) {
             return Err(HprofError::InvalidIndexFile);
         }
-        Ok(Self {
-            data: ByteSource::MMapSource(mmap),
-        })
+        Ok(Self { data })
     }
 
-    /// Create a reader from raw bytes.
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, HprofError> {
-        if !bytes.len().is_multiple_of(ARRAY_SIZE_ENTRY_SIZE) {
-            return Err(HprofError::InvalidIndexFile);
-        }
-        Ok(Self {
-            data: ByteSource::VecSource(bytes),
-        })
+    /// Create a reader from a slice already known to be valid.
+    pub(crate) fn from_slice(data: &'a [u8]) -> Self {
+        debug_assert!(data.len().is_multiple_of(ARRAY_SIZE_ENTRY_SIZE));
+        Self { data }
     }
 
     fn as_slice(&self) -> &[u8] {
-        self.data.as_ref()
+        self.data
     }
 
     /// Total number of entries in this index.
@@ -395,9 +385,9 @@ impl ArraySizeReader {
     }
 
     /// Iterate all entries in descending byte-size order.
-    pub fn iter(&self) -> ArraySizeIter<'_> {
+    pub fn iter(&self) -> ArraySizeIter<'a> {
         ArraySizeIter {
-            data: self.as_slice(),
+            data: self.data,
             pos: 0,
         }
     }

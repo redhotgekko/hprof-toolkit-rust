@@ -732,7 +732,7 @@ mod tests {
     use crate::object_store::combine_sort_and_split;
     use crate::record_index::index_hprof;
     use crate::ref_index::build_reference_index;
-    use crate::vfs::{MMapReader, SubIndexDir};
+    use crate::vfs::SubIndexDir;
 
     // ── Minimal hprof builder ─────────────────────────────────────────────────
 
@@ -963,27 +963,10 @@ mod tests {
             &et,
             &uc,
             &refs,
+            [&r0, &r1, &r2, &r3, &r4, &r5, &r6, &r7, &r8],
             [
-                &r0 as &dyn MMapReader,
-                &r1,
-                &r2,
-                &r3,
-                &r4,
-                &r5,
-                &r6,
-                &r7,
-                &r8,
-            ],
-            [
-                &arrays[0] as &dyn MMapReader,
-                &arrays[1],
-                &arrays[2],
-                &arrays[3],
-                &arrays[4],
-                &arrays[5],
-                &arrays[6],
-                &arrays[7],
-                &arrays[8],
+                &arrays[0], &arrays[1], &arrays[2], &arrays[3], &arrays[4], &arrays[5], &arrays[6],
+                &arrays[7], &arrays[8],
             ],
         )
         .unwrap()

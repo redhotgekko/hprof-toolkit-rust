@@ -3,7 +3,7 @@ pub mod entry;
 pub use entry::{INDEX_ENTRY_SIZE, IndexEntry};
 
 use crate::hprof::{HprofError, HprofFile};
-use crate::vfs::{MMapReader, MMapWriter};
+use crate::vfs::MMapWriter;
 use std::io::Write;
 
 /// Read every top-level record from `hprof_source` and write a fixed-size binary
@@ -16,10 +16,10 @@ use std::io::Write;
 ///
 /// Returns the number of records indexed.
 pub fn index_hprof(
-    hprof_source: &impl MMapReader,
+    hprof_source: &[u8],
     index_path: &mut impl MMapWriter,
 ) -> Result<u64, HprofError> {
-    let hprof = HprofFile::from_source(hprof_source.open_mmap()?)?;
+    let hprof = HprofFile::from_ref(hprof_source)?;
     let mut writer = index_path.create_writer()?;
 
     let mut count = 0u64;
@@ -97,7 +97,7 @@ mod tests {
     #[test]
     fn record_header_iter_matches_index() {
         let data = minimal_hprof();
-        let hprof = HprofFile::from_bytes(data.clone()).unwrap();
+        let hprof = HprofFile::from_ref(&data).unwrap();
 
         let headers: Vec<_> = hprof.record_headers().map(|r| r.unwrap()).collect();
 

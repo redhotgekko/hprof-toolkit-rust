@@ -25,7 +25,6 @@
 //! | `root_thread_obj.bin`   | `0x08`         | `ThreadObject`          |
 
 use crate::hprof::HprofError;
-use crate::vfs::ByteSource;
 use std::path::Path;
 
 // ── GcRootType ────────────────────────────────────────────────────────────────
@@ -136,36 +135,31 @@ impl RootIndexEntry {
 // ── RootIndexReader ───────────────────────────────────────────────────────────
 
 /// Read-only handle to a single per-type root index file.
-///
-/// Open once and reuse for multiple lookups; all access is via the memory map.
-pub struct RootIndexReader {
-    data: ByteSource,
+#[derive(Copy, Clone)]
+pub struct RootIndexReader<'a> {
+    data: &'a [u8],
 }
 
-impl RootIndexReader {
-    /// Open `path` as a read-only memory-mapped root index file.
-    pub fn open(path: &Path) -> Result<Self, HprofError> {
-        let mmap = crate::hprof::map_file(path)?;
-        if mmap.len() % ROOT_INDEX_ENTRY_SIZE != 0 {
+impl<'a> RootIndexReader<'a> {
+    /// Create a validated reader from a byte slice.
+    pub fn from_ref(data: &'a [u8]) -> Result<Self, HprofError> {
+        if !data.len().is_multiple_of(ROOT_INDEX_ENTRY_SIZE) {
             return Err(HprofError::InvalidIndexFile);
         }
-        Ok(Self {
-            data: ByteSource::MMapSource(mmap),
-        })
+        Ok(Self { data })
     }
 
-    /// Create a reader from raw bytes.
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, HprofError> {
-        if !bytes.len().is_multiple_of(ROOT_INDEX_ENTRY_SIZE) {
-            return Err(HprofError::InvalidIndexFile);
-        }
-        Ok(Self {
-            data: ByteSource::VecSource(bytes),
-        })
+    /// Create a reader from a slice already known to be valid.
+    ///
+    /// The caller must guarantee that `data.len()` is a multiple of
+    /// [`ROOT_INDEX_ENTRY_SIZE`]; checked with `debug_assert`.
+    pub(crate) fn from_slice(data: &'a [u8]) -> Self {
+        debug_assert!(data.len().is_multiple_of(ROOT_INDEX_ENTRY_SIZE));
+        Self { data }
     }
 
     fn as_slice(&self) -> &[u8] {
-        self.data.as_ref()
+        self.data
     }
 
     /// Total number of entries in this index.
@@ -201,9 +195,9 @@ impl RootIndexReader {
     }
 
     /// Iterate all entries in ascending `object_id` order.
-    pub fn iter(&self) -> RootIter<'_> {
+    pub fn iter(&self) -> RootIter<'a> {
         RootIter {
-            reader: self,
+            reader: *self,
             idx: 0,
         }
     }
@@ -239,7 +233,7 @@ impl RootIndexReader {
 ///
 /// Yields entries in ascending `object_id` order.
 pub struct RootIter<'a> {
-    reader: &'a RootIndexReader,
+    reader: RootIndexReader<'a>,
     idx: usize,
 }
 
@@ -315,7 +309,7 @@ mod tests {
     #[test]
     fn reader_find_found() {
         let data = make_root_index(&[(10, 1000), (20, 2000), (30, 3000)]);
-        let reader = RootIndexReader::from_bytes(data).unwrap();
+        let reader = RootIndexReader::from_ref(&data).unwrap();
         let e = reader.find(20).unwrap();
         assert_eq!(e.object_id, 20);
         assert_eq!(e.position, 2000);
@@ -324,13 +318,14 @@ mod tests {
     #[test]
     fn reader_find_not_found() {
         let data = make_root_index(&[(10, 1000), (20, 2000)]);
-        let reader = RootIndexReader::from_bytes(data).unwrap();
+        let reader = RootIndexReader::from_ref(&data).unwrap();
         assert!(reader.find(99).is_none());
     }
 
     #[test]
     fn reader_find_empty() {
-        let reader = RootIndexReader::from_bytes(vec![]).unwrap();
+        let empty: Vec<u8> = vec![];
+        let reader = RootIndexReader::from_ref(&empty).unwrap();
         assert!(reader.find(1).is_none());
         assert_eq!(reader.len(), 0);
         assert!(reader.is_empty());
@@ -339,7 +334,7 @@ mod tests {
     #[test]
     fn reader_iter_yields_all_in_order() {
         let data = make_root_index(&[(10, 100), (20, 200), (30, 300)]);
-        let reader = RootIndexReader::from_bytes(data).unwrap();
+        let reader = RootIndexReader::from_ref(&data).unwrap();
         let entries: Vec<_> = reader.iter().collect();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].object_id, 10);

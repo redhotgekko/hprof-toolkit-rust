@@ -45,61 +45,97 @@ pub use record::{Frame, LineNumber, ResolvedFrame, ResolvedThread, StartThread, 
 
 use crate::aux_index::AuxIndexReader;
 use crate::heap_query::name_index::Utf8IndexReader;
-use crate::hprof::{HprofError, HprofFile};
-use crate::vfs::MMapReader;
+use crate::hprof::{HprofError, HprofFile, HprofHeader};
+use crate::vfs::{ByteSource, MMapReader};
 use record::{parse_frame, parse_start_thread, parse_trace};
 
 // ── AuxRecordIndex ────────────────────────────────────────────────────────────
 
 /// High-level API for the auxiliary record indexes.
 ///
-/// All data is accessed via memory-mapped files; no heap dump content is
-/// loaded into process memory.
+/// All data is stored in owned [`ByteSource`] buffers (either memory maps or
+/// in-memory vecs); no heap dump content is loaded into process memory beyond
+/// what is already in the owned buffers.
 pub struct AuxRecordIndex {
-    hprof: HprofFile,
-    frames: AuxIndexReader,
-    traces: AuxIndexReader,
-    start_threads: AuxIndexReader,
-    end_threads: AuxIndexReader,
-    unload_classes: AuxIndexReader,
-    utf8: Utf8IndexReader,
+    hprof_data: ByteSource,
+    hprof_header: HprofHeader,
+    frame_data: ByteSource,
+    trace_data: ByteSource,
+    start_thread_data: ByteSource,
+    end_thread_data: ByteSource,
+    unload_class_data: ByteSource,
+    utf8_data: ByteSource,
 }
 
 impl AuxRecordIndex {
-    /// Open the hprof file and all auxiliary index files.
+    /// Open the auxiliary record indexes.
     ///
-    /// Each index file must have been produced by the corresponding
+    /// Each source must be an owned [`ByteSource`] (memory map or vec).
+    /// Each index must have been produced by the corresponding
     /// `build_*_index` function in [`crate::aux_index`].
     #[allow(clippy::too_many_arguments)]
     pub fn open(
-        hprof_source: &impl MMapReader,
-        frame_source: &impl MMapReader,
-        trace_source: &impl MMapReader,
-        start_thread_source: &impl MMapReader,
-        end_thread_source: &impl MMapReader,
-        unload_class_source: &impl MMapReader,
-        utf8_source: &impl MMapReader,
+        hprof_source: ByteSource,
+        frame_source: ByteSource,
+        trace_source: ByteSource,
+        start_thread_source: ByteSource,
+        end_thread_source: ByteSource,
+        unload_class_source: ByteSource,
+        utf8_source: ByteSource,
     ) -> Result<Self, HprofError> {
+        let hprof_header = HprofFile::from_ref(hprof_source.as_ref())?.header;
+        // Validate all indexes at construction time.
+        AuxIndexReader::from_ref(frame_source.as_ref())?;
+        AuxIndexReader::from_ref(trace_source.as_ref())?;
+        AuxIndexReader::from_ref(start_thread_source.as_ref())?;
+        AuxIndexReader::from_ref(end_thread_source.as_ref())?;
+        AuxIndexReader::from_ref(unload_class_source.as_ref())?;
+        Utf8IndexReader::from_ref(utf8_source.as_ref())?;
         Ok(Self {
-            hprof: HprofFile::from_source(hprof_source.open_mmap()?)?,
-            frames: AuxIndexReader::from_bytes(frame_source.open_mmap()?.as_ref().to_vec())?,
-            traces: AuxIndexReader::from_bytes(trace_source.open_mmap()?.as_ref().to_vec())?,
-            start_threads: AuxIndexReader::from_bytes(
-                start_thread_source.open_mmap()?.as_ref().to_vec(),
-            )?,
-            end_threads: AuxIndexReader::from_bytes(
-                end_thread_source.open_mmap()?.as_ref().to_vec(),
-            )?,
-            unload_classes: AuxIndexReader::from_bytes(
-                unload_class_source.open_mmap()?.as_ref().to_vec(),
-            )?,
-            utf8: Utf8IndexReader::from_bytes(utf8_source.open_mmap()?.as_ref().to_vec())?,
+            hprof_data: hprof_source,
+            hprof_header,
+            frame_data: frame_source,
+            trace_data: trace_source,
+            start_thread_data: start_thread_source,
+            end_thread_data: end_thread_source,
+            unload_class_data: unload_class_source,
+            utf8_data: utf8_source,
         })
+    }
+
+    // ── Short-lived reader helpers ────────────────────────────────────────────
+
+    fn hprof_file(&self) -> HprofFile<'_> {
+        HprofFile::from_parts(self.hprof_data.as_ref(), self.hprof_header.clone())
+    }
+
+    fn utf8_reader(&self) -> Result<Utf8IndexReader<'_>, HprofError> {
+        Utf8IndexReader::from_ref(self.utf8_data.as_ref())
     }
 
     /// Return the hprof identifier size in bytes (4 or 8).
     pub fn id_size(&self) -> u32 {
-        self.hprof.header.id_size
+        self.hprof_header.id_size
+    }
+
+    fn frames(&self) -> AuxIndexReader<'_> {
+        AuxIndexReader::from_slice(self.frame_data.as_ref())
+    }
+
+    fn traces(&self) -> AuxIndexReader<'_> {
+        AuxIndexReader::from_slice(self.trace_data.as_ref())
+    }
+
+    fn start_threads(&self) -> AuxIndexReader<'_> {
+        AuxIndexReader::from_slice(self.start_thread_data.as_ref())
+    }
+
+    fn end_threads(&self) -> AuxIndexReader<'_> {
+        AuxIndexReader::from_slice(self.end_thread_data.as_ref())
+    }
+
+    fn unload_classes(&self) -> AuxIndexReader<'_> {
+        AuxIndexReader::from_slice(self.unload_class_data.as_ref())
     }
 
     // ── Name resolution ───────────────────────────────────────────────────────
@@ -108,7 +144,8 @@ impl AuxRecordIndex {
     ///
     /// Returns `None` when `name_id` is not present.
     pub fn lookup_name(&self, name_id: u64) -> Result<Option<String>, HprofError> {
-        self.utf8.lookup(&self.hprof, name_id)
+        let hprof = self.hprof_file();
+        self.utf8_reader()?.lookup(&hprof, name_id)
     }
 
     // ── Frame lookups ─────────────────────────────────────────────────────────
@@ -117,11 +154,11 @@ impl AuxRecordIndex {
     ///
     /// Returns `None` when the frame is not in the index.
     pub fn find_frame(&self, frame_id: u64) -> Result<Option<Frame>, HprofError> {
-        match self.frames.find(frame_id) {
+        match self.frames().find(frame_id) {
             Some(offset) => Ok(Some(parse_frame(
-                self.hprof.data(),
+                self.hprof_data.as_ref(),
                 offset as usize,
-                self.hprof.header.id_size as usize,
+                self.hprof_header.id_size as usize,
             )?)),
             None => Ok(None),
         }
@@ -145,7 +182,9 @@ impl AuxRecordIndex {
     /// Iterate over all frames in the index in ascending `frame_id` order.
     pub fn iter_frames(&self) -> FrameIter<'_> {
         FrameIter {
-            index: self,
+            hprof_data: self.hprof_data.as_ref(),
+            id_size: self.hprof_header.id_size as usize,
+            frames: self.frames(),
             pos: 0,
         }
     }
@@ -156,11 +195,11 @@ impl AuxRecordIndex {
     ///
     /// Returns `None` when the trace is not in the index.
     pub fn find_trace(&self, trace_serial: u32) -> Result<Option<Trace>, HprofError> {
-        match self.traces.find(trace_serial as u64) {
+        match self.traces().find(trace_serial as u64) {
             Some(offset) => Ok(Some(parse_trace(
-                self.hprof.data(),
+                self.hprof_data.as_ref(),
                 offset as usize,
-                self.hprof.header.id_size as usize,
+                self.hprof_header.id_size as usize,
             )?)),
             None => Ok(None),
         }
@@ -183,7 +222,9 @@ impl AuxRecordIndex {
     /// Iterate over all traces in the index in ascending `trace_serial` order.
     pub fn iter_traces(&self) -> TraceIter<'_> {
         TraceIter {
-            index: self,
+            hprof_data: self.hprof_data.as_ref(),
+            id_size: self.hprof_header.id_size as usize,
+            traces: self.traces(),
             pos: 0,
         }
     }
@@ -194,11 +235,11 @@ impl AuxRecordIndex {
     ///
     /// Returns `None` when the thread is not in the index.
     pub fn find_start_thread(&self, thread_serial: u32) -> Result<Option<StartThread>, HprofError> {
-        match self.start_threads.find(thread_serial as u64) {
+        match self.start_threads().find(thread_serial as u64) {
             Some(offset) => Ok(Some(parse_start_thread(
-                self.hprof.data(),
+                self.hprof_data.as_ref(),
                 offset as usize,
-                self.hprof.header.id_size as usize,
+                self.hprof_header.id_size as usize,
             )?)),
             None => Ok(None),
         }
@@ -225,13 +266,15 @@ impl AuxRecordIndex {
 
     /// Returns `true` if a `HPROF_END_THREAD` record exists for `thread_serial`.
     pub fn was_thread_ended(&self, thread_serial: u32) -> bool {
-        self.end_threads.find(thread_serial as u64).is_some()
+        self.end_threads().find(thread_serial as u64).is_some()
     }
 
     /// Iterate over all start-thread records in ascending `thread_serial` order.
     pub fn iter_start_threads(&self) -> StartThreadIter<'_> {
         StartThreadIter {
-            index: self,
+            hprof_data: self.hprof_data.as_ref(),
+            id_size: self.hprof_header.id_size as usize,
+            start_threads: self.start_threads(),
             pos: 0,
         }
     }
@@ -240,7 +283,7 @@ impl AuxRecordIndex {
 
     /// Returns `true` if a `HPROF_UNLOAD_CLASS` record exists for `class_serial`.
     pub fn was_class_unloaded(&self, class_serial: u32) -> bool {
-        self.unload_classes.find(class_serial as u64).is_some()
+        self.unload_classes().find(class_serial as u64).is_some()
     }
 
     // ── Heap-based thread name resolution ─────────────────────────────────────
@@ -259,12 +302,9 @@ impl AuxRecordIndex {
         record_index_source: &impl MMapReader,
         object_store_source: &impl MMapReader,
     ) -> Result<std::collections::HashMap<u32, String>, HprofError> {
-        thread_names::collect_thread_names(
-            &self.hprof,
-            record_index_source,
-            object_store_source,
-            &self.utf8,
-        )
+        let hprof = self.hprof_file();
+        let utf8 = self.utf8_reader()?;
+        thread_names::collect_thread_names(&hprof, record_index_source, object_store_source, &utf8)
     }
 }
 
@@ -272,7 +312,9 @@ impl AuxRecordIndex {
 
 /// Iterator over all [`Frame`] records in ascending `frame_id` order.
 pub struct FrameIter<'a> {
-    index: &'a AuxRecordIndex,
+    hprof_data: &'a [u8],
+    id_size: usize,
+    frames: AuxIndexReader<'a>,
     pos: usize,
 }
 
@@ -280,22 +322,24 @@ impl Iterator for FrameIter<'_> {
     type Item = Result<Frame, HprofError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.index.frames.len() {
+        if self.pos >= self.frames.len() {
             return None;
         }
-        let (_key, hprof_offset) = self.index.frames.entry_at(self.pos);
+        let (_key, hprof_offset) = self.frames.entry_at(self.pos);
         self.pos += 1;
         Some(parse_frame(
-            self.index.hprof.data(),
+            self.hprof_data,
             hprof_offset as usize,
-            self.index.hprof.header.id_size as usize,
+            self.id_size,
         ))
     }
 }
 
 /// Iterator over all [`Trace`] records in ascending `trace_serial` order.
 pub struct TraceIter<'a> {
-    index: &'a AuxRecordIndex,
+    hprof_data: &'a [u8],
+    id_size: usize,
+    traces: AuxIndexReader<'a>,
     pos: usize,
 }
 
@@ -303,22 +347,24 @@ impl Iterator for TraceIter<'_> {
     type Item = Result<Trace, HprofError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.index.traces.len() {
+        if self.pos >= self.traces.len() {
             return None;
         }
-        let (_key, hprof_offset) = self.index.traces.entry_at(self.pos);
+        let (_key, hprof_offset) = self.traces.entry_at(self.pos);
         self.pos += 1;
         Some(parse_trace(
-            self.index.hprof.data(),
+            self.hprof_data,
             hprof_offset as usize,
-            self.index.hprof.header.id_size as usize,
+            self.id_size,
         ))
     }
 }
 
 /// Iterator over all [`StartThread`] records in ascending `thread_serial` order.
 pub struct StartThreadIter<'a> {
-    index: &'a AuxRecordIndex,
+    hprof_data: &'a [u8],
+    id_size: usize,
+    start_threads: AuxIndexReader<'a>,
     pos: usize,
 }
 
@@ -326,15 +372,15 @@ impl Iterator for StartThreadIter<'_> {
     type Item = Result<StartThread, HprofError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.index.start_threads.len() {
+        if self.pos >= self.start_threads.len() {
             return None;
         }
-        let (_key, hprof_offset) = self.index.start_threads.entry_at(self.pos);
+        let (_key, hprof_offset) = self.start_threads.entry_at(self.pos);
         self.pos += 1;
         Some(parse_start_thread(
-            self.index.hprof.data(),
+            self.hprof_data,
             hprof_offset as usize,
-            self.index.hprof.header.id_size as usize,
+            self.id_size,
         ))
     }
 }
@@ -350,6 +396,7 @@ mod tests {
     };
     use crate::heap_query::build_name_indexes;
     use crate::record_index::index_hprof;
+    use crate::vfs::ByteSource;
 
     // ── Minimal hprof builder ─────────────────────────────────────────────────
 
@@ -424,7 +471,6 @@ mod tests {
 
     /// Build all auxiliary indexes and open an [`AuxRecordIndex`].
     fn build_all(hprof_data: &[u8]) -> AuxRecordIndex {
-        let hprof = hprof_data.to_vec();
         let mut p1 = Vec::new();
         let mut frame_buf = Vec::new();
         let mut trace_buf = Vec::new();
@@ -434,16 +480,22 @@ mod tests {
         let mut utf8_buf = Vec::new();
         let mut lc_buf = Vec::new();
 
-        index_hprof(&hprof, &mut p1).unwrap();
-        build_frame_index(&hprof, &p1, &mut frame_buf).unwrap();
-        build_trace_index(&hprof, &p1, &mut trace_buf).unwrap();
-        build_start_thread_index(&hprof, &p1, &mut st_buf).unwrap();
-        build_end_thread_index(&hprof, &p1, &mut et_buf).unwrap();
-        build_unload_class_index(&hprof, &p1, &mut uc_buf).unwrap();
-        build_name_indexes(&hprof, &p1, &mut utf8_buf, &mut lc_buf).unwrap();
+        index_hprof(hprof_data, &mut p1).unwrap();
+        build_frame_index(hprof_data, &p1, &mut frame_buf).unwrap();
+        build_trace_index(hprof_data, &p1, &mut trace_buf).unwrap();
+        build_start_thread_index(hprof_data, &p1, &mut st_buf).unwrap();
+        build_end_thread_index(hprof_data, &p1, &mut et_buf).unwrap();
+        build_unload_class_index(hprof_data, &p1, &mut uc_buf).unwrap();
+        build_name_indexes(hprof_data, &p1, &mut utf8_buf, &mut lc_buf).unwrap();
 
         AuxRecordIndex::open(
-            &hprof, &frame_buf, &trace_buf, &st_buf, &et_buf, &uc_buf, &utf8_buf,
+            ByteSource::from(hprof_data.to_vec()),
+            ByteSource::from(frame_buf),
+            ByteSource::from(trace_buf),
+            ByteSource::from(st_buf),
+            ByteSource::from(et_buf),
+            ByteSource::from(uc_buf),
+            ByteSource::from(utf8_buf),
         )
         .unwrap()
     }

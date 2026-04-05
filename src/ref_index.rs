@@ -29,10 +29,9 @@ use crate::heap_parser::record::FieldValue;
 use crate::heap_query::HprofIndex;
 use crate::heap_query::resolve::read_field_value;
 use crate::hprof::HprofError;
-use crate::vfs::{MMapReader, MMapWriter};
+use crate::vfs::MMapWriter;
 use rayon::prelude::*;
 use std::io::Write;
-use std::path::Path;
 
 /// Byte size of one reference index record.
 pub const REF_ENTRY_SIZE: usize = 16;
@@ -53,21 +52,14 @@ pub const MAX_BACK_REFS: usize = 50;
 ///
 /// Returns the total number of reference records written.
 pub fn build_reference_index(
-    hprof_source: &impl MMapReader,
-    combined_source: &impl MMapReader,
-    utf8_source: &impl MMapReader,
-    load_class_source: &impl MMapReader,
+    hprof_source: &[u8],
+    combined_mmap: &[u8],
+    utf8_source: &[u8],
+    load_class_source: &[u8],
     output: &mut impl MMapWriter,
 ) -> Result<u64, HprofError> {
-    let index = HprofIndex::open(
-        hprof_source,
-        combined_source,
-        utf8_source,
-        load_class_source,
-    )?;
+    let index = HprofIndex::from_ref(hprof_source, combined_mmap, utf8_source, load_class_source)?;
 
-    let combined_bs = combined_source.open_mmap()?;
-    let combined_mmap: &[u8] = combined_bs.as_ref();
     if !combined_mmap.len().is_multiple_of(SUB_INDEX_ENTRY_SIZE) {
         return Err(HprofError::InvalidIndexFile);
     }
@@ -111,30 +103,23 @@ pub fn build_reference_index(
 // ── Public reader ─────────────────────────────────────────────────────────────
 
 /// Read-only handle to a sorted reference index file.
-pub struct RefIndex {
-    data: crate::vfs::ByteSource,
+pub struct RefIndex<'a> {
+    data: &'a [u8],
 }
 
-impl RefIndex {
-    /// Open `path` as a read-only memory-mapped reference index.
-    pub fn open(path: &Path) -> Result<Self, HprofError> {
-        let mmap = crate::hprof::map_file(path)?;
-        if mmap.len() % REF_ENTRY_SIZE != 0 {
+impl<'a> RefIndex<'a> {
+    /// Create a validated reader from a byte slice.
+    pub fn from_ref(data: &'a [u8]) -> Result<Self, HprofError> {
+        if !data.len().is_multiple_of(REF_ENTRY_SIZE) {
             return Err(HprofError::InvalidIndexFile);
         }
-        Ok(Self {
-            data: crate::vfs::ByteSource::MMapSource(mmap),
-        })
+        Ok(Self { data })
     }
 
-    /// Create a reader from raw bytes.
-    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, HprofError> {
-        if !bytes.len().is_multiple_of(REF_ENTRY_SIZE) {
-            return Err(HprofError::InvalidIndexFile);
-        }
-        Ok(Self {
-            data: crate::vfs::ByteSource::VecSource(bytes),
-        })
+    /// Create a reader from a slice already known to be valid.
+    pub(crate) fn from_slice(data: &'a [u8]) -> Self {
+        debug_assert!(data.len().is_multiple_of(REF_ENTRY_SIZE));
+        Self { data }
     }
 
     /// Return all `from_object_id` values that hold a reference to `to_id`.
@@ -142,7 +127,7 @@ impl RefIndex {
     /// Uses leftmost binary search followed by a linear scan through equal
     /// keys.  Results are bounded by [`MAX_BACK_REFS`].
     pub fn find(&self, to_id: u64) -> Vec<u64> {
-        let data = self.data.as_ref();
+        let data = self.data;
         let n = data.len() / REF_ENTRY_SIZE;
 
         // Leftmost binary search.
@@ -171,7 +156,7 @@ impl RefIndex {
 
     /// Total number of reference records in this index.
     pub fn len(&self) -> usize {
-        self.data.as_ref().len() / REF_ENTRY_SIZE
+        self.data.len() / REF_ENTRY_SIZE
     }
 
     /// Returns `true` if the index contains no records.
@@ -326,7 +311,7 @@ mod tests {
     fn ref_index_find_returns_matching_from_ids() {
         // Sorted pairs: (to=1,from=10), (to=2,from=20), (to=2,from=30), (to=3,from=40)
         let data = make_ref_bytes(&[(1, 10), (2, 20), (2, 30), (3, 40)]);
-        let idx = RefIndex::from_bytes(data).unwrap();
+        let idx = RefIndex::from_ref(&data).unwrap();
 
         assert_eq!(idx.find(2), vec![20, 30]);
         assert_eq!(idx.find(1), vec![10]);
@@ -336,7 +321,8 @@ mod tests {
 
     #[test]
     fn ref_index_find_empty_file() {
-        let idx = RefIndex::from_bytes(vec![]).unwrap();
+        let empty: Vec<u8> = vec![];
+        let idx = RefIndex::from_ref(&empty).unwrap();
         assert!(idx.find(1).is_empty());
         assert!(idx.is_empty());
     }

@@ -9,6 +9,7 @@ pub mod aux_index;
 pub mod aux_query;
 pub mod diff;
 pub mod diff_index;
+pub mod dominator;
 pub mod heap_index;
 pub mod heap_parser;
 pub mod heap_query;
