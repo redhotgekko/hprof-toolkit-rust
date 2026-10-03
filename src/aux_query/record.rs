@@ -15,9 +15,12 @@ pub(crate) const RECORD_HEADER_SIZE: usize = 9;
 
 /// A parsed `HPROF_FRAME` record.
 ///
+/// Mirrors the hprof record; not every field has a reader yet.
+///
 /// Names and signatures are stored as `name_id` references; use
 /// [`crate::aux_query::AuxRecordIndex::lookup_name`] to resolve them.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Frame {
     /// Unique identifier for this stack frame.
     pub frame_id: u64,
@@ -38,7 +41,10 @@ pub struct Frame {
 ///
 /// `frame_ids` is bounded by `num_frames` in the record — a small number
 /// even for deep stack traces — so storing it as a `Vec` is safe.
+///
+/// Mirrors the hprof record; not every field has a reader yet.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Trace {
     /// Unique serial number for this stack trace.
     pub trace_serial: u32,
@@ -50,9 +56,12 @@ pub struct Trace {
 
 /// A parsed `HPROF_START_THREAD` record.
 ///
+/// Mirrors the hprof record; not every field has a reader yet.
+///
 /// Name IDs are resolved via
 /// [`crate::aux_query::AuxRecordIndex::lookup_name`].
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct StartThread {
     /// Unique serial number for this thread.
     pub thread_serial: u32,
@@ -70,7 +79,7 @@ pub struct StartThread {
 
 // ── Resolved types ────────────────────────────────────────────────────────────
 
-/// The source line number extracted from a [`Frame`], with sentinel handling.
+/// The source line number of a stack frame, with the hprof sentinels decoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LineNumber {
     /// A positive source line number.
@@ -101,8 +110,6 @@ impl LineNumber {
 /// A [`Frame`] with all name IDs resolved to `String` values.
 #[derive(Debug, Clone)]
 pub struct ResolvedFrame {
-    /// Unique identifier for this stack frame.
-    pub frame_id: u64,
     /// Method name (resolved from UTF-8 index).
     pub method_name: String,
     /// Method descriptor / signature (resolved from UTF-8 index).
@@ -118,18 +125,10 @@ pub struct ResolvedFrame {
 /// A [`StartThread`] with the thread name resolved to a `String`.
 #[derive(Debug, Clone)]
 pub struct ResolvedThread {
-    /// Unique serial number for this thread.
-    pub thread_serial: u32,
-    /// Object ID of the `java.lang.Thread` instance.
-    pub thread_id: u64,
-    /// Serial number of the stack trace at the time of thread start.
-    pub stack_trace_serial: u32,
     /// Thread name (resolved from UTF-8 index).
     pub thread_name: String,
     /// Thread group name (resolved from UTF-8 index).
     pub thread_group_name: String,
-    /// Parent thread group name (resolved from UTF-8 index).
-    pub thread_parent_group_name: String,
 }
 
 // ── Parsers ───────────────────────────────────────────────────────────────────
@@ -273,35 +272,13 @@ pub(crate) fn read_id(data: &[u8], off: usize, id_size: usize) -> Result<u64, Hp
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn hprof_header(id_size: u32) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"JAVA PROFILE 1.0.2\0");
-        buf.extend_from_slice(&id_size.to_be_bytes());
-        buf.extend_from_slice(&0u64.to_be_bytes());
-        buf
-    }
-
-    fn write_record(buf: &mut Vec<u8>, tag: u8, body: &[u8]) -> usize {
-        let offset = buf.len();
-        buf.push(tag);
-        buf.extend_from_slice(&0u32.to_be_bytes());
-        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        buf.extend_from_slice(body);
-        offset
-    }
+    use crate::test_util::HprofBuilder;
 
     #[test]
     fn parse_frame_id8() {
-        let mut data = hprof_header(8);
-        let mut body = Vec::new();
-        body.extend_from_slice(&0xABCDu64.to_be_bytes()); // frame_id
-        body.extend_from_slice(&1u64.to_be_bytes()); // method_name_id
-        body.extend_from_slice(&2u64.to_be_bytes()); // method_sig_id
-        body.extend_from_slice(&3u64.to_be_bytes()); // source_file_id
-        body.extend_from_slice(&42u32.to_be_bytes()); // class_serial
-        body.extend_from_slice(&10i32.to_be_bytes()); // line_number
-        let off = write_record(&mut data, 0x04, &body);
+        let mut b = HprofBuilder::new(8);
+        let off = b.next_record_position() as usize;
+        let data = b.frame(0xABCD, 1, 2, 3, 42, 10).build();
         let frame = parse_frame(&data, off, 8).unwrap();
         assert_eq!(frame.frame_id, 0xABCD);
         assert_eq!(frame.method_name_id, 1);
@@ -311,14 +288,9 @@ mod tests {
 
     #[test]
     fn parse_trace_id8() {
-        let mut data = hprof_header(8);
-        let mut body = Vec::new();
-        body.extend_from_slice(&99u32.to_be_bytes()); // trace_serial
-        body.extend_from_slice(&1u32.to_be_bytes()); // thread_serial
-        body.extend_from_slice(&2u32.to_be_bytes()); // num_frames
-        body.extend_from_slice(&0x100u64.to_be_bytes());
-        body.extend_from_slice(&0x200u64.to_be_bytes());
-        let off = write_record(&mut data, 0x05, &body);
+        let mut b = HprofBuilder::new(8);
+        let off = b.next_record_position() as usize;
+        let data = b.trace(99, 1, &[0x100, 0x200]).build();
         let trace = parse_trace(&data, off, 8).unwrap();
         assert_eq!(trace.trace_serial, 99);
         assert_eq!(trace.thread_serial, 1);
@@ -327,27 +299,18 @@ mod tests {
 
     #[test]
     fn parse_trace_empty_frames() {
-        let mut data = hprof_header(8);
-        let mut body = Vec::new();
-        body.extend_from_slice(&5u32.to_be_bytes()); // trace_serial
-        body.extend_from_slice(&1u32.to_be_bytes()); // thread_serial
-        body.extend_from_slice(&0u32.to_be_bytes()); // num_frames = 0
-        let off = write_record(&mut data, 0x05, &body);
+        let mut b = HprofBuilder::new(8);
+        let off = b.next_record_position() as usize;
+        let data = b.trace(5, 1, &[]).build();
         let trace = parse_trace(&data, off, 8).unwrap();
         assert!(trace.frame_ids.is_empty());
     }
 
     #[test]
     fn parse_start_thread_id8() {
-        let mut data = hprof_header(8);
-        let mut body = Vec::new();
-        body.extend_from_slice(&7u32.to_be_bytes()); // thread_serial
-        body.extend_from_slice(&0xDEADu64.to_be_bytes()); // thread_id
-        body.extend_from_slice(&3u32.to_be_bytes()); // stack_trace_serial
-        body.extend_from_slice(&10u64.to_be_bytes()); // thread_name_id
-        body.extend_from_slice(&20u64.to_be_bytes()); // group_name_id
-        body.extend_from_slice(&30u64.to_be_bytes()); // parent_group_id
-        let off = write_record(&mut data, 0x0A, &body);
+        let mut b = HprofBuilder::new(8);
+        let off = b.next_record_position() as usize;
+        let data = b.start_thread(7, 0xDEAD, 3, 10, 20, 30).build();
         let st = parse_start_thread(&data, off, 8).unwrap();
         assert_eq!(st.thread_serial, 7);
         assert_eq!(st.thread_id, 0xDEAD);
@@ -355,6 +318,17 @@ mod tests {
         assert_eq!(st.thread_name_id, 10);
         assert_eq!(st.thread_group_name_id, 20);
         assert_eq!(st.thread_parent_group_name_id, 30);
+    }
+
+    #[test]
+    fn parse_frame_id4() {
+        let mut b = HprofBuilder::new(4);
+        let off = b.next_record_position() as usize;
+        let data = b.frame(0xABCD, 1, 2, 3, 42, -3).build();
+        let frame = parse_frame(&data, off, 4).unwrap();
+        assert_eq!(frame.frame_id, 0xABCD);
+        assert_eq!(frame.source_file_id, 3);
+        assert_eq!(LineNumber::from_raw(frame.line_number), LineNumber::Native);
     }
 
     #[test]

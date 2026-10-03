@@ -1,9 +1,9 @@
 //! Unified query API for heap dump analysis.
 //!
 //! [`HeapQuery`] is the single entry point for ad-hoc heap dump analysis.
-//! It wraps the heap-object API ([`crate::heap_query::HprofIndex`]) and the
-//! auxiliary record API ([`crate::aux_query::AuxRecordIndex`]) and opens both
-//! from a single [`crate::pipeline::IndexPaths`].
+//! It opens the object store, name, reference, GC-root, class, array, thread
+//! and retained-size indexes from one index store and answers questions from
+//! them.
 //!
 //! All data is accessed via memory-mapped files; no dump data is loaded into
 //! process memory.  Object lookup is O(log n) via binary search; parallel
@@ -11,84 +11,87 @@
 //!
 //! ## Quick start
 //!
-//! ```rust,ignore
-//! use hprof_toolkit::query::HeapQuery;
-//! use hprof_toolkit::pipeline::IndexPaths;
-//! use hprof_toolkit::heap_parser::SubRecord;
-//! use std::path::Path;
+//! ```no_run
+//! use hprof_toolkit::prelude::*;
 //!
-//! let hprof = Path::new("heap.dump");
-//! let paths = IndexPaths::for_hprof(hprof);
-//! let query  = HeapQuery::open(hprof, &paths)?;
+//! // Builds the indexes on first use, then just opens them.
+//! let heap = HeapQuery::open("heap.hprof")?;
 //!
-//! // Look up a single object by ID
-//! if let Some(record) = query.find(0xDEAD_BEEF)? {
+//! // Look up a single object by ID.
+//! if let Some(record) = heap.object(0xDEAD_BEEF)? {
 //!     match record {
 //!         SubRecord::InstanceDump(inst) => {
-//!             let name = query.class_name(inst.class_id)?.unwrap_or_default();
-//!             let fields = query.instance_fields(&inst)?;
-//!             println!("{name}: {fields:?}");
+//!             let name = heap.class_name(inst.class_id).unwrap_or_default();
+//!             println!("{name}: {:?}", heap.instance_fields(&inst)?);
 //!         }
 //!         SubRecord::ClassDump(cd) => {
-//!             println!("class: {}", query.class_name(cd.class_id)?.unwrap_or_default());
+//!             println!("class: {}", heap.class_name(cd.class_id).unwrap_or_default());
 //!         }
 //!         _ => {}
 //!     }
 //! }
 //!
-//! // Iterate all instances in parallel
-//! query.par_instances(|inst| {
-//!     let _ = query.class_name(inst.class_id)?;
-//!     Ok(())
+//! // Visit all instances in parallel (rayon).
+//! // (`ParallelIterator` comes with the prelude.)
+//! heap.par_instances().try_for_each(|inst| {
+//!     let _ = heap.class_name(inst?.class_id);
+//!     Ok::<(), HprofError>(())
 //! })?;
+//! # Ok::<(), HprofError>(())
 //! ```
+//!
+//! Tests (and anything else that has the dump in memory) use
+//! [`HeapQuery::from_store`] with an [`crate::index::MemStore`] instead; no
+//! file is involved.
 
 use crate::array_index::{ArrayKind, ArraySizeIter, ArraySizeReader};
 use crate::aux_query::{
     AuxRecordIndex, Frame, FrameIter, ResolvedFrame, ResolvedThread, StartThread, StartThreadIter,
     Trace, TraceIter,
 };
-use crate::dominator::{DominatorIndex, RetainedIndex};
+use crate::class_index::{HistogramRecord, InstanceByClassEntry};
+use crate::class_key::ClassKey;
+use crate::dominator::{DomChildEntry, DominatorIndex, RetainedBySizeEntry, RetainedIndex};
 use crate::heap_index::sub_record::SubIndexEntry;
+use crate::heap_index::sub_record::TAG_INSTANCE_DUMP;
 use crate::heap_parser::{ClassDump, InstanceDump, SubIndexIter, SubRecord};
-use crate::heap_query::{HprofIndex, JavaValue, ResolvedField};
+use crate::heap_query::name_index::LoadClassEntry;
+use crate::heap_query::{Field, HprofIndex};
 use crate::hprof::{HprofError, HprofHeader};
-use crate::pipeline::IndexPaths;
+use crate::index::{
+    ByteSource, FsStore, HprofIdentity, IndexStore, Manifest, RecordFile, RecordIter, names,
+};
+use crate::pipeline::{IndexOptions, build_all_indexes_with, default_index_dir};
+use crate::progress::{NoProgress, Progress};
 use crate::ref_index::RefIndex;
-use crate::root_index::{GcRootType, RootIndexEntry, RootIndexReader, RootIter};
-use crate::vfs::{ByteSource, MMapReader};
+use crate::resolved::Value;
+use crate::root_index::{GcRootType, RootIndexReader, RootIter};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
-// ── RootPathResult ────────────────────────────────────────────────────────────
-
-/// Maximum number of BFS nodes visited before [`HeapQuery::path_to_root`] gives up.
-pub const ROOT_PATH_SEARCH_LIMIT: usize = 10_000;
-
-/// Result of [`HeapQuery::path_to_root`].
-#[derive(Debug, Clone)]
-pub enum RootPathResult {
-    /// A path was found.  `path[0]` is a GC root; `path.last()` is the target.
-    Found(Vec<u64>),
-    /// The BFS hit [`ROOT_PATH_SEARCH_LIMIT`] visited nodes before finding a root.
-    LimitReached,
-    /// The reference graph was exhausted without reaching any GC root.
-    NotReachable,
+/// Borrow the bytes behind a shared [`ByteSource`].
+fn bytes(src: &Arc<ByteSource>) -> &[u8] {
+    (**src).as_ref()
 }
 
 // ── HeapQuery ─────────────────────────────────────────────────────────────────
 
 /// Unified query API over a heap dump and all its index files.
 ///
-/// Wraps both the heap-object API ([`HprofIndex`]) and the auxiliary record
-/// API ([`AuxRecordIndex`]) and exposes a single, intuitive interface.
+/// Owns every index a question can need (objects, names, references, GC roots,
+/// classes, arrays, threads, retained sizes) behind one interface.
 ///
 /// All data is accessed via memory-mapped files; no dump data is loaded into
 /// process memory.
 pub struct HeapQuery {
-    hprof_data: ByteSource,
+    /// The hprof bytes, shared with the auxiliary index.
+    hprof_data: Arc<ByteSource>,
     hprof_header: HprofHeader,
     combined_data: ByteSource,
-    utf8_data: ByteSource,
+    /// UTF-8 name index, shared with the auxiliary index.
+    utf8_data: Arc<ByteSource>,
     lc_data: ByteSource,
     aux: AuxRecordIndex,
     /// Per-type GC root data, indexed by [`GcRootType::index()`].
@@ -97,266 +100,406 @@ pub struct HeapQuery {
     refs: ByteSource,
     /// Per-kind array size index data, indexed by [`ArrayKind::index()`].
     array_sizes: [ByteSource; 9],
-    /// Dominator tree index data (optional — present only when built).
-    dominator: Option<ByteSource>,
-    /// Retained heap size index data (optional — present only when built).
-    retained: Option<ByteSource>,
+    /// Objects grouped by class key (`instances_by_class.bin`).
+    instances_by_class: ByteSource,
+    /// Per-class counts and shallow sizes (`class_histogram.bin`).
+    class_histogram: ByteSource,
+    /// The dominator/retained index family (optional — present only when
+    /// the pipeline ran with `IndexOptions::retained`).
+    retained_set: Option<RetainedSet>,
+    /// Class id ⇄ name maps, built when the query is opened (O(classes),
+    /// never O(objects)).
+    class_names: ClassNames,
+}
+
+/// Every loaded class's dot-notation name, both directions.
+#[derive(Default)]
+struct ClassNames {
+    by_id: HashMap<u64, Arc<str>>,
+    /// The lowest class id wins when several classes share a name (as with
+    /// the same class loaded by two class loaders).
+    by_name: HashMap<Arc<str>, u64>,
+}
+
+/// The four entries produced by the dominator step, see
+/// [`crate::index::names::RETAINED_SET`].
+struct RetainedSet {
+    dominators: ByteSource,
+    retained: ByteSource,
+    by_size: ByteSource,
+    children: ByteSource,
+}
+
+// ── Paging ────────────────────────────────────────────────────────────────────
+
+/// A window into a ranked or grouped result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Page {
+    /// Number of items to skip.
+    pub offset: usize,
+    /// Maximum number of items to return.
+    pub limit: usize,
+}
+
+impl Page {
+    pub fn new(offset: usize, limit: usize) -> Self {
+        Self { offset, limit }
+    }
+
+    /// The first `limit` items.
+    pub fn first(limit: usize) -> Self {
+        Self { offset: 0, limit }
+    }
+}
+
+/// One page of results plus what the caller needs to page further.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageResult<T> {
+    /// The items in this page, in result order.
+    pub items: Vec<T>,
+    /// Total number of items across all pages.
+    pub total: usize,
+    /// `true` when `offset + items.len() < total`.
+    pub has_more: bool,
+}
+
+// ── Bounded scans ─────────────────────────────────────────────────────────────
+
+/// A window over an id-ordered scan that has to read object contents (for
+/// example [`HeapQuery::search_strings`]).
+///
+/// Unlike [`Page`], the number of matches is not known up front, so a scan
+/// examines at most `max_scan` entries from `cursor`, stops early once it
+/// has `max_results` matches, and reports in [`ScanResult::next_cursor`]
+/// where to continue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanWindow {
+    /// Index of the first entry to examine (a previous
+    /// [`ScanResult::next_cursor`]).
+    pub cursor: usize,
+    /// Entries to examine at most in this call.
+    pub max_scan: usize,
+    /// Stop after this many matches.
+    pub max_results: usize,
+}
+
+impl ScanWindow {
+    /// Default `max_scan`.
+    pub const DEFAULT_MAX_SCAN: usize = 100_000;
+    /// Largest `max_scan` the front ends accept.
+    pub const MAX_SCAN_LIMIT: usize = 5_000_000;
+    /// Default `max_results`.
+    pub const DEFAULT_MAX_RESULTS: usize = 20;
+    /// Largest `max_results` the front ends accept.
+    pub const MAX_RESULTS_LIMIT: usize = 200;
+
+    pub fn new(cursor: usize, max_scan: usize, max_results: usize) -> Self {
+        Self {
+            cursor,
+            max_scan,
+            max_results,
+        }
+    }
+
+    /// From the start, with the default budget.
+    pub fn first() -> Self {
+        Self::new(0, Self::DEFAULT_MAX_SCAN, Self::DEFAULT_MAX_RESULTS)
+    }
+
+    /// The same budget, continuing from `cursor`.
+    pub fn from(self, cursor: usize) -> Self {
+        Self { cursor, ..self }
+    }
+}
+
+impl Default for ScanWindow {
+    fn default() -> Self {
+        Self::first()
+    }
+}
+
+/// What one [`ScanWindow`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanResult<T> {
+    /// The matches, in scan order.
+    pub items: Vec<T>,
+    /// Entries examined in this call.
+    pub scanned: usize,
+    /// Entries in the whole scan.
+    pub total: usize,
+    /// Where to continue, or `None` when the scan reached the end.
+    pub next_cursor: Option<usize>,
+}
+
+impl<T> ScanResult<T> {
+    /// A scan over nothing.
+    pub(crate) fn empty() -> Self {
+        Self {
+            items: Vec::new(),
+            scanned: 0,
+            total: 0,
+            next_cursor: None,
+        }
+    }
+
+    /// The window that continues this scan, if it is not finished.
+    pub fn next_window(&self, window: ScanWindow) -> Option<ScanWindow> {
+        self.next_cursor.map(|c| window.from(c))
+    }
+}
+
+/// A `java.lang.String` found by [`HeapQuery::search_strings`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StringMatch {
+    /// The String object's id.
+    pub object_id: u64,
+    /// Length of the whole string in characters.
+    pub length_chars: usize,
+    /// The first [`StringMatch::PREVIEW_CHARS`] characters.
+    pub preview: String,
+}
+
+impl StringMatch {
+    /// How much of a matched string [`StringMatch::preview`] carries.
+    pub const PREVIEW_CHARS: usize = 200;
+}
+
+impl<T> PageResult<T> {
+    /// No items at all.
+    pub(crate) fn empty() -> Self {
+        Self {
+            items: Vec::new(),
+            total: 0,
+            has_more: false,
+        }
+    }
+
+    /// Take `page` out of an iterator whose total length is only known by
+    /// exhausting it (a filtered list).  The items outside the page are
+    /// counted, not kept.
+    pub(crate) fn from_unsized(page: Page, iter: impl Iterator<Item = T>) -> Self {
+        let mut total = 0;
+        let mut items = Vec::new();
+        for item in iter {
+            if total >= page.offset && items.len() < page.limit {
+                items.push(item);
+            }
+            total += 1;
+        }
+        let has_more = page.offset + items.len() < total;
+        Self {
+            items,
+            total,
+            has_more,
+        }
+    }
+
+    /// Take `page` out of an iterator whose total length is known.
+    fn from_iter(total: usize, page: Page, iter: impl Iterator<Item = T>) -> Self {
+        let items: Vec<T> = iter.skip(page.offset).take(page.limit).collect();
+        let has_more = page.offset + items.len() < total;
+        Self {
+            items,
+            total,
+            has_more,
+        }
+    }
 }
 
 impl HeapQuery {
-    /// Open the heap dump and all index files described by `paths`.
+    /// Open the heap dump at `hprof_path`, building any missing indexes first.
     ///
-    /// All index files must already exist (run [`crate::pipeline::build_all_indexes`]
-    /// first).
-    pub fn open(hprof_path: &Path, paths: &IndexPaths) -> Result<Self, HprofError> {
-        let hprof_pb = hprof_path.to_path_buf();
-        let hprof_data = hprof_pb.open_mmap()?;
-        let combined_data = paths.object_store.open_mmap()?;
-        let utf8_data = paths.utf8.open_mmap()?;
-        let lc_data = paths.load_class.open_mmap()?;
-        let hprof_header = HprofIndex::from_ref(
-            hprof_data.as_ref(),
-            combined_data.as_ref(),
-            utf8_data.as_ref(),
-            lc_data.as_ref(),
-        )?
-        .hprof_header();
-
-        let roots = [
-            {
-                let s = paths.root_unknown.open_mmap()?;
-                RootIndexReader::from_ref(s.as_ref())?;
-                s
-            },
-            {
-                let s = paths.root_jni_global.open_mmap()?;
-                RootIndexReader::from_ref(s.as_ref())?;
-                s
-            },
-            {
-                let s = paths.root_jni_local.open_mmap()?;
-                RootIndexReader::from_ref(s.as_ref())?;
-                s
-            },
-            {
-                let s = paths.root_java_frame.open_mmap()?;
-                RootIndexReader::from_ref(s.as_ref())?;
-                s
-            },
-            {
-                let s = paths.root_native_stack.open_mmap()?;
-                RootIndexReader::from_ref(s.as_ref())?;
-                s
-            },
-            {
-                let s = paths.root_sticky_class.open_mmap()?;
-                RootIndexReader::from_ref(s.as_ref())?;
-                s
-            },
-            {
-                let s = paths.root_thread_block.open_mmap()?;
-                RootIndexReader::from_ref(s.as_ref())?;
-                s
-            },
-            {
-                let s = paths.root_monitor_used.open_mmap()?;
-                RootIndexReader::from_ref(s.as_ref())?;
-                s
-            },
-            {
-                let s = paths.root_thread_obj.open_mmap()?;
-                RootIndexReader::from_ref(s.as_ref())?;
-                s
-            },
-        ];
-        let refs = {
-            let s = paths.refs.open_mmap()?;
-            RefIndex::from_ref(s.as_ref())?;
-            s
+    /// Indexes live in `{stem}.indexes/` next to the dump and are reused on
+    /// later runs.  Only the *cheap* indexes are built implicitly; the
+    /// dominator tree and retained sizes (the one step whose memory grows
+    /// with the heap) are used if they already exist but never started here —
+    /// use [`Self::open_with`] with `IndexOptions { retained: true, .. }` or
+    /// run `hprof-toolkit index` to build them.  Nothing is printed; see
+    /// [`Self::open_with`] for progress.
+    ///
+    /// ```no_run
+    /// use hprof_toolkit::HeapQuery;
+    ///
+    /// let heap = HeapQuery::open("heap.hprof")?;
+    /// println!("{} objects", heap.object_count());
+    /// # Ok::<(), hprof_toolkit::HprofError>(())
+    /// ```
+    pub fn open(hprof_path: impl AsRef<Path>) -> Result<Self, HprofError> {
+        let opts = IndexOptions {
+            retained: false,
+            ..IndexOptions::default()
         };
-        let array_sizes = [
-            {
-                let s = paths.array_size(ArrayKind::Boolean).open_mmap()?;
-                ArraySizeReader::from_ref(s.as_ref())?;
-                s
-            },
-            {
-                let s = paths.array_size(ArrayKind::Char).open_mmap()?;
-                ArraySizeReader::from_ref(s.as_ref())?;
-                s
-            },
-            {
-                let s = paths.array_size(ArrayKind::Float).open_mmap()?;
-                ArraySizeReader::from_ref(s.as_ref())?;
-                s
-            },
-            {
-                let s = paths.array_size(ArrayKind::Double).open_mmap()?;
-                ArraySizeReader::from_ref(s.as_ref())?;
-                s
-            },
-            {
-                let s = paths.array_size(ArrayKind::Byte).open_mmap()?;
-                ArraySizeReader::from_ref(s.as_ref())?;
-                s
-            },
-            {
-                let s = paths.array_size(ArrayKind::Short).open_mmap()?;
-                ArraySizeReader::from_ref(s.as_ref())?;
-                s
-            },
-            {
-                let s = paths.array_size(ArrayKind::Int).open_mmap()?;
-                ArraySizeReader::from_ref(s.as_ref())?;
-                s
-            },
-            {
-                let s = paths.array_size(ArrayKind::Long).open_mmap()?;
-                ArraySizeReader::from_ref(s.as_ref())?;
-                s
-            },
-            {
-                let s = paths.array_size(ArrayKind::Object).open_mmap()?;
-                ArraySizeReader::from_ref(s.as_ref())?;
-                s
-            },
-        ];
-
-        Ok(Self {
-            hprof_data,
-            hprof_header,
-            combined_data,
-            utf8_data,
-            lc_data,
-            aux: AuxRecordIndex::open(
-                hprof_pb.open_mmap()?,
-                paths.frames.open_mmap()?,
-                paths.traces.open_mmap()?,
-                paths.start_threads.open_mmap()?,
-                paths.end_threads.open_mmap()?,
-                paths.unload_classes.open_mmap()?,
-                paths.utf8.open_mmap()?,
-            )?,
-            roots,
-            refs,
-            array_sizes,
-            dominator: if paths.dominators.exists() {
-                let src = paths.dominators.open_mmap()?;
-                DominatorIndex::from_ref(src.as_ref())?;
-                Some(src)
-            } else {
-                None
-            },
-            retained: if paths.retained.exists() {
-                let src = paths.retained.open_mmap()?;
-                RetainedIndex::from_ref(src.as_ref())?;
-                Some(src)
-            } else {
-                None
-            },
-        })
+        Self::open_with(hprof_path, &opts, &NoProgress)
     }
 
-    /// Open a [`HeapQuery`] from in-memory sources.
-    ///
-    /// All sources implement [`MMapReader`] (e.g. `Vec<u8>`, `PathBuf`).
-    /// `root_sources` must be 9 sources in the canonical GC-root order
-    /// (unknown, jni_global, jni_local, java_frame, native_stack, sticky_class,
-    /// thread_block, monitor_used, thread_obj).
-    /// `array_sources` must be 9 sources in [`ArrayKind::ALL`] order
-    /// (boolean, char, float, double, byte, short, int, long, object).
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_sources(
-        hprof_source: &[u8],
-        combined_source: &[u8],
-        utf8_source: &[u8],
-        lc_source: &[u8],
-        frame_source: &[u8],
-        trace_source: &[u8],
-        start_thread_source: &[u8],
-        end_thread_source: &[u8],
-        unload_class_source: &[u8],
-        refs_source: &[u8],
-        root_sources: [&[u8]; 9],
-        array_sources: [&[u8]; 9],
+    /// [`Self::open`] with explicit [`IndexOptions`] and a [`Progress`] sink.
+    pub fn open_with(
+        hprof_path: impl AsRef<Path>,
+        opts: &IndexOptions,
+        progress: &dyn Progress,
     ) -> Result<Self, HprofError> {
-        let hprof_data = ByteSource::from(hprof_source.to_vec());
-        let combined_data = ByteSource::from(combined_source.to_vec());
-        let utf8_data = ByteSource::from(utf8_source.to_vec());
-        let lc_data = ByteSource::from(lc_source.to_vec());
+        let hprof_path = hprof_path.as_ref();
+        let dir = build_all_indexes_with(hprof_path, opts, progress)?;
+        Self::open_existing_in(hprof_path, &dir)
+    }
+
+    /// Fail with [`HprofError::NotIndexed`] unless `store` holds a completed
+    /// build of every mandatory index.
+    pub(crate) fn check_indexed(store: &dyn IndexStore) -> Result<(), HprofError> {
+        let manifest = Manifest::read(store)?.ok_or(HprofError::NotIndexed("hprof"))?;
+        match names::mandatory()
+            .into_iter()
+            .find(|n| !manifest.is_built(n) || !store.exists(n))
+        {
+            Some(missing) => Err(HprofError::NotIndexed(missing)),
+            None => Ok(()),
+        }
+    }
+
+    /// Open the heap dump at `hprof_path` using indexes that must already
+    /// exist; never builds anything.
+    ///
+    /// Fails with [`HprofError::NotIndexed`] when the index directory, its
+    /// manifest or any mandatory index is missing.
+    pub fn open_existing(hprof_path: impl AsRef<Path>) -> Result<Self, HprofError> {
+        let hprof_path = hprof_path.as_ref();
+        Self::open_existing_in(hprof_path, &default_index_dir(hprof_path))
+    }
+
+    /// [`Self::open_existing`] with the indexes in `dir` instead of next to
+    /// the dump.
+    pub fn open_existing_in(hprof_path: &Path, dir: &Path) -> Result<Self, HprofError> {
+        if !dir.is_dir() {
+            return Err(HprofError::NotIndexed("hprof"));
+        }
+        let store = FsStore::open_or_create(dir)?;
+        Self::check_indexed(&store)?;
+        Self::from_store(ByteSource::map_file(hprof_path)?, &store)
+    }
+
+    /// Open a [`HeapQuery`] over `hprof` and the indexes in `store`.
+    ///
+    /// This is the one real constructor; it works identically for a
+    /// filesystem store (memory-mapped files) and an in-memory store.  All
+    /// mandatory indexes must exist in the store; the dominator and retained
+    /// indexes are optional and detected via [`IndexStore::exists`].
+    pub fn from_store(hprof: ByteSource, store: &dyn IndexStore) -> Result<Self, HprofError> {
+        if let Some(manifest) = Manifest::read(store)? {
+            let identity = HprofIdentity::of(hprof.as_ref())?;
+            if let Some(reason) = manifest.mismatch_reason(&identity) {
+                return Err(HprofError::Corrupt(reason));
+            }
+        }
+        let hprof = Arc::new(hprof);
+        let utf8 = Arc::new(store.open(names::UTF8)?);
+        let aux = AuxRecordIndex::open(
+            Arc::clone(&hprof),
+            store.open(names::FRAMES)?,
+            store.open(names::TRACES)?,
+            store.open(names::START_THREADS)?,
+            store.open(names::END_THREADS)?,
+            store.open(names::UNLOAD_CLASSES)?,
+            Arc::clone(&utf8),
+        )?;
+        let open_nine = |entries: &[&str; 9]| -> Result<[ByteSource; 9], HprofError> {
+            let v: Vec<ByteSource> = entries
+                .iter()
+                .map(|n| store.open(n))
+                .collect::<Result<_, _>>()?;
+            v.try_into()
+                .map_err(|_| HprofError::Internal("expected 9 index entries".to_owned()))
+        };
+        let retained_set = if names::RETAINED_SET.iter().all(|n| store.exists(n)) {
+            Some(RetainedSet {
+                dominators: store.open(names::DOMINATORS)?,
+                retained: store.open(names::RETAINED)?,
+                by_size: store.open(names::RETAINED_BY_SIZE)?,
+                children: store.open(names::DOMINATOR_CHILDREN)?,
+            })
+        } else {
+            None
+        };
+        Self::create(
+            hprof,
+            store.open(names::OBJECT_STORE)?,
+            utf8,
+            store.open(names::LOAD_CLASS)?,
+            aux,
+            store.open(names::REFS)?,
+            open_nine(&names::ROOTS)?,
+            open_nine(&names::ARRAYS)?,
+            store.open(names::INSTANCES_BY_CLASS)?,
+            store.open(names::CLASS_HISTOGRAM)?,
+            retained_set,
+        )
+    }
+
+    /// Shared inner constructor: validates all readers from their [`ByteSource`]s
+    /// and stores them.
+    #[allow(clippy::too_many_arguments)]
+    fn create(
+        hprof_data: Arc<ByteSource>,
+        combined_data: ByteSource,
+        utf8_data: Arc<ByteSource>,
+        lc_data: ByteSource,
+        aux: AuxRecordIndex,
+        refs_data: ByteSource,
+        root_data: [ByteSource; 9],
+        array_data: [ByteSource; 9],
+        instances_by_class: ByteSource,
+        class_histogram: ByteSource,
+        retained_set: Option<RetainedSet>,
+    ) -> Result<Self, HprofError> {
         let hprof_header = HprofIndex::from_ref(
-            hprof_data.as_ref(),
+            bytes(&hprof_data),
             combined_data.as_ref(),
-            utf8_data.as_ref(),
+            bytes(&utf8_data),
             lc_data.as_ref(),
         )?
         .hprof_header();
-
-        let make_root = |s: &[u8]| -> Result<ByteSource, HprofError> {
-            RootIndexReader::from_ref(s)?;
-            Ok(ByteSource::from(s.to_vec()))
-        };
-        let make_array = |s: &[u8]| -> Result<ByteSource, HprofError> {
-            ArraySizeReader::from_ref(s)?;
-            Ok(ByteSource::from(s.to_vec()))
-        };
-        let refs = {
-            RefIndex::from_ref(refs_source)?;
-            ByteSource::from(refs_source.to_vec())
-        };
-
-        Ok(Self {
+        RefIndex::from_ref(refs_data.as_ref())?;
+        for s in &root_data {
+            RootIndexReader::from_ref(s.as_ref())?;
+        }
+        for s in &array_data {
+            ArraySizeReader::from_ref(s.as_ref())?;
+        }
+        RecordFile::<InstanceByClassEntry>::new(instances_by_class.as_ref())?;
+        RecordFile::<HistogramRecord>::new(class_histogram.as_ref())?;
+        if let Some(set) = &retained_set {
+            DominatorIndex::from_ref(set.dominators.as_ref())?;
+            RetainedIndex::from_ref(set.retained.as_ref())?;
+            RecordFile::<RetainedBySizeEntry>::new(set.by_size.as_ref())?;
+            RecordFile::<DomChildEntry>::new(set.children.as_ref())?;
+        }
+        let mut query = Self {
             hprof_data,
             hprof_header,
             combined_data,
             utf8_data,
             lc_data,
-            aux: AuxRecordIndex::open(
-                ByteSource::from(hprof_source.to_vec()),
-                ByteSource::from(frame_source.to_vec()),
-                ByteSource::from(trace_source.to_vec()),
-                ByteSource::from(start_thread_source.to_vec()),
-                ByteSource::from(end_thread_source.to_vec()),
-                ByteSource::from(unload_class_source.to_vec()),
-                ByteSource::from(utf8_source.to_vec()),
-            )?,
-            roots: [
-                make_root(root_sources[0])?,
-                make_root(root_sources[1])?,
-                make_root(root_sources[2])?,
-                make_root(root_sources[3])?,
-                make_root(root_sources[4])?,
-                make_root(root_sources[5])?,
-                make_root(root_sources[6])?,
-                make_root(root_sources[7])?,
-                make_root(root_sources[8])?,
-            ],
-            refs,
-            array_sizes: [
-                make_array(array_sources[0])?,
-                make_array(array_sources[1])?,
-                make_array(array_sources[2])?,
-                make_array(array_sources[3])?,
-                make_array(array_sources[4])?,
-                make_array(array_sources[5])?,
-                make_array(array_sources[6])?,
-                make_array(array_sources[7])?,
-                make_array(array_sources[8])?,
-            ],
-            dominator: None,
-            retained: None,
-        })
+            aux,
+            roots: root_data,
+            refs: refs_data,
+            array_sizes: array_data,
+            instances_by_class,
+            class_histogram,
+            retained_set,
+            class_names: ClassNames::default(),
+        };
+        query.class_names = query.load_class_names()?;
+        Ok(query)
     }
 
     // ── Private reader helpers ────────────────────────────────────────────────
 
     fn hprof_index(&self) -> HprofIndex<'_> {
         HprofIndex::from_slice(
-            self.hprof_data.as_ref(),
+            bytes(&self.hprof_data),
             self.combined_data.as_ref(),
-            self.utf8_data.as_ref(),
+            bytes(&self.utf8_data),
             self.lc_data.as_ref(),
-            self.hprof_header.clone(),
+            &self.hprof_header,
         )
     }
 
@@ -364,7 +507,7 @@ impl HeapQuery {
         RootIndexReader::from_slice(self.roots[rt.index()].as_ref())
     }
 
-    fn ref_index(&self) -> RefIndex<'_> {
+    pub(crate) fn ref_index(&self) -> RefIndex<'_> {
         RefIndex::from_slice(self.refs.as_ref())
     }
 
@@ -373,14 +516,37 @@ impl HeapQuery {
     }
 
     fn retained_index(&self) -> Option<RetainedIndex<'_>> {
-        self.retained
+        self.retained_set
             .as_ref()
-            .map(|src| RetainedIndex::from_slice(src.as_ref()))
+            .map(|s| RetainedIndex::from_slice(s.retained.as_ref()))
+    }
+
+    fn dominator_index(&self) -> Option<DominatorIndex<'_>> {
+        self.retained_set
+            .as_ref()
+            .map(|s| DominatorIndex::from_slice(s.dominators.as_ref()))
+    }
+
+    fn retained_by_size(&self) -> Option<RecordFile<'_, RetainedBySizeEntry>> {
+        self.retained_set
+            .as_ref()
+            .map(|s| RecordFile::from_slice(s.by_size.as_ref()))
+    }
+
+    fn dominator_children(&self) -> Option<RecordFile<'_, DomChildEntry>> {
+        self.retained_set
+            .as_ref()
+            .map(|s| RecordFile::from_slice(s.children.as_ref()))
     }
 
     // ── Basic accessors ───────────────────────────────────────────────────────
 
-    /// hprof identifier size in bytes (4 or 8).
+    /// The parsed hprof file header (version, id size, timestamp).
+    pub fn hprof_header(&self) -> &HprofHeader {
+        &self.hprof_header
+    }
+
+    /// Size of object identifiers in this dump, in bytes (4 or 8).
     pub fn id_size(&self) -> u32 {
         self.hprof_index().id_size()
     }
@@ -405,21 +571,32 @@ impl HeapQuery {
 
     // ── Object lookup by ID ───────────────────────────────────────────────────
 
-    /// Find any sub-record by its object ID.
+    /// The sub-record with object id `object_id`, whatever its kind.
     ///
-    /// Returns `None` when the ID is not present. O(log n) binary search.
-    pub fn find(&self, object_id: u64) -> Result<Option<SubRecord<'_>>, HprofError> {
+    /// `None` when the id is not in the dump.  O(log n) binary search.
+    pub fn object(&self, object_id: u64) -> Result<Option<SubRecord<'_>>, HprofError> {
         self.hprof_index().find_object(object_id)
     }
 
-    /// Find a `CLASS_DUMP` sub-record by class ID.
-    pub fn find_class(&self, class_id: u64) -> Result<Option<SubRecord<'_>>, HprofError> {
-        self.hprof_index().find_class_dump(class_id)
+    /// The `INSTANCE_DUMP` with object id `object_id`.
+    ///
+    /// `None` when the id is absent or names something that is not an
+    /// instance (a class, an array, a GC root).
+    pub fn instance(&self, object_id: u64) -> Result<Option<InstanceDump<'_>>, HprofError> {
+        Ok(match self.hprof_index().find_instance(object_id)? {
+            Some(SubRecord::InstanceDump(inst)) => Some(inst),
+            _ => None,
+        })
     }
 
-    /// Find an `INSTANCE_DUMP` sub-record by object ID.
-    pub fn find_instance(&self, object_id: u64) -> Result<Option<SubRecord<'_>>, HprofError> {
-        self.hprof_index().find_instance(object_id)
+    /// The `CLASS_DUMP` of class object `class_id`.
+    ///
+    /// `None` when the id is absent or is not a class.
+    pub fn class(&self, class_id: u64) -> Result<Option<ClassDump<'_>>, HprofError> {
+        Ok(match self.hprof_index().find_class_dump(class_id)? {
+            Some(SubRecord::ClassDump(cd)) => Some(cd),
+            _ => None,
+        })
     }
 
     // ── Sequential iteration ──────────────────────────────────────────────────
@@ -429,20 +606,22 @@ impl HeapQuery {
     /// Yields parsed [`SubRecord`] values on demand; use `match` to identify
     /// the type:
     ///
-    /// ```rust,ignore
-    /// for result in query.iter_objects() {
+    /// ```no_run
+    /// # use hprof_toolkit::prelude::*;
+    /// # let heap = HeapQuery::open("heap.hprof")?;
+    /// let mut instances = 0;
+    /// for result in heap.objects() {
     ///     match result? {
-    ///         SubRecord::ClassDump(cd)    => { /* class dump */ }
-    ///         SubRecord::InstanceDump(i)  => { /* instance  */ }
-    ///         SubRecord::ObjArrayDump(a)  => { /* obj array */ }
-    ///         SubRecord::PrimArrayDump(a) => { /* prim array */ }
-    ///         _                           => { /* GC root   */ }
+    ///         SubRecord::InstanceDump(_) => instances += 1,
+    ///         SubRecord::ClassDump(_) | SubRecord::ObjArrayDump(_) | SubRecord::PrimArrayDump(_) => {}
+    ///         _ => {} // GC roots
     ///     }
     /// }
+    /// # Ok::<(), HprofError>(())
     /// ```
-    pub fn iter_objects(&self) -> ObjectIter<'_> {
+    pub fn objects(&self) -> ObjectIter<'_> {
         ObjectIter {
-            inner: SubIndexIter::new(self.combined_data.as_ref()),
+            inner: RecordFile::<SubIndexEntry>::from_slice(self.combined_data.as_ref()).iter(),
             query: self,
         }
     }
@@ -450,183 +629,141 @@ impl HeapQuery {
     /// Iterate raw [`SubIndexEntry`] values from the combined index in ascending
     /// object-ID order.
     ///
-    /// Unlike [`Self::iter_objects`], no parsing is performed; callers receive
+    /// Unlike [`Self::objects`], no parsing is performed; callers receive
     /// the lightweight `(tag, object_id, position)` tuple and can choose to
     /// parse selectively with [`Self::parse_entry`].
-    pub fn iter_entries(&self) -> SubIndexIter<'_> {
-        SubIndexIter::new(self.combined_data.as_ref())
+    pub(crate) fn iter_entries(&self) -> SubIndexIter<'_> {
+        RecordFile::<SubIndexEntry>::from_slice(self.combined_data.as_ref()).iter()
     }
 
     /// Parse the sub-record described by `entry` directly from the hprof mmap.
     ///
     /// Use this when you already hold a [`SubIndexEntry`] (e.g. from iterating
     /// via [`Self::iter_entries`]) and want to avoid a redundant binary search.
-    pub fn parse_entry<'a>(&'a self, entry: &SubIndexEntry) -> Result<SubRecord<'a>, HprofError> {
+    pub(crate) fn parse_entry<'a>(
+        &'a self,
+        entry: &SubIndexEntry,
+    ) -> Result<SubRecord<'a>, HprofError> {
         self.hprof_index().parse_entry(entry)
     }
 
     // ── Parallel iteration ────────────────────────────────────────────────────
 
-    /// Execute `f` over every sub-record in parallel using rayon.
+    /// Every sub-record, as a rayon parallel iterator.
     ///
-    /// Processing stops as soon as any invocation of `f` returns an `Err`;
-    /// that error is returned from `par_for_each`.
+    /// Items are parsed on demand by the worker that receives them; nothing
+    /// is collected.  Use the ordinary rayon adaptors:
     ///
-    /// ```rust,ignore
-    /// query.par_for_each(|record| {
-    ///     match record {
-    ///         SubRecord::InstanceDump(inst) => { /* ... */ }
-    ///         _ => {}
-    ///     }
-    ///     Ok(())
-    /// })?;
+    /// ```no_run
+    /// # use hprof_toolkit::prelude::*;
+    /// # let heap = HeapQuery::open("heap.hprof")?;
+    /// let arrays = heap
+    ///     .par_objects()
+    ///     .filter(|r| matches!(r, Ok(SubRecord::PrimArrayDump(_))))
+    ///     .count();
+    /// # Ok::<(), HprofError>(())
     /// ```
-    pub fn par_for_each<F>(&self, f: F) -> Result<(), HprofError>
-    where
-        F: for<'a> Fn(SubRecord<'a>) -> Result<(), HprofError> + Send + Sync,
-    {
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    pub fn par_objects(&self) -> impl ParallelIterator<Item = Result<SubRecord<'_>, HprofError>> {
         (0..self.hprof_index().object_count())
             .into_par_iter()
-            .try_for_each(|i| {
-                if let Some(record) = self.hprof_index().parse_at(i)? {
-                    f(record)
-                } else {
-                    Ok(())
-                }
-            })
+            .filter_map(move |i| self.hprof_index().parse_at(i).transpose())
     }
 
-    /// Execute `f` over every `CLASS_DUMP` record in parallel using rayon.
-    ///
-    /// Non-class records are silently skipped.
-    pub fn par_classes<F>(&self, f: F) -> Result<(), HprofError>
-    where
-        F: for<'a> Fn(ClassDump<'a>) -> Result<(), HprofError> + Send + Sync,
-    {
-        self.par_for_each(|record| {
-            if let SubRecord::ClassDump(cd) = record {
-                f(cd)
-            } else {
-                Ok(())
-            }
+    /// Every `INSTANCE_DUMP`, as a rayon parallel iterator.
+    pub fn par_instances(
+        &self,
+    ) -> impl ParallelIterator<Item = Result<InstanceDump<'_>, HprofError>> {
+        self.par_objects().filter_map(|r| match r {
+            Ok(SubRecord::InstanceDump(inst)) => Some(Ok(inst)),
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
         })
     }
 
-    /// Execute `f` over every `INSTANCE_DUMP` record in parallel using rayon.
-    ///
-    /// Non-instance records are silently skipped.
-    pub fn par_instances<F>(&self, f: F) -> Result<(), HprofError>
-    where
-        F: for<'a> Fn(InstanceDump<'a>) -> Result<(), HprofError> + Send + Sync,
-    {
-        self.par_for_each(|record| {
-            if let SubRecord::InstanceDump(inst) = record {
-                f(inst)
-            } else {
-                Ok(())
-            }
+    /// Every `CLASS_DUMP`, as a rayon parallel iterator.
+    pub fn par_classes(&self) -> impl ParallelIterator<Item = Result<ClassDump<'_>, HprofError>> {
+        self.par_objects().filter_map(|r| match r {
+            Ok(SubRecord::ClassDump(cd)) => Some(Ok(cd)),
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
         })
     }
 
-    /// Execute `f` over every fully-resolved instance in parallel using rayon.
+    /// Every instance of the class object `class_id`, in ascending object-id
+    /// order.  Reads only that class's range of the per-class index.
     ///
-    /// Each [`InstanceDump`] is resolved to a [`crate::resolved::ResolvedInstance`]
-    /// before being passed to `f`; non-instance records are silently skipped.
-    /// Use this instead of [`Self::par_instances`] when you need resolved field
-    /// values (class name, field names, wrapper-type unwrapping).
-    ///
-    /// ```rust,ignore
-    /// query.par_resolved_instances(|inst| {
-    ///     for field in &inst.fields {
-    ///         if let Value::String(_, s) = &field.value {
-    ///             println!("{} - {s}", field.name);
-    ///         }
-    ///     }
-    ///     Ok(())
-    /// })?;
-    /// ```
-    pub fn par_resolved_instances<F>(&self, f: F) -> Result<(), HprofError>
-    where
-        F: Fn(crate::resolved::ResolvedInstance) -> Result<(), HprofError> + Send + Sync,
-    {
-        self.par_instances(|inst| f(crate::resolved::ResolvedInstance::from_dump(self, &inst)?))
+    /// Subclass instances are *not* included: an instance belongs to exactly
+    /// one class.
+    pub fn instances_of(
+        &self,
+        class_id: u64,
+    ) -> impl Iterator<Item = Result<InstanceDump<'_>, HprofError>> {
+        self.class_entries(ClassKey::Class(class_id))
+            .filter_map(move |e| self.instance_from_entry(&e))
     }
 
-    /// Execute `f` over every fully-resolved class in parallel using rayon.
-    ///
-    /// Each [`ClassDump`] is resolved to a [`crate::resolved::ResolvedClass`]
-    /// before being passed to `f`; non-class records are silently skipped.
-    /// Use this instead of [`Self::par_classes`] when you need resolved names
-    /// and static field values.
-    ///
-    /// ```rust,ignore
-    /// query.par_resolved_classes(|cd| {
-    ///     println!("{}: {} static fields", cd.class_name, cd.static_fields.len());
-    ///     Ok(())
-    /// })?;
-    /// ```
-    pub fn par_resolved_classes<F>(&self, f: F) -> Result<(), HprofError>
-    where
-        F: Fn(crate::resolved::ResolvedClass) -> Result<(), HprofError> + Send + Sync,
-    {
-        self.par_classes(|cd| f(crate::resolved::ResolvedClass::from_dump(self, &cd)?))
+    /// [`Self::instances_of`] as a rayon parallel iterator.
+    pub fn par_instances_of(
+        &self,
+        class_id: u64,
+    ) -> impl ParallelIterator<Item = Result<InstanceDump<'_>, HprofError>> {
+        self.instances_by_class()
+            .par_range(ClassKey::Class(class_id).to_u64())
+            .filter_map(move |e| self.instance_from_entry(&e))
     }
 
-    /// Execute `f` over every `INSTANCE_DUMP` whose class name exactly matches
-    /// `class_name`, in parallel using rayon.
-    ///
-    /// Resolves the class ID once via [`Self::find_class_by_name`], then
-    /// filters instances by an O(1) integer comparison per record.  Returns
-    /// `Ok(())` immediately (without calling `f`) when `class_name` is not
-    /// found in the heap dump.
-    ///
-    /// ```rust,ignore
-    /// query.par_instances_of("com.example.Foo", |inst| {
-    ///     let fields = query.instance_fields(&inst)?;
-    ///     println!("{fields:?}");
-    ///     Ok(())
-    /// })?;
-    /// ```
-    pub fn par_instances_of<F>(&self, class_name: &str, f: F) -> Result<(), HprofError>
-    where
-        F: for<'a> Fn(InstanceDump<'a>) -> Result<(), HprofError> + Send + Sync,
-    {
-        let class_id = match self.find_class_by_name(class_name)? {
-            Some(id) => id,
-            None => return Ok(()),
-        };
-        self.par_instances(|inst| {
-            if inst.class_id == class_id {
-                f(inst)
-            } else {
-                Ok(())
-            }
-        })
+    pub(crate) fn instance_from_entry(
+        &self,
+        e: &InstanceByClassEntry,
+    ) -> Option<Result<InstanceDump<'_>, HprofError>> {
+        match self
+            .hprof_index()
+            .parse_entry(&e.sub_index_entry(TAG_INSTANCE_DUMP))
+        {
+            Ok(SubRecord::InstanceDump(inst)) => Some(Ok(inst)),
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
+        }
     }
 
-    /// Execute `f` over every fully-resolved instance whose class name exactly
-    /// matches `class_name`, in parallel using rayon.
+    // ── Per-class index ───────────────────────────────────────────────────────
+
+    fn instances_by_class(&self) -> RecordFile<'_, InstanceByClassEntry> {
+        RecordFile::from_slice(self.instances_by_class.as_ref())
+    }
+
+    /// Every object grouped under `key`, in ascending object-id order.
     ///
-    /// Combines [`Self::par_instances_of`] with resolution to
-    /// [`crate::resolved::ResolvedInstance`].  Returns `Ok(())` immediately
-    /// when `class_name` is not found.
+    /// A binary-search range over `instances_by_class.bin`; nothing outside
+    /// the class is touched.  Parse an entry with
+    /// [`Self::parse_entry`] and [`InstanceByClassEntry::sub_index_entry`].
+    pub(crate) fn class_entries(&self, key: ClassKey) -> RecordIter<'_, InstanceByClassEntry> {
+        self.instances_by_class().range(key.to_u64())
+    }
+
+    /// Number of objects grouped under `key`.  O(log n).
+    pub fn instance_count(&self, key: ClassKey) -> usize {
+        self.class_entries(key).len()
+    }
+
+    /// The class histogram, largest instance count first.
     ///
-    /// ```rust,ignore
-    /// query.par_resolved_instances_of("com.example.Foo", |inst| {
-    ///     for field in &inst.fields {
-    ///         println!("  {}: {:?}", field.name, field.value);
-    ///     }
-    ///     Ok(())
-    /// })?;
-    /// ```
-    pub fn par_resolved_instances_of<F>(&self, class_name: &str, f: F) -> Result<(), HprofError>
-    where
-        F: Fn(crate::resolved::ResolvedInstance) -> Result<(), HprofError> + Send + Sync,
-    {
-        self.par_instances_of(class_name, |inst| {
-            f(crate::resolved::ResolvedInstance::from_dump(self, &inst)?)
-        })
+    /// Read straight from `class_histogram.bin`: no scan, O(classes) total.
+    pub(crate) fn histogram(&self) -> RecordIter<'_, HistogramRecord> {
+        RecordFile::<HistogramRecord>::from_slice(self.class_histogram.as_ref()).iter()
+    }
+
+    /// Number of distinct class keys with at least one object.
+    pub(crate) fn histogram_len(&self) -> usize {
+        RecordFile::<HistogramRecord>::from_slice(self.class_histogram.as_ref()).len()
+    }
+
+    /// Every loaded class as `(class_id, name_id)` from the load-class index,
+    /// ascending by class id.  Includes classes with no instances.
+    pub fn class_ids(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        RecordFile::<LoadClassEntry>::from_slice(self.lc_data.as_ref())
+            .iter()
+            .map(|e| (e.class_id, e.class_name_id))
     }
 
     // ── Name resolution ───────────────────────────────────────────────────────
@@ -636,81 +773,131 @@ impl HeapQuery {
         self.hprof_index().lookup_name(name_id)
     }
 
-    /// Find a class by its dot-notation name (e.g. `"java.lang.String"`).
-    ///
-    /// Returns the `class_id` of the first matching class, or `None` if no
-    /// class with that name exists in the heap dump.  Scans the load-class
-    /// index linearly (O(n_classes)), so call this once and then filter
-    /// instance records by the returned `class_id`.
-    pub fn find_class_by_name(&self, name: &str) -> Result<Option<u64>, HprofError> {
-        self.hprof_index().find_class_by_name(name)
-    }
-
-    /// Return the dot-notation class name for `class_id`
+    /// The class object whose dot-notation name is exactly `name`
     /// (e.g. `"java.lang.String"`).
-    pub fn class_name(&self, class_id: u64) -> Result<Option<String>, HprofError> {
-        self.hprof_index().class_name(class_id)
+    ///
+    /// A hash probe: the names are read once when the query is opened.  When
+    /// several classes share a name (one class loaded by two class loaders)
+    /// the lowest class id is returned.
+    pub fn find_class_by_name(&self, name: &str) -> Option<u64> {
+        self.class_names.by_name.get(name).copied()
     }
 
-    /// Resolve the runtime type name of the object at `object_id`.
-    pub fn object_type_name(&self, object_id: u64) -> Result<String, HprofError> {
-        self.hprof_index().object_type_name(object_id)
+    /// The dot-notation class name for `class_id` (e.g. `"java.lang.String"`).
+    ///
+    /// `None` when `class_id` is not a loaded class.  A hash probe and a
+    /// pointer clone.
+    pub fn class_name(&self, class_id: u64) -> Option<Arc<str>> {
+        self.class_names.by_id.get(&class_id).cloned()
+    }
+
+    /// [`Self::class_name`] for display: the name, or `0x…` hex of the id when
+    /// the class is unknown.
+    pub fn class_label(&self, class_id: u64) -> String {
+        match self.class_name(class_id) {
+            Some(name) => name.to_string(),
+            None => format!("0x{class_id:x}"),
+        }
+    }
+
+    /// Read every class name once: O(classes) memory.
+    fn load_class_names(&self) -> Result<ClassNames, HprofError> {
+        let mut by_id = HashMap::new();
+        let mut by_name: HashMap<Arc<str>, u64> = HashMap::new();
+        for (class_id, name_id) in self.class_ids() {
+            let Some(raw) = self.lookup_name(name_id)? else {
+                continue;
+            };
+            let name: Arc<str> = raw.replace('/', ".").into();
+            by_name.entry(name.clone()).or_insert(class_id);
+            by_id.insert(class_id, name);
+        }
+        Ok(ClassNames { by_id, by_name })
+    }
+
+    /// The runtime type name of the object at `object_id`, for display:
+    /// `java.util.ArrayList`, `Class` for a class object, `int[]`,
+    /// `java.lang.String[]`.
+    ///
+    /// `Object` when the id is null, not in the dump or has an unknown class;
+    /// `?` when its record cannot be read.  Never fails, so it can label rows
+    /// in a listing.
+    pub fn object_type_name(&self, object_id: u64) -> String {
+        const UNKNOWN: &str = "Object";
+        if object_id == 0 {
+            return UNKNOWN.to_owned();
+        }
+        match self.object(object_id) {
+            Err(_) => "?".to_owned(),
+            Ok(None) => UNKNOWN.to_owned(),
+            Ok(Some(SubRecord::InstanceDump(inst))) => self
+                .class_name(inst.class_id)
+                .map_or_else(|| UNKNOWN.to_owned(), |n| n.to_string()),
+            Ok(Some(SubRecord::ClassDump(_))) => "Class".to_owned(),
+            Ok(Some(SubRecord::ObjArrayDump(arr))) => {
+                self.key_name(ClassKey::ObjArray(arr.array_class_id))
+            }
+            Ok(Some(SubRecord::PrimArrayDump(arr))) => {
+                self.key_name(ClassKey::PrimArray(arr.element_type))
+            }
+            Ok(Some(_)) => UNKNOWN.to_owned(),
+        }
     }
 
     // ── Field resolution ──────────────────────────────────────────────────────
 
     /// Resolve the instance fields for an [`InstanceDump`], traversing the
     /// full class hierarchy.
-    pub fn instance_fields(
-        &self,
-        instance: &InstanceDump<'_>,
-    ) -> Result<Vec<ResolvedField>, HprofError> {
+    pub fn instance_fields(&self, instance: &InstanceDump<'_>) -> Result<Vec<Field>, HprofError> {
         self.hprof_index().instance_fields(instance)
+    }
+
+    /// The text of the String instance `inst`, when it is one already in hand
+    /// (skips the lookup [`Self::string`] does).  Handles `char[]` and compact
+    /// `byte[]` strings.
+    pub(crate) fn string_of(&self, inst: &InstanceDump<'_>) -> Result<String, HprofError> {
+        Ok(match self.hprof_index().resolve_string(inst)? {
+            Value::String(_, s) => s,
+            _ => String::new(),
+        })
     }
 
     /// Attempt to resolve `object_id` as a primitive Java wrapper value.
     ///
     /// Handles `String`, `Integer`, `Long`, `Double`, `Float`, `Short`,
     /// `Byte`, `Boolean`, and `Character`.  Anything else returns
-    /// [`JavaValue::Object`].
-    pub fn resolve_value(&self, object_id: u64) -> Result<JavaValue, HprofError> {
+    /// [`Value::Object`].
+    pub fn resolve_value(&self, object_id: u64) -> Result<Value, HprofError> {
         self.hprof_index().resolve_value(object_id)
     }
 
     // ── Auxiliary record lookup ───────────────────────────────────────────────
 
-    /// Find a `HPROF_FRAME` record by `frame_id`.
-    pub fn find_frame(&self, frame_id: u64) -> Result<Option<Frame>, HprofError> {
-        self.aux.find_frame(frame_id)
-    }
-
     /// Find a `HPROF_TRACE` record by `trace_serial`.
-    pub fn find_trace(&self, trace_serial: u32) -> Result<Option<Trace>, HprofError> {
+    pub(crate) fn find_trace(&self, trace_serial: u32) -> Result<Option<Trace>, HprofError> {
         self.aux.find_trace(trace_serial)
     }
 
-    /// Find a `HPROF_START_THREAD` record by `thread_serial`.
-    pub fn find_thread(&self, thread_serial: u32) -> Result<Option<StartThread>, HprofError> {
-        self.aux.find_start_thread(thread_serial)
-    }
-
     /// Resolve all name IDs in `frame` to strings.
-    pub fn resolve_frame(&self, frame: &Frame) -> Result<ResolvedFrame, HprofError> {
+    pub(crate) fn resolve_frame(&self, frame: &Frame) -> Result<ResolvedFrame, HprofError> {
         self.aux.resolve_frame(frame)
     }
 
     /// Resolve all name IDs in `thread` to strings.
-    pub fn resolve_thread(&self, thread: &StartThread) -> Result<ResolvedThread, HprofError> {
+    pub(crate) fn resolve_thread(
+        &self,
+        thread: &StartThread,
+    ) -> Result<ResolvedThread, HprofError> {
         self.aux.resolve_thread(thread)
     }
 
     /// Parse every frame in `trace` and return them in order.
-    pub fn trace_frames(&self, trace: &Trace) -> Result<Vec<Frame>, HprofError> {
+    pub(crate) fn trace_frames(&self, trace: &Trace) -> Result<Vec<Frame>, HprofError> {
         self.aux.trace_frames(trace)
     }
 
     /// Returns `true` if a `HPROF_END_THREAD` record exists for `thread_serial`.
-    pub fn was_thread_ended(&self, thread_serial: u32) -> bool {
+    pub(crate) fn was_thread_ended(&self, thread_serial: u32) -> bool {
         self.aux.was_thread_ended(thread_serial)
     }
 
@@ -722,33 +909,25 @@ impl HeapQuery {
     // ── Auxiliary record iteration ────────────────────────────────────────────
 
     /// Iterate all `HPROF_FRAME` records in ascending `frame_id` order.
-    pub fn iter_frames(&self) -> FrameIter<'_> {
+    pub(crate) fn iter_frames(&self) -> FrameIter<'_> {
         self.aux.iter_frames()
     }
 
     /// Iterate all `HPROF_TRACE` records in ascending `trace_serial` order.
-    pub fn iter_traces(&self) -> TraceIter<'_> {
+    pub(crate) fn iter_traces(&self) -> TraceIter<'_> {
         self.aux.iter_traces()
     }
 
     /// Iterate all `HPROF_START_THREAD` records in ascending `thread_serial` order.
-    pub fn iter_threads(&self) -> StartThreadIter<'_> {
+    pub(crate) fn iter_threads(&self) -> StartThreadIter<'_> {
         self.aux.iter_start_threads()
     }
 
     // ── GC root access ────────────────────────────────────────────────────────
 
-    /// Find the root index entry for `object_id` in the given `root_type` file.
-    ///
-    /// Returns `Some(entry)` if `object_id` appears as a root of that type,
-    /// `None` otherwise.  O(log n) binary search.
-    pub fn find_root(&self, object_id: u64, root_type: GcRootType) -> Option<RootIndexEntry> {
-        self.root_reader(root_type).find(object_id)
-    }
-
     /// Iterate all root entries for the given `root_type` in ascending
     /// `object_id` order.
-    pub fn iter_roots(&self, root_type: GcRootType) -> RootIter<'_> {
+    pub(crate) fn iter_roots(&self, root_type: GcRootType) -> RootIter<'_> {
         self.root_reader(root_type).iter()
     }
 
@@ -770,74 +949,6 @@ impl HeapQuery {
 
     // ── Reference index ───────────────────────────────────────────────────────
 
-    /// Return the IDs of all objects that hold a direct reference to `object_id`.
-    ///
-    /// Results are bounded by [`crate::ref_index::MAX_BACK_REFS`].  Uses the
-    /// pre-built reference index for O(log n) lookup.
-    pub fn refs_to(&self, object_id: u64) -> Vec<u64> {
-        self.ref_index().find(object_id)
-    }
-
-    /// Walk backwards through the reference graph from `object_id` to find
-    /// the shortest path to any GC root.
-    ///
-    /// Returns [`RootPathResult::Found`] with a vec where `path[0]` is the GC
-    /// root and `path.last()` is `object_id`.  Returns
-    /// [`RootPathResult::LimitReached`] if the BFS visited
-    /// [`ROOT_PATH_SEARCH_LIMIT`] nodes without finding a root, or
-    /// [`RootPathResult::NotReachable`] if the graph was exhausted.
-    ///
-    /// **Caveat:** [`Self::refs_to`] is capped at
-    /// [`crate::ref_index::MAX_BACK_REFS`] per node.  Paths that pass through
-    /// high-fanin objects may not be found.
-    pub fn path_to_root(&self, object_id: u64) -> RootPathResult {
-        use std::collections::{HashMap, HashSet, VecDeque};
-
-        if self.is_gc_root(object_id) {
-            return RootPathResult::Found(vec![object_id]);
-        }
-
-        let mut visited: HashSet<u64> = HashSet::new();
-        // parent[v] = u means v references u, so u is one step closer to object_id
-        let mut parent: HashMap<u64, u64> = HashMap::new();
-        let mut queue: VecDeque<u64> = VecDeque::new();
-
-        visited.insert(object_id);
-        queue.push_back(object_id);
-
-        while let Some(current) = queue.pop_front() {
-            for referrer in self.refs_to(current) {
-                if !visited.insert(referrer) {
-                    continue;
-                }
-                parent.insert(referrer, current);
-
-                if self.is_gc_root(referrer) {
-                    // Reconstruct path: root → … → object_id
-                    let mut path = vec![referrer];
-                    let mut node = referrer;
-                    while node != object_id {
-                        match parent.get(&node).copied() {
-                            Some(next) => {
-                                node = next;
-                                path.push(node);
-                            }
-                            None => break,
-                        }
-                    }
-                    return RootPathResult::Found(path);
-                }
-
-                if visited.len() >= ROOT_PATH_SEARCH_LIMIT {
-                    return RootPathResult::LimitReached;
-                }
-                queue.push_back(referrer);
-            }
-        }
-
-        RootPathResult::NotReachable
-    }
-
     /// Total number of reference records in the reference index.
     pub fn ref_count(&self) -> usize {
         self.ref_index().len()
@@ -848,7 +959,40 @@ impl HeapQuery {
     /// Returns `true` if the dominator tree and retained heap size indexes are
     /// available (i.e. were built by the indexing pipeline).
     pub fn has_retained_heap(&self) -> bool {
-        self.retained.is_some() && self.dominator.is_some()
+        self.retained_set.is_some()
+    }
+
+    /// The objects with the largest retained heap sizes, largest first.
+    ///
+    /// Each item is `(object_id, retained_bytes)`.  Served from the
+    /// pre-sorted `retained_by_size.bin`, so a page costs O(page), not
+    /// O(objects).  Returns `None` when the retained heap index was not built.
+    pub fn retained_top(&self, page: Page) -> Option<PageResult<(u64, u64)>> {
+        let file = self.retained_by_size()?;
+        Some(PageResult::from_iter(
+            file.len(),
+            page,
+            file.iter().map(|e| (e.object_id, e.retained_bytes)),
+        ))
+    }
+
+    /// The objects immediately dominated by `dominator_id`, with their
+    /// retained sizes, in ascending object-id order.
+    ///
+    /// Pass [`crate::VIRTUAL_ROOT_ID`] (`0`) for the objects that
+    /// are dominated only by the virtual root (the GC roots).  Served from
+    /// `dominator_children.bin` by binary search; a page costs
+    /// O(log n + page).  Returns `None` when the retained heap index was not
+    /// built.
+    pub fn dominated_by(&self, dominator_id: u64, page: Page) -> Option<PageResult<(u64, u64)>> {
+        let children = self.dominator_children()?;
+        let retained = self.retained_index()?;
+        let range = children.range(dominator_id);
+        Some(PageResult::from_iter(
+            range.len(),
+            page,
+            range.map(|e| (e.object_id, retained.find(e.object_id).unwrap_or(0))),
+        ))
     }
 
     /// Return the retained heap size in bytes for `object_id`.
@@ -875,22 +1019,8 @@ impl HeapQuery {
     /// Returns `None` when:
     /// * The dominator index was not built.
     /// * `object_id` is not a live (reachable) heap object.
-    fn dominator_index(&self) -> Option<DominatorIndex<'_>> {
-        self.dominator
-            .as_ref()
-            .map(|src| DominatorIndex::from_slice(src.as_ref()))
-    }
-
     pub fn dominator_of(&self, object_id: u64) -> Option<u64> {
         self.dominator_index()?.find(object_id)
-    }
-
-    /// Iterate all `(object_id, retained_bytes)` pairs from the retained heap
-    /// index in ascending `object_id` order.
-    ///
-    /// Returns `None` when the retained heap index was not built.
-    pub fn iter_retained(&self) -> Option<crate::dominator::RetainedIter<'_>> {
-        self.retained_index().map(|r| r.iter())
     }
 
     // ── Object resolution ─────────────────────────────────────────────────────
@@ -944,264 +1074,100 @@ impl<'a> Iterator for ObjectIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::array_index::build_array_size_indexes;
-    use crate::aux_index::{
-        build_end_thread_index, build_frame_index, build_start_thread_index, build_trace_index,
-        build_unload_class_index,
-    };
     use crate::aux_query::LineNumber;
-    use crate::heap_index::index_heap_dumps;
     use crate::heap_parser::FieldValue;
-    use crate::heap_query::build_name_indexes;
-    use crate::object_store::combine_sort_and_split;
-    use crate::record_index::index_hprof;
-    use crate::ref_index::build_reference_index;
-    use crate::vfs::SubIndexDir;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::index::MemStore;
+    use crate::resolved::Value;
+    use crate::test_util::{build_in_memory, build_in_memory_with, standard_heap, std_ids::*};
 
-    // ── Test hprof builder ────────────────────────────────────────────────────
-
-    fn write_record(buf: &mut Vec<u8>, tag: u8, body: &[u8]) {
-        buf.push(tag);
-        buf.extend_from_slice(&0u32.to_be_bytes());
-        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        buf.extend_from_slice(body);
+    fn query() -> HeapQuery {
+        build_in_memory(&standard_heap())
     }
 
-    /// Build a minimal hprof combining heap dump objects and aux records:
-    ///
-    /// Heap content (id_size = 8):
-    ///   UTF8(1,"value"), UTF8(2,"java/lang/Integer"), UTF8(3,"java/lang/Object"),
-    ///   UTF8(4,"main"),  UTF8(5,"()V"),               UTF8(6,"MyClass.java")
-    ///   LOAD_CLASS(class_id=0x200, name_id=2)
-    ///   LOAD_CLASS(class_id=0x300, name_id=3)
-    ///   HEAP_DUMP_SEGMENT:
-    ///     CLASS_DUMP(0x200, super=0x300, 1 int field "value")
-    ///     CLASS_DUMP(0x300, super=0)
-    ///     INSTANCE_DUMP(0x100, class=0x200, data=[0,0,0,42])
-    ///
-    /// Aux records:
-    ///   FRAME(id=0x10, method=4, sig=5, src=6, class_serial=1, line=7)
-    ///   TRACE(serial=1, thread_serial=1, frames=[0x10])
-    ///   START_THREAD(serial=1, thread_id=0xABC, trace=1, name=4)
-    ///   END_THREAD(serial=1)
-    fn build_test_hprof() -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"JAVA PROFILE 1.0.2\0");
-        buf.extend_from_slice(&8u32.to_be_bytes()); // id_size = 8
-        buf.extend_from_slice(&0u64.to_be_bytes()); // timestamp
+    // ── Open / completeness checks ────────────────────────────────────────────
 
-        let utf8 = |buf: &mut Vec<u8>, id: u64, s: &[u8]| {
-            let mut body = Vec::new();
-            body.extend_from_slice(&id.to_be_bytes());
-            body.extend_from_slice(s);
-            write_record(buf, 0x01, &body);
+    #[test]
+    fn a_complete_store_passes_the_indexed_check() {
+        let (store, _) = build_in_memory_with(&standard_heap(), &IndexOptions::default());
+        HeapQuery::check_indexed(&store).unwrap();
+    }
+
+    #[test]
+    fn an_empty_store_is_not_indexed() {
+        let err = HeapQuery::check_indexed(&MemStore::new()).unwrap_err();
+        assert!(matches!(err, HprofError::NotIndexed(_)), "{err}");
+    }
+
+    #[test]
+    fn a_store_missing_one_mandatory_entry_names_it() {
+        let (store, _) = build_in_memory_with(&standard_heap(), &IndexOptions::default());
+        store.remove(names::REFS).unwrap();
+        match HeapQuery::check_indexed(&store) {
+            Err(HprofError::NotIndexed(name)) => assert_eq!(name, names::REFS),
+            other => panic!("expected NotIndexed(refs), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_retained_family_is_not_mandatory() {
+        let opts = IndexOptions {
+            retained: false,
+            ..IndexOptions::default()
         };
-        utf8(&mut buf, 1, b"value");
-        utf8(&mut buf, 2, b"java/lang/Integer");
-        utf8(&mut buf, 3, b"java/lang/Object");
-        utf8(&mut buf, 4, b"main");
-        utf8(&mut buf, 5, b"()V");
-        utf8(&mut buf, 6, b"MyClass.java");
-
-        // LOAD_CLASS: class_id=0x200, name_id=2
-        let mut lc = Vec::new();
-        lc.extend_from_slice(&1u32.to_be_bytes()); // class_serial
-        lc.extend_from_slice(&0x200u64.to_be_bytes()); // class_id
-        lc.extend_from_slice(&0u32.to_be_bytes()); // stack_serial
-        lc.extend_from_slice(&2u64.to_be_bytes()); // name_id
-        write_record(&mut buf, 0x02, &lc);
-
-        let mut lc = Vec::new();
-        lc.extend_from_slice(&2u32.to_be_bytes()); // class_serial
-        lc.extend_from_slice(&0x300u64.to_be_bytes()); // class_id
-        lc.extend_from_slice(&0u32.to_be_bytes());
-        lc.extend_from_slice(&3u64.to_be_bytes()); // name_id
-        write_record(&mut buf, 0x02, &lc);
-
-        // HEAP_DUMP_SEGMENT
-        let mut seg = Vec::new();
-
-        // CLASS_DUMP(0x200, super=0x300, instance_size=4, 1 field: name_id=1, type=int)
-        seg.push(0x20u8);
-        seg.extend_from_slice(&0x200u64.to_be_bytes()); // class_id
-        seg.extend_from_slice(&0u32.to_be_bytes()); // stack_serial
-        seg.extend_from_slice(&0x300u64.to_be_bytes()); // super
-        seg.extend_from_slice(&[0u8; 8 * 5]); // loader+signers+domain+res1+res2
-        seg.extend_from_slice(&4u32.to_be_bytes()); // instance_size
-        seg.extend_from_slice(&0u16.to_be_bytes()); // cp_count
-        seg.extend_from_slice(&0u16.to_be_bytes()); // statics_count
-        seg.extend_from_slice(&1u16.to_be_bytes()); // instance_fields_count
-        seg.extend_from_slice(&1u64.to_be_bytes()); // field name_id=1 ("value")
-        seg.push(10u8); // type = int
-
-        // CLASS_DUMP(0x300, super=0, 0 fields) — java.lang.Object
-        seg.push(0x20u8);
-        seg.extend_from_slice(&0x300u64.to_be_bytes());
-        seg.extend_from_slice(&0u32.to_be_bytes());
-        seg.extend_from_slice(&0u64.to_be_bytes()); // super = null
-        seg.extend_from_slice(&[0u8; 8 * 5]);
-        seg.extend_from_slice(&0u32.to_be_bytes());
-        seg.extend_from_slice(&0u16.to_be_bytes());
-        seg.extend_from_slice(&0u16.to_be_bytes());
-        seg.extend_from_slice(&0u16.to_be_bytes());
-
-        // INSTANCE_DUMP(0x100, class=0x200, data=[0,0,0,42])
-        seg.push(0x21u8);
-        seg.extend_from_slice(&0x100u64.to_be_bytes()); // object_id
-        seg.extend_from_slice(&0u32.to_be_bytes()); // stack_serial
-        seg.extend_from_slice(&0x200u64.to_be_bytes()); // class_id
-        seg.extend_from_slice(&4u32.to_be_bytes()); // data_len
-        seg.extend_from_slice(&42i32.to_be_bytes()); // value = 42
-
-        write_record(&mut buf, 0x1C, &seg); // HEAP_DUMP_SEGMENT
-
-        // FRAME record
-        let mut frame_body = Vec::new();
-        frame_body.extend_from_slice(&0x10u64.to_be_bytes()); // frame_id
-        frame_body.extend_from_slice(&4u64.to_be_bytes()); // method_name_id ("main")
-        frame_body.extend_from_slice(&5u64.to_be_bytes()); // method_sig_id  ("()V")
-        frame_body.extend_from_slice(&6u64.to_be_bytes()); // source_file_id ("MyClass.java")
-        frame_body.extend_from_slice(&1u32.to_be_bytes()); // class_serial
-        frame_body.extend_from_slice(&7i32.to_be_bytes()); // line_number
-        write_record(&mut buf, 0x04, &frame_body);
-
-        // TRACE record
-        let mut trace_body = Vec::new();
-        trace_body.extend_from_slice(&1u32.to_be_bytes()); // trace_serial
-        trace_body.extend_from_slice(&1u32.to_be_bytes()); // thread_serial
-        trace_body.extend_from_slice(&1u32.to_be_bytes()); // num_frames
-        trace_body.extend_from_slice(&0x10u64.to_be_bytes());
-        write_record(&mut buf, 0x05, &trace_body);
-
-        // START_THREAD record
-        let mut st_body = Vec::new();
-        st_body.extend_from_slice(&1u32.to_be_bytes()); // thread_serial
-        st_body.extend_from_slice(&0xABCu64.to_be_bytes()); // thread_id
-        st_body.extend_from_slice(&1u32.to_be_bytes()); // stack_trace_serial
-        st_body.extend_from_slice(&4u64.to_be_bytes()); // thread_name_id ("main")
-        st_body.extend_from_slice(&0u64.to_be_bytes()); // group_name_id
-        st_body.extend_from_slice(&0u64.to_be_bytes()); // parent_group_id
-        write_record(&mut buf, 0x0A, &st_body);
-
-        // END_THREAD record
-        write_record(&mut buf, 0x0B, &1u32.to_be_bytes());
-
-        buf
-    }
-
-    /// Run the full build pipeline and open a [`HeapQuery`] entirely in memory.
-    fn build_query(hprof_data: &[u8]) -> HeapQuery {
-        let hprof = hprof_data.to_vec();
-        let mut p1 = Vec::new();
-        let p2d = SubIndexDir::mem();
-        let mut p4 = Vec::new();
-        let mut utf8 = Vec::new();
-        let mut lc = Vec::new();
-        let mut frames = Vec::new();
-        let mut traces = Vec::new();
-        let mut st = Vec::new();
-        let mut et = Vec::new();
-        let mut uc = Vec::new();
-        let mut refs = Vec::new();
-        // 9 separate root buffers (one per GC root type in canonical order).
-        let mut r0: Vec<u8> = Vec::new();
-        let mut r1: Vec<u8> = Vec::new();
-        let mut r2: Vec<u8> = Vec::new();
-        let mut r3: Vec<u8> = Vec::new();
-        let mut r4: Vec<u8> = Vec::new();
-        let mut r5: Vec<u8> = Vec::new();
-        let mut r6: Vec<u8> = Vec::new();
-        let mut r7: Vec<u8> = Vec::new();
-        let mut r8: Vec<u8> = Vec::new();
-        let mut arrays: [Vec<u8>; 9] = std::array::from_fn(|_| Vec::new());
-
-        index_hprof(&hprof, &mut p1).unwrap();
-        index_heap_dumps(&hprof, &p1, &p2d).unwrap();
-
-        combine_sort_and_split(
-            &p2d,
-            &mut p4,
-            &mut [
-                &mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7, &mut r8,
-            ],
-        )
-        .unwrap();
-
-        build_name_indexes(&hprof, &p1, &mut utf8, &mut lc).unwrap();
-        build_reference_index(&hprof, &p4, &utf8, &lc, &mut refs).unwrap();
-        build_frame_index(&hprof, &p1, &mut frames).unwrap();
-        build_trace_index(&hprof, &p1, &mut traces).unwrap();
-        build_start_thread_index(&hprof, &p1, &mut st).unwrap();
-        build_end_thread_index(&hprof, &p1, &mut et).unwrap();
-        build_unload_class_index(&hprof, &p1, &mut uc).unwrap();
-
-        build_array_size_indexes(&hprof, &p4, &mut arrays).unwrap();
-
-        HeapQuery::from_sources(
-            &hprof,
-            &p4,
-            &utf8,
-            &lc,
-            &frames,
-            &traces,
-            &st,
-            &et,
-            &uc,
-            &refs,
-            [&r0, &r1, &r2, &r3, &r4, &r5, &r6, &r7, &r8],
-            [
-                &arrays[0], &arrays[1], &arrays[2], &arrays[3], &arrays[4], &arrays[5], &arrays[6],
-                &arrays[7], &arrays[8],
-            ],
-        )
-        .unwrap()
+        let (store, _) = build_in_memory_with(&standard_heap(), &opts);
+        HeapQuery::check_indexed(&store).unwrap();
     }
 
     // ── Heap query tests ──────────────────────────────────────────────────────
 
     #[test]
     fn find_by_object_id() {
-        let query = build_query(&build_test_hprof());
-        let record = query.find(0x100).unwrap().unwrap();
+        let query = query();
+        let record = query.object(INTEGER_42).unwrap().unwrap();
         assert!(matches!(record, SubRecord::InstanceDump(_)));
     }
 
     #[test]
     fn find_missing_returns_none() {
-        let query = build_query(&build_test_hprof());
-        assert!(query.find(0xDEAD).unwrap().is_none());
+        let query = query();
+        assert!(query.object(0xDEAD).unwrap().is_none());
     }
 
     #[test]
-    fn find_class_returns_class_dump() {
-        let query = build_query(&build_test_hprof());
-        let record = query.find_class(0x200).unwrap().unwrap();
-        assert!(matches!(record, SubRecord::ClassDump(_)));
+    fn class_returns_the_class_dump_only_for_classes() {
+        let query = query();
+        let cd = query.class(INTEGER_CLASS).unwrap().unwrap();
+        assert_eq!(cd.class_id, INTEGER_CLASS);
+        // An instance id, an unknown id: not classes.
+        assert!(query.class(INTEGER_42).unwrap().is_none());
+        assert!(query.class(0xDEAD).unwrap().is_none());
     }
 
     #[test]
-    fn find_instance_returns_instance_dump() {
-        let query = build_query(&build_test_hprof());
-        let record = query.find_instance(0x100).unwrap().unwrap();
-        assert!(matches!(record, SubRecord::InstanceDump(_)));
+    fn instance_returns_the_instance_dump_only_for_instances() {
+        let query = query();
+        let inst = query.instance(INTEGER_42).unwrap().unwrap();
+        assert_eq!(inst.object_id, INTEGER_42);
+        assert_eq!(inst.class_id, INTEGER_CLASS);
+        // A class id, an array id, an unknown id: not instances.
+        assert!(query.instance(INTEGER_CLASS).unwrap().is_none());
+        assert!(query.instance(CHARS_HI).unwrap().is_none());
+        assert!(query.instance(0xDEAD).unwrap().is_none());
     }
 
     #[test]
     fn class_name_resolved() {
-        let query = build_query(&build_test_hprof());
+        let query = query();
         assert_eq!(
-            query.class_name(0x200).unwrap(),
-            Some("java.lang.Integer".to_string())
+            query.class_name(INTEGER_CLASS),
+            Some("java.lang.Integer".into())
         );
     }
 
     #[test]
     fn instance_fields_resolved() {
-        let query = build_query(&build_test_hprof());
-        let SubRecord::InstanceDump(inst) = query.find_instance(0x100).unwrap().unwrap() else {
-            panic!("expected InstanceDump");
-        };
+        let query = query();
+        let inst = query.instance(INTEGER_42).unwrap().unwrap();
         let fields = query.instance_fields(&inst).unwrap();
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].name, "value");
@@ -1210,227 +1176,226 @@ mod tests {
 
     #[test]
     fn resolve_value_integer_wrapper() {
-        let query = build_query(&build_test_hprof());
-        let val = query.resolve_value(0x100).unwrap();
-        assert!(matches!(val, JavaValue::Integer(0x100, 42)));
+        let query = query();
+        let val = query.resolve_value(INTEGER_42).unwrap();
+        assert!(matches!(val, Value::BoxedInt(INTEGER_42, 42)));
     }
 
     #[test]
-    fn object_count_nonzero() {
-        let query = build_query(&build_test_hprof());
-        assert!(query.object_count() > 0);
+    fn resolve_value_string() {
+        let query = query();
+        let val = query.resolve_value(STRING_HI).unwrap();
+        assert!(matches!(val, Value::String(STRING_HI, ref s) if s == "hi"));
     }
 
     #[test]
-    fn iter_objects_yields_records() {
-        let query = build_query(&build_test_hprof());
-        let records: Vec<_> = query.iter_objects().collect::<Result<_, _>>().unwrap();
-        // Should contain at least the 2 class dumps and 1 instance dump.
-        assert!(records.len() >= 3);
-        let has_instance = records
-            .iter()
-            .any(|r| matches!(r, SubRecord::InstanceDump(_)));
-        let has_class = records.iter().any(|r| matches!(r, SubRecord::ClassDump(_)));
-        assert!(has_instance);
-        assert!(has_class);
+    fn object_count_matches_fixture() {
+        let query = query();
+        // 5 classes + 4 objects + 3 roots
+        assert_eq!(query.object_count(), 12);
     }
 
     #[test]
-    fn par_for_each_visits_all_records() {
-        let query = build_query(&build_test_hprof());
-        let count = AtomicU64::new(0);
-        query
-            .par_for_each(|_record| {
-                count.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            })
+    fn iter_objects_yields_records_in_id_order() {
+        let query = query();
+        let records: Vec<_> = query.objects().collect::<Result<_, _>>().unwrap();
+        assert_eq!(records.len(), query.object_count());
+        let ids: Vec<u64> = query.iter_entries().map(|e| e.object_id).collect();
+        assert!(ids.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn par_objects_visits_every_record_once() {
+        let query = query();
+        let n = query
+            .par_objects()
+            .map(|r| r.map(|_| 1u64))
+            .sum::<Result<u64, _>>()
             .unwrap();
-        assert_eq!(count.load(Ordering::Relaxed), query.object_count() as u64);
+        assert_eq!(n, query.object_count() as u64);
     }
 
     #[test]
-    fn par_instances_visits_only_instances() {
-        let query = build_query(&build_test_hprof());
-        let count = AtomicU64::new(0);
-        query
-            .par_instances(|_inst| {
-                count.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            })
+    fn par_instances_yields_only_instances() {
+        let query = query();
+        let mut ids: Vec<u64> = query
+            .par_instances()
+            .map(|r| r.map(|i| i.object_id))
+            .collect::<Result<_, _>>()
             .unwrap();
-        // Test hprof has exactly 1 INSTANCE_DUMP.
-        assert_eq!(count.load(Ordering::Relaxed), 1);
+        ids.sort_unstable();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&INTEGER_42) && ids.contains(&LIST));
     }
 
     #[test]
-    fn par_classes_visits_only_classes() {
-        let query = build_query(&build_test_hprof());
-        let count = AtomicU64::new(0);
-        query
-            .par_classes(|_cd| {
-                count.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            })
+    fn par_classes_yields_only_classes() {
+        let query = query();
+        let n = query
+            .par_classes()
+            .map(|r| r.map(|_| 1u64))
+            .sum::<Result<u64, _>>()
             .unwrap();
-        // Test hprof has 2 CLASS_DUMP records.
-        assert_eq!(count.load(Ordering::Relaxed), 2);
+        assert_eq!(n, 5);
     }
 
     #[test]
-    fn par_resolved_instances_visits_resolved_instances() {
-        use std::sync::Mutex;
-        let query = build_query(&build_test_hprof());
-        let names: Mutex<Vec<String>> = Mutex::new(Vec::new());
-        query
-            .par_resolved_instances(|inst| {
-                names.lock().unwrap().push(inst.class_name.clone());
-                Ok(())
-            })
+    fn resolving_instances_from_the_iterator() {
+        let query = query();
+        let mut names: Vec<String> = query
+            .par_instances()
+            .map(|r| Ok(query.resolve_instance(&r?)?.class_name))
+            .collect::<Result<_, HprofError>>()
             .unwrap();
-        let mut names = names.into_inner().unwrap();
         names.sort();
-        // Test hprof has 1 INSTANCE_DUMP with class java.lang.Integer.
-        assert_eq!(names, vec!["java.lang.Integer"]);
+        assert_eq!(
+            names,
+            vec![
+                "java.lang.Integer",
+                "java.lang.String",
+                "java.util.ArrayList"
+            ]
+        );
     }
 
     #[test]
-    fn par_resolved_instances_fields_are_resolved() {
-        use crate::resolved::Value;
-        use std::sync::Mutex;
-        let query = build_query(&build_test_hprof());
-        let values: Mutex<Vec<Value>> = Mutex::new(Vec::new());
-        query
-            .par_resolved_instances(|inst| {
-                for f in &inst.fields {
-                    values.lock().unwrap().push(f.value.clone());
-                }
-                Ok(())
-            })
-            .unwrap();
-        let values = values.into_inner().unwrap();
-        // INSTANCE_DUMP(0x100, class=Integer, value=42) → one Int(42) field.
-        assert_eq!(values, vec![Value::Int(42)]);
+    fn resolved_instance_fields_come_through_the_iterator() {
+        let query = query();
+        let mut values: Vec<Value> = Vec::new();
+        for inst in query.objects().filter_map(|r| match r {
+            Ok(SubRecord::InstanceDump(i)) => Some(i),
+            _ => None,
+        }) {
+            values.extend(
+                query
+                    .resolve_instance(&inst)
+                    .unwrap()
+                    .fields
+                    .into_iter()
+                    .map(|f| f.value),
+            );
+        }
+        assert_eq!(values.len(), 3);
+        assert!(values.contains(&Value::Int(42)));
+        assert!(values.contains(&Value::Object(CHARS_HI)));
+        assert!(values.contains(&Value::BoxedInt(INTEGER_42, 42)));
     }
 
     #[test]
-    fn par_resolved_classes_visits_resolved_classes() {
-        use std::sync::Mutex;
-        let query = build_query(&build_test_hprof());
-        let names: Mutex<Vec<String>> = Mutex::new(Vec::new());
-        query
-            .par_resolved_classes(|cd| {
-                names.lock().unwrap().push(cd.class_name.clone());
-                Ok(())
-            })
+    fn resolving_classes_from_the_iterator() {
+        let query = query();
+        let mut names: Vec<String> = query
+            .par_classes()
+            .map(|r| Ok(query.resolve_class(&r?)?.class_name))
+            .collect::<Result<_, HprofError>>()
             .unwrap();
-        let mut names = names.into_inner().unwrap();
         names.sort();
-        // Test hprof has CLASS_DUMP for Integer and Object.
-        assert_eq!(names, vec!["java.lang.Integer", "java.lang.Object"]);
-    }
-
-    #[test]
-    fn par_resolved_classes_super_class_name_resolved() {
-        use std::sync::Mutex;
-        let query = build_query(&build_test_hprof());
-        let super_names: Mutex<Vec<Option<String>>> = Mutex::new(Vec::new());
-        query
-            .par_resolved_classes(|cd| {
-                if cd.class_name == "java.lang.Integer" {
-                    super_names
-                        .lock()
-                        .unwrap()
-                        .push(cd.super_class_name.clone());
-                }
-                Ok(())
-            })
+        assert_eq!(
+            names,
+            vec![
+                "[C",
+                "java.lang.Integer",
+                "java.lang.Object",
+                "java.lang.String",
+                "java.util.ArrayList"
+            ]
+        );
+        let integer = query
+            .resolve_class(&query.class(INTEGER_CLASS).unwrap().unwrap())
             .unwrap();
-        let super_names = super_names.into_inner().unwrap();
-        assert_eq!(super_names, vec![Some("java.lang.Object".to_string())]);
+        assert_eq!(
+            integer.super_class_name.as_deref(),
+            Some("java.lang.Object")
+        );
     }
 
-    // ── find_class_by_name / par_instances_of tests ───────────────────────────
+    // ── find_class_by_name / instances_of tests ───────────────────────────────
 
     #[test]
     fn find_class_by_name_returns_class_id() {
-        let query = build_query(&build_test_hprof());
-        let class_id = query.find_class_by_name("java.lang.Integer").unwrap();
-        assert_eq!(class_id, Some(0x200));
+        let query = query();
+        let class_id = query.find_class_by_name("java.lang.Integer");
+        assert_eq!(class_id, Some(INTEGER_CLASS));
+    }
+
+    #[test]
+    fn class_names_use_dots_and_round_trip() {
+        let query = query();
+        assert_eq!(query.find_class_by_name("java/lang/Object"), None);
+        assert_eq!(
+            query.find_class_by_name("java.lang.Object"),
+            Some(OBJECT_CLASS)
+        );
+        assert_eq!(
+            query.class_name(OBJECT_CLASS).as_deref(),
+            Some("java.lang.Object")
+        );
+        assert_eq!(query.class_name(0xDEAD), None);
+        assert_eq!(query.class_label(0xDEAD), "0xdead");
+        assert_eq!(query.class_label(INTEGER_CLASS), "java.lang.Integer");
+        for (id, _) in query.class_ids() {
+            let name = query.class_name(id).unwrap();
+            assert_eq!(query.find_class_by_name(&name), Some(id));
+        }
+    }
+
+    #[test]
+    fn object_type_names_cover_every_kind_and_never_fail() {
+        let query = query();
+        assert_eq!(query.object_type_name(LIST), "java.util.ArrayList");
+        assert_eq!(query.object_type_name(INTEGER_CLASS), "Class");
+        assert_eq!(query.object_type_name(CHARS_HI), "char[]");
+        assert_eq!(query.object_type_name(0), "Object");
+        assert_eq!(query.object_type_name(0xDEAD), "Object");
     }
 
     #[test]
     fn find_class_by_name_unknown_returns_none() {
-        let query = build_query(&build_test_hprof());
-        let class_id = query.find_class_by_name("does.not.Exist").unwrap();
+        let query = query();
+        let class_id = query.find_class_by_name("does.not.Exist");
         assert_eq!(class_id, None);
     }
 
     #[test]
-    fn par_instances_of_visits_matching_instances() {
-        let query = build_query(&build_test_hprof());
-        let count = AtomicU64::new(0);
-        query
-            .par_instances_of("java.lang.Integer", |_inst| {
-                count.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            })
+    fn instances_of_yields_the_classes_own_instances() {
+        let query = query();
+        let ints: Vec<u64> = query
+            .instances_of(INTEGER_CLASS)
+            .map(|r| r.unwrap().object_id)
+            .collect();
+        assert_eq!(ints, vec![INTEGER_42]);
+        let par: Vec<u64> = query
+            .par_instances_of(INTEGER_CLASS)
+            .map(|r| r.map(|i| i.object_id))
+            .collect::<Result<_, _>>()
             .unwrap();
-        // One Integer instance in the test hprof.
-        assert_eq!(count.load(Ordering::Relaxed), 1);
+        assert_eq!(par, vec![INTEGER_42]);
     }
 
     #[test]
-    fn par_instances_of_skips_non_matching_instances() {
-        let query = build_query(&build_test_hprof());
-        let count = AtomicU64::new(0);
-        query
-            .par_instances_of("java.lang.Object", |_inst| {
-                count.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            })
-            .unwrap();
-        // No Object instances directly (only Integer which extends Object).
-        assert_eq!(count.load(Ordering::Relaxed), 0);
+    fn instances_of_a_class_without_instances_or_an_unknown_class_is_empty() {
+        let query = query();
+        assert_eq!(query.instances_of(OBJECT_CLASS).count(), 0);
+        assert_eq!(query.instances_of(0xDEAD).count(), 0);
+        assert_eq!(query.par_instances_of(0xDEAD).count(), 0);
     }
 
     #[test]
-    fn par_instances_of_unknown_class_is_noop() {
-        let query = build_query(&build_test_hprof());
-        let count = AtomicU64::new(0);
-        query
-            .par_instances_of("no.such.Class", |_inst| {
-                count.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(count.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn par_resolved_instances_of_yields_resolved() {
-        use crate::resolved::Value;
-        use std::sync::Mutex;
-        let query = build_query(&build_test_hprof());
-        let values: Mutex<Vec<Value>> = Mutex::new(Vec::new());
-        query
-            .par_resolved_instances_of("java.lang.Integer", |inst| {
-                for f in &inst.fields {
-                    values.lock().unwrap().push(f.value.clone());
-                }
-                Ok(())
-            })
-            .unwrap();
-        // Integer instance has one int field "value" = 42.
-        assert_eq!(values.into_inner().unwrap(), vec![Value::Int(42)]);
+    fn instances_of_resolves_field_values() {
+        let query = query();
+        let inst = query.instances_of(INTEGER_CLASS).next().unwrap().unwrap();
+        let fields = query.resolve_instance(&inst).unwrap().fields;
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].value, Value::Int(42));
     }
 
     // ── Aux record tests ──────────────────────────────────────────────────────
 
     #[test]
     fn find_frame_by_id() {
-        let query = build_query(&build_test_hprof());
-        let frame = query.find_frame(0x10).unwrap().unwrap();
-        assert_eq!(frame.frame_id, 0x10);
+        let query = query();
+        let frame = query.iter_frames().next().unwrap().unwrap();
+        assert_eq!(frame.frame_id, FRAME_MAIN);
         assert_eq!(frame.class_serial, 1);
 
         let resolved = query.resolve_frame(&frame).unwrap();
@@ -1442,21 +1407,22 @@ mod tests {
 
     #[test]
     fn find_trace_by_serial() {
-        let query = build_query(&build_test_hprof());
-        let trace = query.find_trace(1).unwrap().unwrap();
-        assert_eq!(trace.trace_serial, 1);
-        assert_eq!(trace.thread_serial, 1);
+        let query = query();
+        let trace = query.find_trace(TRACE_SERIAL).unwrap().unwrap();
+        assert_eq!(trace.trace_serial, TRACE_SERIAL);
+        assert_eq!(trace.thread_serial, THREAD_SERIAL);
 
         let frames = query.trace_frames(&trace).unwrap();
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].frame_id, 0x10);
+        assert_eq!(frames[0].frame_id, FRAME_MAIN);
     }
 
     #[test]
     fn find_thread_by_serial() {
-        let query = build_query(&build_test_hprof());
-        let thread = query.find_thread(1).unwrap().unwrap();
-        assert_eq!(thread.thread_id, 0xABC);
+        let query = query();
+        let thread = query.iter_threads().next().unwrap().unwrap();
+        assert_eq!(thread.thread_serial, THREAD_SERIAL);
+        assert_eq!(thread.thread_id, THREAD_OBJ);
 
         let resolved = query.resolve_thread(&thread).unwrap();
         assert_eq!(resolved.thread_name, "main");
@@ -1464,72 +1430,189 @@ mod tests {
 
     #[test]
     fn was_thread_ended_true() {
-        let query = build_query(&build_test_hprof());
-        assert!(query.was_thread_ended(1));
+        let query = query();
+        assert!(query.was_thread_ended(THREAD_SERIAL));
         assert!(!query.was_thread_ended(99));
     }
 
     #[test]
     fn iter_frames_yields_all() {
-        let query = build_query(&build_test_hprof());
+        let query = query();
         let frames: Vec<_> = query.iter_frames().collect::<Result<_, _>>().unwrap();
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].frame_id, 0x10);
+        assert_eq!(frames[0].frame_id, FRAME_MAIN);
     }
 
     #[test]
     fn iter_traces_yields_all() {
-        let query = build_query(&build_test_hprof());
+        let query = query();
         let traces: Vec<_> = query.iter_traces().collect::<Result<_, _>>().unwrap();
         assert_eq!(traces.len(), 1);
-        assert_eq!(traces[0].trace_serial, 1);
+        assert_eq!(traces[0].trace_serial, TRACE_SERIAL);
     }
 
     #[test]
     fn iter_threads_yields_all() {
-        let query = build_query(&build_test_hprof());
+        let query = query();
         let threads: Vec<_> = query.iter_threads().collect::<Result<_, _>>().unwrap();
         assert_eq!(threads.len(), 1);
-        assert_eq!(threads[0].thread_id, 0xABC);
+        assert_eq!(threads[0].thread_id, THREAD_OBJ);
     }
 
     // ── GC root tests ─────────────────────────────────────────────────────────
 
     #[test]
     fn is_gc_root_false_for_plain_instance() {
-        // The test hprof has no GC roots; instance 0x100 is not a root.
-        let query = build_query(&build_test_hprof());
-        assert!(!query.is_gc_root(0x100));
+        let query = query();
+        assert!(!query.is_gc_root(INTEGER_42));
     }
 
     #[test]
-    fn find_root_returns_none_for_absent_id() {
-        let query = build_query(&build_test_hprof());
-        assert!(query.find_root(0x100, GcRootType::StickyClass).is_none());
+    fn is_gc_root_true_for_frame_root_and_sticky_class() {
+        let query = query();
+        assert!(query.is_gc_root(LIST));
+        assert!(query.is_gc_root(INTEGER_CLASS));
+        assert_eq!(query.root_types_of(LIST), vec![GcRootType::JavaFrame]);
     }
 
     #[test]
-    fn iter_roots_empty_when_no_roots() {
-        let query = build_query(&build_test_hprof());
-        let count = query.iter_roots(GcRootType::JniGlobal).count();
-        assert_eq!(count, 0);
+    fn root_kinds_are_reported_per_object() {
+        let query = query();
+        assert!(
+            !query
+                .root_types_of(INTEGER_42)
+                .contains(&GcRootType::StickyClass)
+        );
+        assert!(
+            query
+                .root_types_of(INTEGER_CLASS)
+                .contains(&GcRootType::StickyClass)
+        );
+    }
+
+    #[test]
+    fn iter_roots_counts_per_type() {
+        let query = query();
+        assert_eq!(query.iter_roots(GcRootType::JniGlobal).count(), 0);
+        assert_eq!(query.iter_roots(GcRootType::StickyClass).count(), 2);
+        assert_eq!(query.iter_roots(GcRootType::JavaFrame).count(), 1);
     }
 
     #[test]
     fn root_types_of_empty_for_non_root() {
-        let query = build_query(&build_test_hprof());
-        assert!(query.root_types_of(0x100).is_empty());
+        let query = query();
+        assert!(query.root_types_of(INTEGER_42).is_empty());
     }
 
     // ── Reference index tests ─────────────────────────────────────────────────
 
     #[test]
-    fn refs_to_returns_vec() {
-        // The test hprof has INSTANCE_DUMP(0x100, class=0x200).
-        // Instance 0x100 holds no object-reference fields (only an int field),
-        // so refs_to(0x100) should be empty; but the ref_count should be >= 0.
-        let query = build_query(&build_test_hprof());
-        let _ = query.refs_to(0x100); // just ensure it doesn't panic
-        let _ = query.ref_count(); // same
+    fn ref_count_counts_reference_records() {
+        assert_eq!(query().ref_count(), 2);
+    }
+
+    // ── Retained heap tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn retained_heap_available_after_full_build() {
+        let query = query();
+        assert!(query.has_retained_heap());
+        // ArrayList instance: 8 bytes of field data + Integer (4 bytes).
+        assert_eq!(query.retained_size(LIST), Some(12));
+        assert_eq!(query.retained_size(INTEGER_42), Some(4));
+        assert_eq!(query.dominator_of(INTEGER_42), Some(LIST));
+        assert_eq!(
+            query.dominator_of(LIST),
+            Some(crate::dominator::VIRTUAL_ROOT_ID)
+        );
+        // Unreachable objects have no retained entry.
+        assert_eq!(query.retained_size(STRING_HI), None);
+        assert!(query.retained_top(Page::first(1)).unwrap().total > 0);
+    }
+
+    #[test]
+    fn instances_of_and_histogram_come_from_the_class_index() {
+        let query = query();
+        let ints: Vec<u64> = query
+            .class_entries(ClassKey::Class(INTEGER_CLASS))
+            .map(|e| e.object_id)
+            .collect();
+        assert_eq!(ints, vec![INTEGER_42]);
+        assert_eq!(query.instance_count(ClassKey::Class(STRING_CLASS)), 1);
+        assert_eq!(query.instance_count(ClassKey::Class(OBJECT_CLASS)), 0);
+        assert_eq!(query.instance_count(ClassKey::PrimArray(5)), 1);
+        assert_eq!(query.histogram_len(), 4);
+        assert!(query.histogram().all(|r| r.instance_count == 1));
+        let classes: Vec<u64> = query.class_ids().map(|(id, _)| id).collect();
+        assert_eq!(
+            classes,
+            vec![
+                INTEGER_CLASS,
+                OBJECT_CLASS,
+                STRING_CLASS,
+                CHAR_ARRAY_CLASS,
+                ARRAYLIST_CLASS
+            ]
+        );
+
+        // Parsing through the entry gives the real record.
+        let e = query
+            .class_entries(ClassKey::Class(ARRAYLIST_CLASS))
+            .next()
+            .unwrap();
+        let rec = query
+            .parse_entry(&e.sub_index_entry(TAG_INSTANCE_DUMP))
+            .unwrap();
+        assert!(matches!(rec, SubRecord::InstanceDump(ref i) if i.object_id == LIST));
+    }
+
+    #[test]
+    fn retained_top_and_dominated_by_are_paged() {
+        let query = query();
+        // Reachable: LIST (12), INTEGER_42 (4), the two sticky classes (0).
+        let top = query.retained_top(Page::first(2)).unwrap();
+        assert_eq!(top.total, 4);
+        assert!(top.has_more);
+        assert_eq!(top.items, vec![(LIST, 12), (INTEGER_42, 4)]);
+        let rest = query.retained_top(Page::new(2, 10)).unwrap();
+        assert_eq!(rest.items.len(), 2);
+        assert!(!rest.has_more);
+        assert!(rest.items.iter().all(|&(_, r)| r == 0));
+
+        // Children of the virtual root are the GC roots, in id order.
+        let roots = query
+            .dominated_by(crate::dominator::VIRTUAL_ROOT_ID, Page::first(10))
+            .unwrap();
+        assert_eq!(
+            roots.items,
+            vec![(INTEGER_CLASS, 0), (OBJECT_CLASS, 0), (LIST, 12)]
+        );
+        assert!(!roots.has_more);
+        let under_list = query.dominated_by(LIST, Page::first(10)).unwrap();
+        assert_eq!(under_list.items, vec![(INTEGER_42, 4)]);
+        let leaf = query.dominated_by(INTEGER_42, Page::first(10)).unwrap();
+        assert!(leaf.items.is_empty());
+        assert_eq!(leaf.total, 0);
+        // Paging past the end is empty, not an error.
+        let past = query.dominated_by(LIST, Page::new(5, 10)).unwrap();
+        assert!(past.items.is_empty());
+        assert!(!past.has_more);
+    }
+
+    #[test]
+    fn retained_heap_absent_when_not_built() {
+        let opts = IndexOptions {
+            retained: false,
+            force: false,
+            ..IndexOptions::default()
+        };
+        let (_, query) = build_in_memory_with(&standard_heap(), &opts);
+        assert!(!query.has_retained_heap());
+        assert_eq!(query.retained_size(LIST), None);
+        assert_eq!(query.dominator_of(LIST), None);
+        assert!(query.retained_top(Page::first(1)).is_none());
+        assert!(query.dominated_by(LIST, Page::first(1)).is_none());
+        // Everything else still works.
+        assert_eq!(query.refs_to(INTEGER_42, Page::first(5)).items, vec![LIST]);
     }
 }

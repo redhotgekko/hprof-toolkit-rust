@@ -1,4 +1,4 @@
-//! Per-type GC root index files — entry format, reader, and binary-search.
+//! Per-type GC root index files — entry format and reader.
 //!
 //! Root index files are produced by [`crate::object_store::combine_sort_and_split`]
 //! as part of the combined object-store build step.
@@ -25,14 +25,14 @@
 //! | `root_thread_obj.bin`   | `0x08`         | `ThreadObject`          |
 
 use crate::hprof::HprofError;
-use std::path::Path;
+use crate::index::{Entry, RecordFile, RecordIter, read_u64_le};
 
 // ── GcRootType ────────────────────────────────────────────────────────────────
 
 /// The nine GC root sub-record types defined by the hprof format.
 ///
-/// Used to select which per-type root index file to query via
-/// [`RootIndexReader`] or [`crate::query::HeapQuery`].
+/// Used to select which kind of root to query through
+/// [`crate::query::HeapQuery`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GcRootType {
     Unknown,
@@ -48,7 +48,7 @@ pub enum GcRootType {
 
 impl GcRootType {
     /// All nine root types in a fixed canonical order (same as the array
-    /// index used internally by [`HeapQuery`]).
+    /// index used internally by [`crate::query::HeapQuery`]).
     pub const ALL: [GcRootType; 9] = [
         GcRootType::Unknown,
         GcRootType::JniGlobal,
@@ -62,6 +62,22 @@ impl GcRootType {
     ];
 
     /// Returns the canonical array index for this type (0–8).
+    /// The hprof sub-record tag of this root kind.
+    pub(crate) fn sub_record_tag(self) -> u8 {
+        use crate::heap_index::sub_record::*;
+        match self {
+            Self::Unknown => TAG_ROOT_UNKNOWN,
+            Self::JniGlobal => TAG_ROOT_JNI_GLOBAL,
+            Self::JniLocal => TAG_ROOT_JNI_LOCAL,
+            Self::JavaFrame => TAG_ROOT_JAVA_FRAME,
+            Self::NativeStack => TAG_ROOT_NATIVE_STACK,
+            Self::StickyClass => TAG_ROOT_STICKY_CLASS,
+            Self::ThreadBlock => TAG_ROOT_THREAD_BLOCK,
+            Self::MonitorUsed => TAG_ROOT_MONITOR_USED,
+            Self::ThreadObject => TAG_ROOT_THREAD_OBJ,
+        }
+    }
+
     pub(crate) fn index(self) -> usize {
         match self {
             Self::Unknown => 0,
@@ -76,19 +92,25 @@ impl GcRootType {
         }
     }
 
-    /// Human-readable name for display.
-    pub fn name(self) -> &'static str {
+    /// Stable lower-case identifier (`"java_frame"`), used in URLs and tool
+    /// arguments.  Inverse of [`Self::from_slug`].
+    pub fn slug(self) -> &'static str {
         match self {
-            Self::Unknown => "ROOT_UNKNOWN",
-            Self::JniGlobal => "ROOT_JNI_GLOBAL",
-            Self::JniLocal => "ROOT_JNI_LOCAL",
-            Self::JavaFrame => "ROOT_JAVA_FRAME",
-            Self::NativeStack => "ROOT_NATIVE_STACK",
-            Self::StickyClass => "ROOT_STICKY_CLASS",
-            Self::ThreadBlock => "ROOT_THREAD_BLOCK",
-            Self::MonitorUsed => "ROOT_MONITOR_USED",
-            Self::ThreadObject => "ROOT_THREAD_OBJ",
+            Self::Unknown => "unknown",
+            Self::JniGlobal => "jni_global",
+            Self::JniLocal => "jni_local",
+            Self::JavaFrame => "java_frame",
+            Self::NativeStack => "native_stack",
+            Self::StickyClass => "sticky_class",
+            Self::ThreadBlock => "thread_block",
+            Self::MonitorUsed => "monitor_used",
+            Self::ThreadObject => "thread_object",
         }
+    }
+
+    /// The root type named by `slug`, if any.
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.slug() == slug)
     }
 }
 
@@ -113,156 +135,67 @@ pub struct RootIndexEntry {
 impl RootIndexEntry {
     pub fn to_bytes(self) -> [u8; ROOT_INDEX_ENTRY_SIZE] {
         let mut buf = [0u8; ROOT_INDEX_ENTRY_SIZE];
-        buf[0..8].copy_from_slice(&self.object_id.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.position.to_le_bytes());
+        self.write_to(&mut buf);
         buf
     }
+}
 
-    pub fn from_bytes(bytes: &[u8; ROOT_INDEX_ENTRY_SIZE]) -> Self {
-        let object_id = u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]);
-        let position = u64::from_le_bytes([
-            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
-        ]);
+impl Entry for RootIndexEntry {
+    const SIZE: usize = ROOT_INDEX_ENTRY_SIZE;
+    const KEY_OFFSET: usize = 0;
+
+    fn from_bytes(b: &[u8]) -> Self {
         Self {
-            object_id,
-            position,
+            object_id: read_u64_le(b, 0),
+            position: read_u64_le(b, 8),
         }
+    }
+
+    fn write_to(&self, out: &mut [u8]) {
+        out[0..8].copy_from_slice(&self.object_id.to_le_bytes());
+        out[8..16].copy_from_slice(&self.position.to_le_bytes());
+    }
+
+    fn key(&self) -> u64 {
+        self.object_id
     }
 }
 
 // ── RootIndexReader ───────────────────────────────────────────────────────────
 
+/// Iterator over all entries in a [`RootIndexReader`], ascending `object_id`.
+pub type RootIter<'a> = RecordIter<'a, RootIndexEntry>;
+
 /// Read-only handle to a single per-type root index file.
 #[derive(Copy, Clone)]
 pub struct RootIndexReader<'a> {
-    data: &'a [u8],
+    file: RecordFile<'a, RootIndexEntry>,
 }
 
 impl<'a> RootIndexReader<'a> {
     /// Create a validated reader from a byte slice.
     pub fn from_ref(data: &'a [u8]) -> Result<Self, HprofError> {
-        if !data.len().is_multiple_of(ROOT_INDEX_ENTRY_SIZE) {
-            return Err(HprofError::InvalidIndexFile);
-        }
-        Ok(Self { data })
+        Ok(Self {
+            file: RecordFile::new(data)?,
+        })
     }
 
     /// Create a reader from a slice already known to be valid.
-    ///
-    /// The caller must guarantee that `data.len()` is a multiple of
-    /// [`ROOT_INDEX_ENTRY_SIZE`]; checked with `debug_assert`.
     pub(crate) fn from_slice(data: &'a [u8]) -> Self {
-        debug_assert!(data.len().is_multiple_of(ROOT_INDEX_ENTRY_SIZE));
-        Self { data }
+        Self {
+            file: RecordFile::from_slice(data),
+        }
     }
 
-    fn as_slice(&self) -> &[u8] {
-        self.data
-    }
-
-    /// Total number of entries in this index.
-    pub fn len(&self) -> usize {
-        self.as_slice().len() / ROOT_INDEX_ENTRY_SIZE
-    }
-
-    /// Returns `true` if this index contains no entries.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Binary-search for an entry with the given `object_id`.
-    ///
-    /// Returns `Some(entry)` if found, `None` if absent.  O(log n).
+    /// Binary-search for an entry with the given `object_id`.  O(log n).
     pub fn find(&self, object_id: u64) -> Option<RootIndexEntry> {
-        let n = self.len();
-        let mut lo = 0usize;
-        let mut hi = n;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if self.read_object_id_at(mid) < object_id {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        if lo < n && self.read_object_id_at(lo) == object_id {
-            Some(self.read_entry_at(lo))
-        } else {
-            None
-        }
+        self.file.find(object_id)
     }
 
     /// Iterate all entries in ascending `object_id` order.
     pub fn iter(&self) -> RootIter<'a> {
-        RootIter {
-            reader: *self,
-            idx: 0,
-        }
+        self.file.iter()
     }
-
-    fn read_object_id_at(&self, idx: usize) -> u64 {
-        let data = self.as_slice();
-        let start = idx * ROOT_INDEX_ENTRY_SIZE;
-        u64::from_le_bytes([
-            data[start],
-            data[start + 1],
-            data[start + 2],
-            data[start + 3],
-            data[start + 4],
-            data[start + 5],
-            data[start + 6],
-            data[start + 7],
-        ])
-    }
-
-    fn read_entry_at(&self, idx: usize) -> RootIndexEntry {
-        let data = self.as_slice();
-        let start = idx * ROOT_INDEX_ENTRY_SIZE;
-        let bytes: [u8; ROOT_INDEX_ENTRY_SIZE] = data[start..start + ROOT_INDEX_ENTRY_SIZE]
-            .try_into()
-            .unwrap_or([0u8; ROOT_INDEX_ENTRY_SIZE]);
-        RootIndexEntry::from_bytes(&bytes)
-    }
-}
-
-// ── RootIter ──────────────────────────────────────────────────────────────────
-
-/// Iterator over all entries in a [`RootIndexReader`].
-///
-/// Yields entries in ascending `object_id` order.
-pub struct RootIter<'a> {
-    reader: RootIndexReader<'a>,
-    idx: usize,
-}
-
-impl<'a> Iterator for RootIter<'a> {
-    type Item = RootIndexEntry;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.idx >= self.reader.len() {
-            return None;
-        }
-        let entry = self.reader.read_entry_at(self.idx);
-        self.idx += 1;
-        Some(entry)
-    }
-}
-
-// ── Output path bundle ────────────────────────────────────────────────────────
-
-/// Paths for all nine per-type root index files.
-pub struct RootIndexPaths<'a> {
-    pub root_unknown: &'a Path,
-    pub root_jni_global: &'a Path,
-    pub root_jni_local: &'a Path,
-    pub root_java_frame: &'a Path,
-    pub root_native_stack: &'a Path,
-    pub root_sticky_class: &'a Path,
-    pub root_thread_block: &'a Path,
-    pub root_monitor_used: &'a Path,
-    pub root_thread_obj: &'a Path,
 }
 
 /// Entry counts for each root type, returned by
@@ -327,8 +260,13 @@ mod tests {
         let empty: Vec<u8> = vec![];
         let reader = RootIndexReader::from_ref(&empty).unwrap();
         assert!(reader.find(1).is_none());
-        assert_eq!(reader.len(), 0);
-        assert!(reader.is_empty());
+        assert_eq!(reader.file.len(), 0);
+        assert!(reader.file.is_empty());
+    }
+
+    #[test]
+    fn reader_rejects_misaligned_data() {
+        assert!(RootIndexReader::from_ref(&[0u8; 17]).is_err());
     }
 
     #[test]
@@ -340,6 +278,14 @@ mod tests {
         assert_eq!(entries[0].object_id, 10);
         assert_eq!(entries[1].object_id, 20);
         assert_eq!(entries[2].object_id, 30);
+    }
+
+    #[test]
+    fn slugs_round_trip() {
+        for t in GcRootType::ALL {
+            assert_eq!(GcRootType::from_slug(t.slug()), Some(t));
+        }
+        assert_eq!(GcRootType::from_slug("purple"), None);
     }
 
     #[test]

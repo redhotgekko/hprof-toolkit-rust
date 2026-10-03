@@ -4,9 +4,9 @@ use crate::heap_index::sub_record::{
     TAG_ROOT_NATIVE_STACK, TAG_ROOT_STICKY_CLASS, TAG_ROOT_THREAD_BLOCK, TAG_ROOT_THREAD_OBJ,
     TAG_ROOT_UNKNOWN,
 };
-use crate::hprof::HprofFile;
 use crate::hprof::error::HprofError;
 use crate::hprof::record::{read_id, read_u16_be, read_u32_be, read_u64_be};
+use crate::hprof::{BasicType, HprofFile};
 
 // ── Value type ────────────────────────────────────────────────────────────────
 
@@ -316,7 +316,9 @@ pub struct ObjArrayDump<'a> {
     pub array_id: u64,
     pub stack_trace_serial: u32,
     pub num_elements: u32,
-    pub element_class_id: u64,
+    /// The array's class object, e.g. `[Ljava.lang.String;` (hprof stores the
+    /// array class here, not the element class).
+    pub array_class_id: u64,
     elements_raw: &'a [u8],
     id_size: usize,
 }
@@ -389,7 +391,7 @@ pub fn parse_sub_record<'a>(
     entry: &SubIndexEntry,
 ) -> Result<SubRecord<'a>, HprofError> {
     let data = hprof.data();
-    let id = hprof.header.id_size as usize;
+    let id = hprof.id_size() as usize;
     let pos = entry.position as usize;
 
     if pos >= data.len() {
@@ -563,22 +565,22 @@ fn parse_obj_array_dump<'a>(
     pos: usize,
     id: usize,
 ) -> Result<SubRecord<'a>, HprofError> {
-    // subtag(1) + array_id(id) + stack_serial(4) + num_elements(4) + elem_class_id(id) + elements(num*id)
+    // subtag(1) + array_id(id) + stack_serial(4) + num_elements(4) + array_class_id(id) + elements(num*id)
     let num_off = pos + 1 + id + 4;
-    let elem_class_off = num_off + 4;
-    let elems_off = elem_class_off + id;
-    require(data, elem_class_off, id)?;
+    let class_off = num_off + 4;
+    let elems_off = class_off + id;
+    require(data, class_off, id)?;
     let array_id = read_id(data, pos + 1, id)?;
     let stack_trace_serial = read_u32_be(data, pos + 1 + id);
     let num_elements = read_u32_be(data, num_off);
-    let element_class_id = read_id(data, elem_class_off, id)?;
+    let array_class_id = read_id(data, class_off, id)?;
     let elems_len = num_elements as usize * id;
     require(data, elems_off, elems_len)?;
     Ok(SubRecord::ObjArrayDump(ObjArrayDump {
         array_id,
         stack_trace_serial,
         num_elements,
-        element_class_id,
+        array_class_id,
         elements_raw: &data[elems_off..elems_off + elems_len],
         id_size: id,
     }))
@@ -667,14 +669,7 @@ fn parse_field_value(
 
 /// Return the byte size of a value with the given hprof type code.
 fn type_byte_size(type_id: u8, id_size: usize) -> Result<usize, HprofError> {
-    match type_id {
-        2 => Ok(id_size),
-        4 | 8 => Ok(1),
-        5 | 9 => Ok(2),
-        6 | 10 => Ok(4),
-        7 | 11 => Ok(8),
-        other => Err(HprofError::UnknownPrimitiveType(other)),
-    }
+    Ok(BasicType::from_code_or_err(type_id)?.size(id_size))
 }
 
 /// Assert that `data[offset..offset+len]` is in-bounds.
@@ -858,7 +853,7 @@ mod tests {
         body.extend_from_slice(&10u64.to_be_bytes()); // array_id
         body.extend_from_slice(&0u32.to_be_bytes()); // stack_serial
         body.extend_from_slice(&3u32.to_be_bytes()); // num_elements = 3
-        body.extend_from_slice(&20u64.to_be_bytes()); // element_class_id
+        body.extend_from_slice(&20u64.to_be_bytes()); // array_class_id
         body.extend_from_slice(&100u64.to_be_bytes()); // element[0]
         body.extend_from_slice(&200u64.to_be_bytes()); // element[1]
         body.extend_from_slice(&300u64.to_be_bytes()); // element[2]
@@ -874,7 +869,7 @@ mod tests {
         let rec = parse_sub_record(&hprof, &entry).unwrap();
         if let SubRecord::ObjArrayDump(arr) = rec {
             assert_eq!(arr.num_elements, 3);
-            assert_eq!(arr.element_class_id, 20);
+            assert_eq!(arr.array_class_id, 20);
             let elems: Vec<u64> = arr.elements().collect();
             assert_eq!(elems, vec![100, 200, 300]);
         } else {

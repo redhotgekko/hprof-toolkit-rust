@@ -11,35 +11,27 @@
 //! **No in-memory caches** are maintained: every lookup goes directly to the
 //! mmapped index files.
 //!
-//! ## Building the name indexes
-//!
-//! ```rust,ignore
-//! use hprof_toolkit::heap_query::build_name_indexes;
-//! build_name_indexes(hprof_path, record_index_path, utf8_path, load_class_path)?;
-//! ```
-//!
-//! ## Opening the API
-//!
-//! ```rust,ignore
-//! use hprof_toolkit::heap_query::HprofIndex;
-//! let index = HprofIndex::open(hprof_path, combined_path, utf8_path, load_class_path)?;
-//! ```
+//! This module is internal plumbing.  The name indexes are built by
+//! [`crate::pipeline`], and everything here is reached through
+//! [`crate::query::HeapQuery`].
 
 pub mod name_index;
 pub mod resolve;
 
 pub use name_index::{LoadClassReader, Utf8IndexReader};
-pub use resolve::{JavaValue, ResolvedField};
+pub use resolve::Field;
 
 use crate::heap_index::sub_record::{
     SUB_INDEX_ENTRY_SIZE, TAG_CLASS_DUMP, TAG_INSTANCE_DUMP, TAG_PRIM_ARRAY_DUMP,
 };
 use crate::heap_parser::record::FieldValue;
 use crate::heap_parser::{InstanceFieldDescriptor, SubIndexReader, SubRecord, parse_sub_record};
-use crate::hprof::{HprofError, HprofFile, HprofHeader};
-use crate::vfs::MMapWriter;
+use crate::hprof::{BasicType, HprofError, HprofFile, HprofHeader};
+use crate::index::StoreWriter;
+use crate::resolved::Value;
 use name_index::{build_load_class_index, build_utf8_index};
 use resolve::{decode_char_array, decode_string_bytes, read_field_value};
+use std::borrow::Cow;
 
 // ── Public builder ────────────────────────────────────────────────────────────
 
@@ -52,8 +44,8 @@ use resolve::{decode_char_array, decode_string_bytes, read_field_value};
 pub fn build_name_indexes(
     hprof_source: &[u8],
     record_index_source: &[u8],
-    utf8_path: &mut impl MMapWriter,
-    load_class_path: &mut impl MMapWriter,
+    utf8_path: &mut dyn StoreWriter,
+    load_class_path: &mut dyn StoreWriter,
 ) -> Result<(u64, u64), HprofError> {
     let hprof = HprofFile::from_ref(hprof_source)?;
 
@@ -70,9 +62,9 @@ pub fn build_name_indexes(
 /// All index files are accessed via borrowed byte slices.  Each method performs
 /// O(log n) binary searches against the sorted index files using short-lived
 /// reader temporaries.
-pub struct HprofIndex<'a> {
+pub(crate) struct HprofIndex<'a> {
     hprof_data: &'a [u8],
-    hprof_header: HprofHeader,
+    hprof_header: Cow<'a, HprofHeader>,
     combined_data: &'a [u8],
     utf8_data: &'a [u8],
     lc_data: &'a [u8],
@@ -91,7 +83,7 @@ impl<'a> HprofIndex<'a> {
         utf8: &'a [u8],
         lc: &'a [u8],
     ) -> Result<Self, HprofError> {
-        let hprof_header = HprofFile::from_ref(hprof)?.header;
+        let hprof_header = Cow::Owned(HprofHeader::parse(hprof)?);
         SubIndexReader::from_ref(combined)?;
         Utf8IndexReader::from_ref(utf8)?;
         LoadClassReader::from_ref(lc)?;
@@ -111,11 +103,11 @@ impl<'a> HprofIndex<'a> {
         combined: &'a [u8],
         utf8: &'a [u8],
         lc: &'a [u8],
-        hprof_header: HprofHeader,
+        hprof_header: &'a HprofHeader,
     ) -> Self {
         Self {
             hprof_data: hprof,
-            hprof_header,
+            hprof_header: Cow::Borrowed(hprof_header),
             combined_data: combined,
             utf8_data: utf8,
             lc_data: lc,
@@ -125,7 +117,7 @@ impl<'a> HprofIndex<'a> {
     // ── Short-lived reader helpers ────────────────────────────────────────────
 
     fn hprof_file(&self) -> HprofFile<'a> {
-        HprofFile::from_parts(self.hprof_data, self.hprof_header.clone())
+        HprofFile::from_parts(self.hprof_data, &self.hprof_header)
     }
 
     fn combined_reader(&self) -> Result<SubIndexReader<'a>, HprofError> {
@@ -144,7 +136,7 @@ impl<'a> HprofIndex<'a> {
 
     /// Return the parsed hprof file header.
     pub fn hprof_header(&self) -> HprofHeader {
-        self.hprof_header.clone()
+        self.hprof_header.clone().into_owned()
     }
 
     /// hprof identifier size in bytes (4 or 8).
@@ -156,14 +148,6 @@ impl<'a> HprofIndex<'a> {
     /// arrays, and GC roots).
     pub fn object_count(&self) -> usize {
         self.combined_data.len() / SUB_INDEX_ENTRY_SIZE
-    }
-
-    /// Iterate over all sub-record index entries in the combined index.
-    ///
-    /// Entries are in object-ID order (ascending).  Call
-    /// [`parse_sub_record`] to obtain full record details.
-    pub fn iter_entries(&self) -> crate::heap_parser::SubIndexIter<'a> {
-        crate::heap_parser::SubIndexIter::new(self.combined_data)
     }
 
     /// Parse the sub-record at position `i` in the combined index.
@@ -239,32 +223,6 @@ impl<'a> HprofIndex<'a> {
         self.utf8_reader()?.lookup(&hprof, name_id)
     }
 
-    /// Find a class by its dot-notation name (e.g. `"java.lang.String"`).
-    ///
-    /// Performs a linear scan of the load-class index, resolving each entry's
-    /// name via the UTF-8 index, until a match is found.  Returns the
-    /// `class_id` of the first matching class, or `None` if no class with that
-    /// name is present.
-    ///
-    /// The `name` argument must use dot notation exactly as returned by
-    /// [`Self::class_name`].  The scan is O(n_classes × log n_utf8) and is
-    /// intended to be called once to obtain the class ID, after which
-    /// filtering by `class_id` is an O(1) integer comparison per record.
-    pub fn find_class_by_name(&self, name: &str) -> Result<Option<u64>, HprofError> {
-        // Stored names use JVM internal slash notation; convert the input once.
-        let slash_name = name.replace('.', "/");
-        let hprof = self.hprof_file();
-        let utf8 = self.utf8_reader()?;
-        for (class_id, name_id) in self.lc_reader()?.iter() {
-            if let Some(raw) = utf8.lookup(&hprof, name_id)?
-                && raw == slash_name
-            {
-                return Ok(Some(class_id));
-            }
-        }
-        Ok(None)
-    }
-
     /// Return the dot-notation class name for `class_id` (e.g. `"java.lang.String"`).
     ///
     /// Uses the load-class index → UTF-8 index chain. Returns `None` when the
@@ -283,48 +241,6 @@ impl<'a> HprofIndex<'a> {
         Ok(Some(raw.replace('/', ".")))
     }
 
-    /// Resolve the runtime type name of the object at `object_id`.
-    ///
-    /// Returns the Java class name of the referenced object:
-    /// * `InstanceDump`  → class name (e.g. `java.util.ArrayList`)
-    /// * `ClassDump`     → `"Class"`
-    /// * `ObjArrayDump`  → `"ElementClass[]"`
-    /// * `PrimArrayDump` → `"primitive[]"`
-    /// * not found / null → `"Object"`
-    pub fn object_type_name(&self, object_id: u64) -> Result<String, HprofError> {
-        if object_id == 0 {
-            return Ok("Object".to_string());
-        }
-        match self.find_object(object_id)? {
-            None => Ok("Object".to_string()),
-            Some(SubRecord::InstanceDump(inst)) => Ok(self
-                .class_name(inst.class_id)?
-                .unwrap_or_else(|| "Object".to_string())),
-            Some(SubRecord::ClassDump(_)) => Ok("Class".to_string()),
-            Some(SubRecord::ObjArrayDump(arr)) => {
-                let elem = self
-                    .class_name(arr.element_class_id)?
-                    .unwrap_or_else(|| "Object".to_string());
-                Ok(format!("{elem}[]"))
-            }
-            Some(SubRecord::PrimArrayDump(arr)) => {
-                let prim = match arr.element_type {
-                    4 => "boolean",
-                    5 => "char",
-                    6 => "float",
-                    7 => "double",
-                    8 => "byte",
-                    9 => "short",
-                    10 => "int",
-                    11 => "long",
-                    _ => "?",
-                };
-                Ok(format!("{prim}[]"))
-            }
-            Some(_) => Ok("Object".to_string()),
-        }
-    }
-
     // ── Field resolution ──────────────────────────────────────────────────────
 
     /// Resolve the instance fields for an [`crate::heap_parser::InstanceDump`].
@@ -338,7 +254,7 @@ impl<'a> HprofIndex<'a> {
     pub fn instance_fields(
         &self,
         instance: &crate::heap_parser::InstanceDump<'_>,
-    ) -> Result<Vec<ResolvedField>, HprofError> {
+    ) -> Result<Vec<Field>, HprofError> {
         let id_size = self.id_size() as usize;
 
         // ── Step 1: collect field descriptors for each class in the chain ──
@@ -375,9 +291,9 @@ impl<'a> HprofIndex<'a> {
                 let name = self
                     .lookup_name(desc.name_id)?
                     .unwrap_or_else(|| format!("<name#{}>", desc.name_id));
-                fields.push(ResolvedField {
+                fields.push(Field {
                     name,
-                    field_type: desc.field_type,
+                    ty: BasicType::from_code_or_err(desc.field_type)?,
                     value,
                 });
             }
@@ -388,95 +304,50 @@ impl<'a> HprofIndex<'a> {
 
     // ── Java wrapper type resolution ──────────────────────────────────────────
 
-    /// Attempt to resolve `object_id` as a primitive Java value.
+    /// Resolve the reference `object_id` to a [`Value`].
     ///
-    /// Handles:
-    /// * `0` → [`JavaValue::Null`]
-    /// * `java.lang.String` → [`JavaValue::String`] (reads the backing array)
-    /// * `java.lang.Integer` / `Long` / `Double` / `Float` / `Short` / `Byte`
-    ///   / `Boolean` / `Character` → the corresponding [`JavaValue`] variant
-    /// * Anything else → [`JavaValue::Object`]
+    /// * `0` → [`Value::Null`]
+    /// * `java.lang.String` → [`Value::String`] (reads the backing array)
+    /// * `Integer`, `Long`, `Double`, `Float`, `Short`, `Byte`, `Boolean`,
+    ///   `Character` → the matching `Boxed…` variant
+    /// * anything else → [`Value::Object`]
     ///
     /// No in-memory caches are used; every resolution is a fresh set of O(log n)
     /// binary searches.
-    pub fn resolve_value(&self, object_id: u64) -> Result<JavaValue, HprofError> {
+    pub fn resolve_value(&self, object_id: u64) -> Result<Value, HprofError> {
         if object_id == 0 {
-            return Ok(JavaValue::Null);
+            return Ok(Value::Null);
         }
-
-        let sub = match self.find_instance(object_id)? {
-            Some(s) => s,
-            None => return Ok(JavaValue::Object(object_id)),
+        let inst = match self.find_instance(object_id)? {
+            Some(SubRecord::InstanceDump(inst)) => inst,
+            _ => return Ok(Value::Object(object_id)),
         };
-        let SubRecord::InstanceDump(inst) = sub else {
-            return Ok(JavaValue::Object(object_id));
+        let Some(class_name) = self.class_name(inst.class_id)? else {
+            return Ok(Value::Object(object_id));
         };
-
-        let class_name = match self.class_name(inst.class_id)? {
-            Some(n) => n,
-            None => return Ok(JavaValue::Object(object_id)),
-        };
-
-        match class_name.as_str() {
-            "java.lang.String" => self.resolve_string(&inst),
-            "java.lang.Integer" => Ok(self
-                .resolve_single_primitive_field(&inst, "value")?
-                .map(|f| match f.value {
-                    FieldValue::Int(v) => JavaValue::Integer(object_id, v),
-                    _ => JavaValue::Object(object_id),
-                })
-                .unwrap_or(JavaValue::Object(object_id))),
-            "java.lang.Long" => Ok(self
-                .resolve_single_primitive_field(&inst, "value")?
-                .map(|f| match f.value {
-                    FieldValue::Long(v) => JavaValue::Long(object_id, v),
-                    _ => JavaValue::Object(object_id),
-                })
-                .unwrap_or(JavaValue::Object(object_id))),
-            "java.lang.Double" => Ok(self
-                .resolve_single_primitive_field(&inst, "value")?
-                .map(|f| match f.value {
-                    FieldValue::Double(v) => JavaValue::Double(object_id, v),
-                    _ => JavaValue::Object(object_id),
-                })
-                .unwrap_or(JavaValue::Object(object_id))),
-            "java.lang.Float" => Ok(self
-                .resolve_single_primitive_field(&inst, "value")?
-                .map(|f| match f.value {
-                    FieldValue::Float(v) => JavaValue::Float(object_id, v),
-                    _ => JavaValue::Object(object_id),
-                })
-                .unwrap_or(JavaValue::Object(object_id))),
-            "java.lang.Short" => Ok(self
-                .resolve_single_primitive_field(&inst, "value")?
-                .map(|f| match f.value {
-                    FieldValue::Short(v) => JavaValue::Short(object_id, v),
-                    _ => JavaValue::Object(object_id),
-                })
-                .unwrap_or(JavaValue::Object(object_id))),
-            "java.lang.Byte" => Ok(self
-                .resolve_single_primitive_field(&inst, "value")?
-                .map(|f| match f.value {
-                    FieldValue::Byte(v) => JavaValue::Byte(object_id, v),
-                    _ => JavaValue::Object(object_id),
-                })
-                .unwrap_or(JavaValue::Object(object_id))),
-            "java.lang.Boolean" => Ok(self
-                .resolve_single_primitive_field(&inst, "value")?
-                .map(|f| match f.value {
-                    FieldValue::Bool(v) => JavaValue::Boolean(object_id, v),
-                    _ => JavaValue::Object(object_id),
-                })
-                .unwrap_or(JavaValue::Object(object_id))),
-            "java.lang.Character" => Ok(self
-                .resolve_single_primitive_field(&inst, "value")?
-                .map(|f| match f.value {
-                    FieldValue::Char(v) => JavaValue::Character(object_id, v),
-                    _ => JavaValue::Object(object_id),
-                })
-                .unwrap_or(JavaValue::Object(object_id))),
-            _ => Ok(JavaValue::Object(object_id)),
+        if class_name == "java.lang.String" {
+            return self.resolve_string(&inst);
         }
+        if !class_name.starts_with("java.lang.") {
+            return Ok(Value::Object(object_id));
+        }
+        let wrapped = self
+            .instance_fields(&inst)?
+            .into_iter()
+            .find(|f| f.name == "value")
+            .map(|f| f.value);
+        let id = object_id;
+        Ok(match (class_name.as_str(), wrapped) {
+            ("java.lang.Integer", Some(FieldValue::Int(v))) => Value::BoxedInt(id, v),
+            ("java.lang.Long", Some(FieldValue::Long(v))) => Value::BoxedLong(id, v),
+            ("java.lang.Double", Some(FieldValue::Double(v))) => Value::BoxedDouble(id, v),
+            ("java.lang.Float", Some(FieldValue::Float(v))) => Value::BoxedFloat(id, v),
+            ("java.lang.Short", Some(FieldValue::Short(v))) => Value::BoxedShort(id, v),
+            ("java.lang.Byte", Some(FieldValue::Byte(v))) => Value::BoxedByte(id, v),
+            ("java.lang.Boolean", Some(FieldValue::Bool(v))) => Value::BoxedBoolean(id, v),
+            ("java.lang.Character", Some(FieldValue::Char(v))) => Value::BoxedCharacter(id, v),
+            _ => Value::Object(id),
+        })
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────
@@ -485,10 +356,10 @@ impl<'a> HprofIndex<'a> {
     ///
     /// Handles both pre-Java-9 (`char[]` backing) and Java 9+ compact strings
     /// (`byte[]` + `coder` field).
-    fn resolve_string(
+    pub(crate) fn resolve_string(
         &self,
         inst: &crate::heap_parser::InstanceDump<'_>,
-    ) -> Result<JavaValue, HprofError> {
+    ) -> Result<Value, HprofError> {
         let fields = self.instance_fields(inst)?;
 
         // Locate `value` (array reference) and optional `coder` (byte).
@@ -513,7 +384,7 @@ impl<'a> HprofIndex<'a> {
 
         let arr_id = match value_id {
             Some(id) if id != 0 => id,
-            _ => return Ok(JavaValue::String(inst.object_id, String::new())),
+            _ => return Ok(Value::String(inst.object_id, String::new())),
         };
 
         // Look up the backing array.
@@ -522,32 +393,22 @@ impl<'a> HprofIndex<'a> {
             .find_by_object_id_and_tag(arr_id, Some(TAG_PRIM_ARRAY_DUMP))
         {
             Some(e) => e,
-            None => return Ok(JavaValue::String(inst.object_id, String::new())),
+            None => return Ok(Value::String(inst.object_id, String::new())),
         };
 
         let hprof = self.hprof_file();
         let arr_record = parse_sub_record(&hprof, &arr_entry)?;
         let SubRecord::PrimArrayDump(arr) = arr_record else {
-            return Ok(JavaValue::String(inst.object_id, String::new()));
+            return Ok(Value::String(inst.object_id, String::new()));
         };
 
         let text = match arr.element_type {
             5 => decode_char_array(arr.data),          // char[]
             8 => decode_string_bytes(arr.data, coder), // byte[]
-            _ => return Ok(JavaValue::String(inst.object_id, String::new())),
+            _ => return Ok(Value::String(inst.object_id, String::new())),
         };
 
-        Ok(JavaValue::String(inst.object_id, text))
-    }
-
-    /// Find the first instance field named `field_name` and return it.
-    fn resolve_single_primitive_field(
-        &self,
-        inst: &crate::heap_parser::InstanceDump<'_>,
-        field_name: &str,
-    ) -> Result<Option<ResolvedField>, HprofError> {
-        let fields = self.instance_fields(inst)?;
-        Ok(fields.into_iter().find(|f| f.name == field_name))
+        Ok(Value::String(inst.object_id, text))
     }
 }
 
@@ -556,149 +417,63 @@ impl<'a> HprofIndex<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::heap_index::index_heap_dumps;
-    use crate::object_store::combine_and_sort_sub_index;
-    use crate::record_index::index_hprof;
-    use crate::vfs::SubIndexDir;
+    use crate::index::{IndexStore, MemStore, names};
+    use crate::pipeline::{IndexOptions, build_indexes};
+    use crate::progress::NoProgress;
+    use crate::test_util::{ClassSpec, HprofBuilder, ty};
 
-    // ── Minimal hprof builder ─────────────────────────────────────────────────
-
-    /// Build a minimal hprof with:
-    /// * UTF8(1, "value") + UTF8(2, "java/lang/Integer") + UTF8(3, "java/lang/Object")
-    /// * LOAD_CLASS(class_id=0x200, name_id=2) + LOAD_CLASS(class_id=0x300, name_id=3)
-    /// * HEAP_DUMP_SEGMENT containing:
-    ///   - CLASS_DUMP(class_id=0x200, super=0x300, 1 instance field: name_id=1, type=int)
-    ///   - CLASS_DUMP(class_id=0x300, super=0, 0 instance fields)
-    ///   - INSTANCE_DUMP(object_id=0x100, class=0x200, data=[0,0,0,42])
-    fn build_test_hprof() -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"JAVA PROFILE 1.0.2\0");
-        buf.extend_from_slice(&8u32.to_be_bytes()); // id_size = 8
-        buf.extend_from_slice(&0u64.to_be_bytes()); // timestamp
-
-        // UTF8(1, "value")  body = 8 + 5 = 13
-        buf.push(0x01);
-        buf.extend_from_slice(&0u32.to_be_bytes());
-        buf.extend_from_slice(&13u32.to_be_bytes());
-        buf.extend_from_slice(&1u64.to_be_bytes());
-        buf.extend_from_slice(b"value");
-
-        // UTF8(2, "java/lang/Integer") body = 8+17 = 25
-        buf.push(0x01);
-        buf.extend_from_slice(&0u32.to_be_bytes());
-        buf.extend_from_slice(&25u32.to_be_bytes());
-        buf.extend_from_slice(&2u64.to_be_bytes());
-        buf.extend_from_slice(b"java/lang/Integer");
-
-        // UTF8(3, "java/lang/Object") body = 8+16 = 24
-        buf.push(0x01);
-        buf.extend_from_slice(&0u32.to_be_bytes());
-        buf.extend_from_slice(&24u32.to_be_bytes());
-        buf.extend_from_slice(&3u64.to_be_bytes());
-        buf.extend_from_slice(b"java/lang/Object");
-
-        // LOAD_CLASS: class_id=0x200, name_id=2
-        buf.push(0x02);
-        buf.extend_from_slice(&0u32.to_be_bytes());
-        buf.extend_from_slice(&24u32.to_be_bytes()); // body = 4+8+4+8 = 24
-        buf.extend_from_slice(&1u32.to_be_bytes()); // class_serial
-        buf.extend_from_slice(&0x200u64.to_be_bytes()); // class_id
-        buf.extend_from_slice(&0u32.to_be_bytes()); // stack_serial
-        buf.extend_from_slice(&2u64.to_be_bytes()); // name_id
-
-        // LOAD_CLASS: class_id=0x300, name_id=3
-        buf.push(0x02);
-        buf.extend_from_slice(&0u32.to_be_bytes());
-        buf.extend_from_slice(&24u32.to_be_bytes());
-        buf.extend_from_slice(&2u32.to_be_bytes());
-        buf.extend_from_slice(&0x300u64.to_be_bytes());
-        buf.extend_from_slice(&0u32.to_be_bytes());
-        buf.extend_from_slice(&3u64.to_be_bytes());
-
-        // Build the HEAP_DUMP_SEGMENT body:
-        let mut seg = Vec::new();
-
-        // CLASS_DUMP(class_id=0x200, super=0x300, instance_size=4, 1 field: name_id=1, type=10/int)
-        seg.push(0x20u8); // TAG_CLASS_DUMP
-        seg.extend_from_slice(&0x200u64.to_be_bytes()); // class_id
-        seg.extend_from_slice(&0u32.to_be_bytes()); // stack_serial
-        seg.extend_from_slice(&0x300u64.to_be_bytes()); // super_class_id
-        seg.extend_from_slice(&[0u8; 8]); // class_loader_id
-        seg.extend_from_slice(&[0u8; 8]); // signers_id
-        seg.extend_from_slice(&[0u8; 8]); // domain_id
-        seg.extend_from_slice(&[0u8; 8]); // reserved1
-        seg.extend_from_slice(&[0u8; 8]); // reserved2
-        seg.extend_from_slice(&4u32.to_be_bytes()); // instance_size = 4
-        seg.extend_from_slice(&0u16.to_be_bytes()); // cp_count = 0
-        seg.extend_from_slice(&0u16.to_be_bytes()); // statics_count = 0
-        seg.extend_from_slice(&1u16.to_be_bytes()); // instance_fields_count = 1
-        seg.extend_from_slice(&1u64.to_be_bytes()); // field name_id = 1 ("value")
-        seg.push(10u8); // field type = int
-
-        // CLASS_DUMP(class_id=0x300, super=0, 0 fields) — java.lang.Object
-        seg.push(0x20u8);
-        seg.extend_from_slice(&0x300u64.to_be_bytes()); // class_id
-        seg.extend_from_slice(&0u32.to_be_bytes());
-        seg.extend_from_slice(&0u64.to_be_bytes()); // super = 0
-        seg.extend_from_slice(&[0u8; 8 * 5]); // loader + signers + domain + res1 + res2
-        seg.extend_from_slice(&0u32.to_be_bytes()); // instance_size
-        seg.extend_from_slice(&0u16.to_be_bytes()); // cp=0
-        seg.extend_from_slice(&0u16.to_be_bytes()); // statics=0
-        seg.extend_from_slice(&0u16.to_be_bytes()); // fields=0
-
-        // INSTANCE_DUMP(object_id=0x100, class=0x200, data=[0,0,0,42])
-        seg.push(0x21u8); // TAG_INSTANCE_DUMP
-        seg.extend_from_slice(&0x100u64.to_be_bytes()); // object_id
-        seg.extend_from_slice(&0u32.to_be_bytes()); // stack_serial
-        seg.extend_from_slice(&0x200u64.to_be_bytes()); // class_id
-        seg.extend_from_slice(&4u32.to_be_bytes()); // data_len = 4
-        seg.extend_from_slice(&42i32.to_be_bytes()); // value = 42
-
-        // Write HEAP_DUMP_SEGMENT record
-        buf.push(0x1C);
-        buf.extend_from_slice(&0u32.to_be_bytes());
-        buf.extend_from_slice(&(seg.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&seg);
-
-        buf
+    /// Integer(0x200 ⊂ Object 0x300) with one int field "value";
+    /// INSTANCE 0x100 = Integer(42).
+    fn test_heap() -> Vec<u8> {
+        HprofBuilder::new(8)
+            .utf8(1, "value")
+            .utf8(2, "java/lang/Integer")
+            .utf8(3, "java/lang/Object")
+            .load_class(1, 0x200, 2)
+            .load_class(2, 0x300, 3)
+            .class_dump(
+                ClassSpec::new(0x200)
+                    .super_class(0x300)
+                    .instance_size(4)
+                    .field(1, ty::INT),
+            )
+            .class_dump(ClassSpec::new(0x300))
+            .instance_values(0x100, 0x200, &[FieldValue::Int(42)])
+            .build()
     }
 
-    /// Run the full build pipeline on `hprof_data` and open a [`HprofIndex`].
+    /// Run the real pipeline in memory and keep the three entries
+    /// [`HprofIndex`] needs.
     fn full_pipeline(hprof_data: &[u8]) -> Pipeline {
-        let hprof_vec = hprof_data.to_vec();
-        let mut p1_idx = Vec::new();
-        let p2_dir = SubIndexDir::mem();
-        let mut combined = Vec::new();
-        let mut utf8_idx = Vec::new();
-        let mut lc_idx = Vec::new();
-
-        index_hprof(&hprof_vec, &mut p1_idx).unwrap();
-        index_heap_dumps(&hprof_vec, &p1_idx, &p2_dir).unwrap();
-        combine_and_sort_sub_index(&p2_dir, &mut combined).unwrap();
-        build_name_indexes(&hprof_vec, &p1_idx, &mut utf8_idx, &mut lc_idx).unwrap();
-
+        let store = MemStore::new();
+        let opts = IndexOptions {
+            retained: false,
+            force: false,
+            ..IndexOptions::default()
+        };
+        build_indexes(hprof_data, &store, &opts, &NoProgress).unwrap();
         Pipeline {
-            hprof_data: hprof_vec,
-            combined,
-            utf8_idx,
-            lc_idx,
+            hprof_data: hprof_data.to_vec(),
+            combined: store.open(names::OBJECT_STORE).unwrap(),
+            utf8_idx: store.open(names::UTF8).unwrap(),
+            lc_idx: store.open(names::LOAD_CLASS).unwrap(),
         }
     }
 
     struct Pipeline {
         hprof_data: Vec<u8>,
-        combined: Vec<u8>,
-        utf8_idx: Vec<u8>,
-        lc_idx: Vec<u8>,
+        combined: crate::index::ByteSource,
+        utf8_idx: crate::index::ByteSource,
+        lc_idx: crate::index::ByteSource,
     }
 
     impl Pipeline {
         fn create_hprof_index(&self) -> HprofIndex<'_> {
             HprofIndex::from_ref(
                 &self.hprof_data,
-                &self.combined,
-                &self.utf8_idx,
-                &self.lc_idx,
+                self.combined.as_ref(),
+                self.utf8_idx.as_ref(),
+                self.lc_idx.as_ref(),
             )
             .unwrap()
         }
@@ -706,26 +481,20 @@ mod tests {
 
     #[test]
     fn class_name_resolved() {
-        let hprof_data = build_test_hprof();
-        let index = full_pipeline(&hprof_data);
-
+        let index = full_pipeline(&test_heap());
         let name = index.create_hprof_index().class_name(0x200).unwrap();
         assert_eq!(name, Some("java.lang.Integer".to_string()));
     }
 
     #[test]
     fn class_name_unknown_returns_none() {
-        let hprof_data = build_test_hprof();
-        let index = full_pipeline(&hprof_data);
-
+        let index = full_pipeline(&test_heap());
         assert_eq!(index.create_hprof_index().class_name(0xDEAD).unwrap(), None);
     }
 
     #[test]
     fn instance_fields_resolved() {
-        let hprof_data = build_test_hprof();
-        let index = full_pipeline(&hprof_data);
-
+        let index = full_pipeline(&test_heap());
         let hprof_index = index.create_hprof_index();
         let sub = hprof_index.find_instance(0x100).unwrap().unwrap();
         let SubRecord::InstanceDump(inst) = sub else {
@@ -740,25 +509,20 @@ mod tests {
 
     #[test]
     fn resolve_integer_wrapper() {
-        let hprof_data = build_test_hprof();
-        let index = full_pipeline(&hprof_data);
-
+        let index = full_pipeline(&test_heap());
         let java_val = index.create_hprof_index().resolve_value(0x100).unwrap();
         assert!(
-            matches!(java_val, JavaValue::Integer(0x100, 42)),
-            "expected Integer(0x100, 42), got {:?}",
-            java_val
+            matches!(java_val, Value::BoxedInt(0x100, 42)),
+            "expected BoxedInt(0x100, 42), got {java_val:?}"
         );
     }
 
     #[test]
     fn resolve_null() {
-        let hprof_data = build_test_hprof();
-        let index = full_pipeline(&hprof_data);
-
+        let index = full_pipeline(&test_heap());
         assert!(matches!(
             index.create_hprof_index().resolve_value(0).unwrap(),
-            JavaValue::Null
+            Value::Null
         ));
     }
 }

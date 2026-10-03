@@ -1,19 +1,34 @@
-//! High-level pipeline for building all binary index files for an hprof dump.
+//! High-level pipeline for building every index for an hprof dump.
 //!
-//! [`IndexPaths`] holds the paths to every index file, all derived from the
-//! hprof file path.  [`build_all_indexes`] builds every index that does not
-//! yet exist, printing progress to stdout.
+//! [`build_indexes`] is the real pipeline: it takes the hprof bytes, an
+//! [`IndexStore`] to write into, [`IndexOptions`] and a [`Progress`] sink.
+//! It never touches the filesystem itself, so the whole pipeline runs
+//! unchanged against [`crate::index::MemStore`] in tests.
 //!
-//! ## Index directory
+//! [`build_all_indexes`] is the filesystem convenience wrapper used by the
+//! CLI and examples: it memory-maps the hprof and builds into
+//! `{hprof_stem}.indexes/` next to it.
 //!
-//! All indexes are created inside `{hprof_stem}.indexes/`, placed in the same
-//! directory as the hprof file.  For example, `./heap.dump` produces:
+//! ## Completion tracking
+//!
+//! A step is considered done only when the store's manifest
+//! ([`crate::index::Manifest`], entry `index.json`) lists every output of
+//! that step **and** the entries exist.  The manifest is rewritten after
+//! each step commits, so an interrupted build resumes at the first
+//! unfinished step, and a manifest for a different hprof or an older
+//! [`crate::index::FORMAT_VERSION`] causes a full rebuild.
+//!
+//! ## Index entries
+//!
+//! All entries are created inside the store (a directory on disk).  For
+//! `./heap.dump` the directory is `./heap.indexes/`:
 //!
 //! ```text
-//! ./heap.indexes/
+//!   index.json            manifest
 //!   record_index.bin      top-level record index
-//!   heap_index/           heap sub-record index files
 //!   object_store.bin      sorted combined sub-record index
+//!   instances_by_class.bin objects grouped by class key
+//!   class_histogram.bin   per-class counts and shallow bytes, largest first
 //!   utf8.bin              UTF-8 name index
 //!   loadclass.bin         load-class index
 //!   refs.bin              object reference index
@@ -22,457 +37,736 @@
 //!   start_threads.bin     HPROF_START_THREAD index
 //!   end_threads.bin       HPROF_END_THREAD index
 //!   unload_classes.bin    HPROF_UNLOAD_CLASS index
-//!   root_unknown.bin      GC_ROOT_UNKNOWN index
-//!   root_jni_global.bin   GC_ROOT_JNI_GLOBAL index
-//!   root_jni_local.bin    GC_ROOT_JNI_LOCAL index
-//!   root_java_frame.bin   GC_ROOT_JAVA_FRAME index
-//!   root_native_stack.bin GC_ROOT_NATIVE_STACK index
-//!   root_sticky_class.bin GC_ROOT_STICKY_CLASS index
-//!   root_thread_block.bin GC_ROOT_THREAD_BLOCK index
-//!   root_monitor_used.bin GC_ROOT_MONITOR_USED index
-//!   root_thread_obj.bin   GC_ROOT_THREAD_OBJ index
-//!   array_boolean.bin     boolean[] size index (largest first)
-//!   array_char.bin        char[]    size index (largest first)
-//!   array_float.bin       float[]   size index (largest first)
-//!   array_double.bin      double[]  size index (largest first)
-//!   array_byte.bin        byte[]    size index (largest first)
-//!   array_short.bin       short[]   size index (largest first)
-//!   array_int.bin         int[]     size index (largest first)
-//!   array_long.bin        long[]    size index (largest first)
-//!   array_object.bin      Object[]  size index (largest first)
+//!   root_*.bin            nine per-type GC root indexes
+//!   dominators.bin        dominator tree (optional, see IndexOptions::retained)
+//!   retained.bin          retained heap sizes (optional)
+//!   retained_by_size.bin  retained sizes ranked largest-first (optional)
+//!   dominator_children.bin dominator tree keyed by parent (optional)
+//!   array_*.bin           nine per-kind array size indexes (largest first)
 //! ```
+//!
+//! `heap_index/…` and `*.part.*` entries are build intermediates and are
+//! removed once the entry they feed is committed.
 
 use crate::array_index::{ArrayKind, build_array_size_indexes};
 use crate::aux_index::{
     build_end_thread_index, build_frame_index, build_start_thread_index, build_trace_index,
     build_unload_class_index,
 };
-use crate::dominator::build_dominator_and_retained;
+use crate::class_index::build_class_indexes;
+use crate::dominator::{build_dominator_and_retained, check_memory};
 use crate::heap_index::index_heap_dumps;
+use crate::heap_index::sub_record::SUB_INDEX_ENTRY_SIZE;
 use crate::heap_query::build_name_indexes;
-use crate::hprof::{HprofError, map_file};
+use crate::hprof::HprofError;
+use crate::index::{ByteSource, FsStore, HprofIdentity, IndexStore, Manifest, StoreWriter, names};
 use crate::object_store::combine_sort_and_split;
+use crate::progress::Progress;
 use crate::record_index::index_hprof;
+use crate::ref_index::REF_ENTRY_SIZE;
 use crate::ref_index::build_reference_index;
 use crate::root_index::RootIndexReader;
-use crate::vfs::{ByteSource, MMapReader, SubIndexDir};
 use std::fmt::Write as _;
-use std::fs::File;
-use std::io::BufWriter;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-pub struct IndexData {
-    /// The index directory (`{hprof_stem}.indexes/`).
-    pub dir: ByteSource,
-    /// Top-level record index.
-    pub record_index: ByteSource,
-    /// Heap sub-record index directory.
-    pub heap_index_dir: ByteSource,
-    /// Sorted combined sub-record index.
-    pub object_store: ByteSource,
-    /// UTF-8 name index.
-    pub utf8: ByteSource,
-    /// Load-class index.
-    pub load_class: ByteSource,
-    /// Object reference index.
-    pub refs: ByteSource,
-    /// HPROF_FRAME index.
-    pub frames: ByteSource,
-    /// HPROF_TRACE index.
-    pub traces: ByteSource,
-    /// HPROF_START_THREAD index.
-    pub start_threads: ByteSource,
-    /// HPROF_END_THREAD index.
-    pub end_threads: ByteSource,
-    /// HPROF_UNLOAD_CLASS index.
-    pub unload_classes: ByteSource,
-    /// GC_ROOT_UNKNOWN index.
-    pub root_unknown: ByteSource,
-    /// GC_ROOT_JNI_GLOBAL index.
-    pub root_jni_global: ByteSource,
-    /// GC_ROOT_JNI_LOCAL index.
-    pub root_jni_local: ByteSource,
-    /// GC_ROOT_JAVA_FRAME index.
-    pub root_java_frame: ByteSource,
-    /// GC_ROOT_NATIVE_STACK index.
-    pub root_native_stack: ByteSource,
-    /// GC_ROOT_STICKY_CLASS index.
-    pub root_sticky_class: ByteSource,
-    /// GC_ROOT_THREAD_BLOCK index.
-    pub root_thread_block: ByteSource,
-    /// GC_ROOT_MONITOR_USED index.
-    pub root_monitor_used: ByteSource,
-    /// GC_ROOT_THREAD_OBJ index.
-    pub root_thread_obj: ByteSource,
-    /// Dominator tree index (`dominators.bin`).
-    pub dominators: ByteSource,
-    /// Retained heap size index (`retained.bin`).
-    pub retained: ByteSource,
+// ── IndexOptions ──────────────────────────────────────────────────────────────
+
+/// What to build.
+#[derive(Debug, Clone)]
+pub struct IndexOptions {
+    /// Build the dominator tree and retained-size indexes.  This is the only
+    /// step whose memory use scales with the heap: about 72 bytes per object plus 12
+    /// per reference.
+    pub retained: bool,
+    /// Rebuild every index even if the manifest says it is done.
+    pub force: bool,
+    /// Memory budget in bytes for the dominator step.  `None` (the default)
+    /// uses the memory currently available on the machine.  The step is
+    /// refused up front, with an actionable error, when its estimate exceeds
+    /// the budget.
+    pub max_memory: Option<u64>,
+    /// Where the indexes live.  `None` (the default) uses
+    /// [`default_index_dir`]: `{stem}.indexes` next to the dump.
+    pub index_dir: Option<PathBuf>,
 }
 
-// ── IndexPaths ────────────────────────────────────────────────────────────────
-
-/// Paths to all binary index files for a single hprof dump.
-///
-/// Construct via [`IndexPaths::for_hprof`]; build via [`build_all_indexes`].
-pub struct IndexPaths {
-    /// The index directory (`{hprof_stem}.indexes/`).
-    pub dir: PathBuf,
-    /// Top-level record index.
-    pub record_index: PathBuf,
-    /// Heap sub-record index directory.
-    pub heap_index_dir: PathBuf,
-    /// Sorted combined sub-record index.
-    pub object_store: PathBuf,
-    /// UTF-8 name index.
-    pub utf8: PathBuf,
-    /// Load-class index.
-    pub load_class: PathBuf,
-    /// Object reference index.
-    pub refs: PathBuf,
-    /// HPROF_FRAME index.
-    pub frames: PathBuf,
-    /// HPROF_TRACE index.
-    pub traces: PathBuf,
-    /// HPROF_START_THREAD index.
-    pub start_threads: PathBuf,
-    /// HPROF_END_THREAD index.
-    pub end_threads: PathBuf,
-    /// HPROF_UNLOAD_CLASS index.
-    pub unload_classes: PathBuf,
-    /// GC_ROOT_UNKNOWN index.
-    pub root_unknown: PathBuf,
-    /// GC_ROOT_JNI_GLOBAL index.
-    pub root_jni_global: PathBuf,
-    /// GC_ROOT_JNI_LOCAL index.
-    pub root_jni_local: PathBuf,
-    /// GC_ROOT_JAVA_FRAME index.
-    pub root_java_frame: PathBuf,
-    /// GC_ROOT_NATIVE_STACK index.
-    pub root_native_stack: PathBuf,
-    /// GC_ROOT_STICKY_CLASS index.
-    pub root_sticky_class: PathBuf,
-    /// GC_ROOT_THREAD_BLOCK index.
-    pub root_thread_block: PathBuf,
-    /// GC_ROOT_MONITOR_USED index.
-    pub root_monitor_used: PathBuf,
-    /// GC_ROOT_THREAD_OBJ index.
-    pub root_thread_obj: PathBuf,
-    /// Dominator tree index (`dominators.bin`).
-    pub dominators: PathBuf,
-    /// Retained heap size index (`retained.bin`).
-    pub retained: PathBuf,
-}
-
-impl IndexPaths {
-    /// Return the path to the array size index file for `kind`.
-    pub fn array_size(&self, kind: ArrayKind) -> PathBuf {
-        self.dir.join(kind.file_name())
-    }
-
-    /// Derive all index paths from `hprof_path`.
-    ///
-    /// The index directory is placed adjacent to the hprof file and named
-    /// `{stem}.indexes`.  For `./heap.dump` this gives
-    /// `./heap.indexes/`.
-    pub fn for_hprof(hprof_path: &Path) -> Self {
-        let stem = hprof_path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "dump".to_string());
-        let parent = hprof_path.parent().unwrap_or(Path::new("."));
-        let dir = parent.join(format!("{stem}.indexes"));
+impl Default for IndexOptions {
+    fn default() -> Self {
         Self {
-            record_index: dir.join("record_index.bin"),
-            heap_index_dir: dir.join("heap_index"),
-            object_store: dir.join("object_store.bin"),
-            utf8: dir.join("utf8.bin"),
-            load_class: dir.join("loadclass.bin"),
-            refs: dir.join("refs.bin"),
-            frames: dir.join("frames.bin"),
-            traces: dir.join("traces.bin"),
-            start_threads: dir.join("start_threads.bin"),
-            end_threads: dir.join("end_threads.bin"),
-            unload_classes: dir.join("unload_classes.bin"),
-            root_unknown: dir.join("root_unknown.bin"),
-            root_jni_global: dir.join("root_jni_global.bin"),
-            root_jni_local: dir.join("root_jni_local.bin"),
-            root_java_frame: dir.join("root_java_frame.bin"),
-            root_native_stack: dir.join("root_native_stack.bin"),
-            root_sticky_class: dir.join("root_sticky_class.bin"),
-            root_thread_block: dir.join("root_thread_block.bin"),
-            root_monitor_used: dir.join("root_monitor_used.bin"),
-            root_thread_obj: dir.join("root_thread_obj.bin"),
-            dominators: dir.join("dominators.bin"),
-            retained: dir.join("retained.bin"),
-            dir,
+            retained: true,
+            force: false,
+            max_memory: None,
+            index_dir: None,
         }
     }
+}
 
-    pub fn to_data(&self) -> Result<IndexData, HprofError> {
-        use crate::vfs::MMapReader;
-        Ok(IndexData {
-            dir: ByteSource::VecSource(Vec::new()),
-            record_index: self.record_index.open_mmap()?,
-            heap_index_dir: ByteSource::VecSource(Vec::new()),
-            object_store: self.object_store.open_mmap()?,
-            utf8: self.utf8.open_mmap()?,
-            load_class: self.load_class.open_mmap()?,
-            refs: self.refs.open_mmap()?,
-            frames: self.frames.open_mmap()?,
-            traces: self.traces.open_mmap()?,
-            start_threads: self.start_threads.open_mmap()?,
-            end_threads: self.end_threads.open_mmap()?,
-            unload_classes: self.unload_classes.open_mmap()?,
-            root_unknown: self.root_unknown.open_mmap()?,
-            root_jni_global: self.root_jni_global.open_mmap()?,
-            root_jni_local: self.root_jni_local.open_mmap()?,
-            root_java_frame: self.root_java_frame.open_mmap()?,
-            root_native_stack: self.root_native_stack.open_mmap()?,
-            root_sticky_class: self.root_sticky_class.open_mmap()?,
-            root_thread_block: self.root_thread_block.open_mmap()?,
-            root_monitor_used: self.root_monitor_used.open_mmap()?,
-            root_thread_obj: self.root_thread_obj.open_mmap()?,
-            dominators: self.dominators.open_mmap()?,
-            retained: self.retained.open_mmap()?,
-        })
+impl IndexOptions {
+    /// The index directory these options select for `hprof_path`.
+    pub fn dir_for(&self, hprof_path: &Path) -> PathBuf {
+        self.index_dir
+            .clone()
+            .unwrap_or_else(|| default_index_dir(hprof_path))
+    }
+}
+
+/// The default index directory for `hprof_path`: `{stem}.indexes` next to it.
+pub fn default_index_dir(hprof_path: &Path) -> PathBuf {
+    let stem = hprof_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "dump".to_string());
+    let parent = hprof_path.parent().unwrap_or(Path::new("."));
+    parent.join(format!("{stem}.indexes"))
+}
+
+// ── Filesystem wrappers ───────────────────────────────────────────────────────
+
+/// Build all index files for `hprof_path` with default options.
+///
+/// Indexes go into `{hprof_stem}.indexes/` next to the dump.  Each step is
+/// skipped if the manifest says it is done.  Progress is reported through
+/// `progress`.  Returns the index directory.
+pub fn build_all_indexes(
+    hprof_path: &Path,
+    progress: &dyn Progress,
+) -> Result<PathBuf, HprofError> {
+    build_all_indexes_with(hprof_path, &IndexOptions::default(), progress)
+}
+
+/// [`build_all_indexes`] with explicit [`IndexOptions`].
+pub fn build_all_indexes_with(
+    hprof_path: &Path,
+    opts: &IndexOptions,
+    progress: &dyn Progress,
+) -> Result<PathBuf, HprofError> {
+    let dir = opts.dir_for(hprof_path);
+    let store = FsStore::open_or_create(&dir)?;
+    let hprof = ByteSource::map_file(hprof_path)?;
+    build_indexes(hprof.as_ref(), &store, opts, progress)?;
+    Ok(dir)
+}
+
+// ── Step bookkeeping ──────────────────────────────────────────────────────────
+
+/// Tracks which steps are done through the manifest.
+struct Steps<'s> {
+    store: &'s dyn IndexStore,
+    manifest: Manifest,
+    force: bool,
+}
+
+impl Steps<'_> {
+    /// `true` when every entry in `outputs` was committed by a finished step
+    /// and still exists.
+    fn done(&self, outputs: &[&str]) -> bool {
+        !self.force
+            && outputs
+                .iter()
+                .all(|n| self.manifest.is_built(n) && self.store.exists(n))
+    }
+
+    /// Record `outputs` as committed and persist the manifest.
+    fn finished(&mut self, outputs: &[&str]) -> Result<(), HprofError> {
+        self.manifest.mark_built(outputs);
+        self.manifest.write(self.store)
     }
 }
 
 // ── Pipeline ──────────────────────────────────────────────────────────────────
 
-/// Build all index files for `hprof_path`, printing progress to stdout.
+/// Build every index for `hprof` into `store`.
 ///
-/// Each index is skipped if its output file (or directory) already exists.
-/// Returns the populated [`IndexPaths`] so the caller can open readers or pass
-/// paths to HTML generation.
-pub fn build_all_indexes(hprof_path: &Path) -> Result<IndexPaths, HprofError> {
-    let mut p = IndexPaths::for_hprof(hprof_path);
-    std::fs::create_dir_all(&p.dir)?;
-    let hprof_pb: PathBuf = hprof_path.to_path_buf();
-
-    // Memory-map the hprof file once; reused across all build steps.
-    let hprof_mmap = map_file(&hprof_pb)?;
-    let hprof_bytes: &[u8] = hprof_mmap.as_ref();
+/// Steps run in dependency order; every output is written through a staged
+/// [`StoreWriter`] and committed only on success, and the manifest is
+/// updated after each step, so an interrupted build never leaves a
+/// truncated index under its final name and resumes where it stopped.
+pub fn build_indexes(
+    hprof: &[u8],
+    store: &dyn IndexStore,
+    opts: &IndexOptions,
+    progress: &dyn Progress,
+) -> Result<(), HprofError> {
+    let identity = HprofIdentity::of(hprof)?;
+    let manifest = match Manifest::read(store)? {
+        Some(m) if !opts.force && m.matches(&identity) => m,
+        Some(m) if !opts.force => {
+            let why = m
+                .mismatch_reason(&identity)
+                .unwrap_or_else(|| "manifest mismatch".to_owned());
+            progress.step("Manifest", &format!("rebuilding everything: {why}"));
+            Manifest::new(identity)
+        }
+        _ => Manifest::new(identity),
+    };
+    let mut steps = Steps {
+        store,
+        manifest,
+        force: opts.force,
+    };
+    let secs = |t: Instant| format!("{:.1}s", t.elapsed().as_secs_f64());
 
     // ── Record index ──────────────────────────────────────────────────────────
-    if p.record_index.exists() {
-        println!("Record index: skipping");
+    const RECORD: &str = "Record index";
+    if steps.done(&[names::RECORD_INDEX]) {
+        progress.step(RECORD, "skipping");
     } else {
-        print!("Record index: indexing records … ");
         let t = Instant::now();
-        let n = index_hprof(hprof_bytes, &mut p.record_index)?;
-        println!("{n} records  ({:.1}s)", t.elapsed().as_secs_f64());
+        let mut w = store.create(names::RECORD_INDEX)?;
+        let n = index_hprof(hprof, &mut w)?;
+        w.commit()?;
+        steps.finished(&[names::RECORD_INDEX])?;
+        progress.step(RECORD, &format!("{n} records ({})", secs(t)));
     }
-
-    // ── Heap index ────────────────────────────────────────────────────────────
-    if p.heap_index_dir.exists() {
-        println!("Heap index: skipping");
-    } else {
-        print!("Heap index: indexing heap sub-records … ");
-        let t = Instant::now();
-        let heap_dir = SubIndexDir::fs(p.heap_index_dir.clone());
-        let n = index_heap_dumps(&hprof_pb, &p.record_index, &heap_dir)?;
-        println!("{n} sub-records  ({:.1}s)", t.elapsed().as_secs_f64());
-    }
+    let record_index = store.open(names::RECORD_INDEX)?;
 
     // ── Object store + root indexes ───────────────────────────────────────────
-    // Both are built in one pass: combine → sort → fan-out roots.
-    let store_and_roots_done = p.object_store.exists()
-        && p.root_unknown.exists()
-        && p.root_jni_global.exists()
-        && p.root_jni_local.exists()
-        && p.root_java_frame.exists()
-        && p.root_native_stack.exists()
-        && p.root_sticky_class.exists()
-        && p.root_thread_block.exists()
-        && p.root_monitor_used.exists()
-        && p.root_thread_obj.exists();
-
-    if store_and_roots_done {
-        println!("Object store + root indexes: skipping");
+    // The per-segment heap index is an intermediate: built, concatenated,
+    // sorted, fanned out into the root indexes, then removed.
+    const STORE: &str = "Object store + root indexes";
+    let mut store_outputs: Vec<&str> = vec![names::OBJECT_STORE];
+    store_outputs.extend(names::ROOTS);
+    if steps.done(&store_outputs) {
+        progress.step(STORE, "skipping");
     } else {
-        print!("Object store + root indexes: combining, sorting, splitting … ");
+        const HEAP: &str = "Heap index";
         let t = Instant::now();
-        let heap_dir = SubIndexDir::fs(p.heap_index_dir.clone());
-        let mut w_unknown = BufWriter::new(File::create(&p.root_unknown)?);
-        let mut w_jni_global = BufWriter::new(File::create(&p.root_jni_global)?);
-        let mut w_jni_local = BufWriter::new(File::create(&p.root_jni_local)?);
-        let mut w_java_frame = BufWriter::new(File::create(&p.root_java_frame)?);
-        let mut w_native_stack = BufWriter::new(File::create(&p.root_native_stack)?);
-        let mut w_sticky_class = BufWriter::new(File::create(&p.root_sticky_class)?);
-        let mut w_thread_block = BufWriter::new(File::create(&p.root_thread_block)?);
-        let mut w_monitor_used = BufWriter::new(File::create(&p.root_monitor_used)?);
-        let mut w_thread_obj = BufWriter::new(File::create(&p.root_thread_obj)?);
-        let counts = combine_sort_and_split(
-            &heap_dir,
-            &mut p.object_store,
-            &mut [
-                &mut w_unknown,
-                &mut w_jni_global,
-                &mut w_jni_local,
-                &mut w_java_frame,
-                &mut w_native_stack,
-                &mut w_sticky_class,
-                &mut w_thread_block,
-                &mut w_monitor_used,
-                &mut w_thread_obj,
-            ],
-        )?;
-        println!(
-            "{} entries; roots: unknown={}, jni_global={}, jni_local={}, java_frame={}, \
-             native_stack={}, sticky_class={}, thread_block={}, monitor_used={}, \
-             thread_obj={}  ({:.1}s)",
-            counts.total,
-            counts.roots.root_unknown,
-            counts.roots.root_jni_global,
-            counts.roots.root_jni_local,
-            counts.roots.root_java_frame,
-            counts.roots.root_native_stack,
-            counts.roots.root_sticky_class,
-            counts.roots.root_thread_block,
-            counts.roots.root_monitor_used,
-            counts.roots.root_thread_obj,
-            t.elapsed().as_secs_f64()
+        store.remove_prefix(names::HEAP_INDEX_PREFIX)?;
+        let n = index_heap_dumps(hprof, record_index.as_ref(), store)?;
+        progress.step(HEAP, &format!("{n} sub-records ({})", secs(t)));
+
+        let t = Instant::now();
+        let mut combined = store.create(names::OBJECT_STORE)?;
+        let mut roots: Vec<Box<dyn StoreWriter>> = names::ROOTS
+            .iter()
+            .map(|n| store.create(n))
+            .collect::<Result<_, _>>()?;
+        let counts = {
+            let mut writers: Vec<&mut dyn Write> = roots
+                .iter_mut()
+                .map(|b| b.as_mut() as &mut dyn Write)
+                .collect();
+            combine_sort_and_split(store, &mut *combined, writers.as_mut_slice())?
+        };
+        combined.commit()?;
+        for w in roots {
+            w.commit()?;
+        }
+        store.remove_prefix(names::HEAP_INDEX_PREFIX)?;
+        steps.finished(&store_outputs)?;
+        let r = &counts.roots;
+        progress.step(
+            STORE,
+            &format!(
+                "{} entries; roots: unknown={}, jni_global={}, jni_local={}, java_frame={}, \
+                 native_stack={}, sticky_class={}, thread_block={}, monitor_used={}, \
+                 thread_obj={} ({})",
+                counts.total,
+                r.root_unknown,
+                r.root_jni_global,
+                r.root_jni_local,
+                r.root_java_frame,
+                r.root_native_stack,
+                r.root_sticky_class,
+                r.root_thread_block,
+                r.root_monitor_used,
+                r.root_thread_obj,
+                secs(t)
+            ),
+        );
+    }
+    let object_store = store.open(names::OBJECT_STORE)?;
+
+    // ── Per-class indexes ─────────────────────────────────────────────────────
+    const CLASSES: &str = "Class indexes";
+    if steps.done(&[names::INSTANCES_BY_CLASS, names::CLASS_HISTOGRAM]) {
+        progress.step(CLASSES, "skipping");
+    } else {
+        let t = Instant::now();
+        let (objects, classes) = build_class_indexes(hprof, object_store.as_ref(), store)?;
+        steps.finished(&[names::INSTANCES_BY_CLASS, names::CLASS_HISTOGRAM])?;
+        progress.step(
+            CLASSES,
+            &format!("{objects} objects in {classes} class keys ({})", secs(t)),
         );
     }
 
     // ── Name indexes ──────────────────────────────────────────────────────────
-    if p.utf8.exists() && p.load_class.exists() {
-        println!("Name indexes: skipping");
+    const NAMES: &str = "Name indexes";
+    if steps.done(&[names::UTF8, names::LOAD_CLASS]) {
+        progress.step(NAMES, "skipping");
     } else {
-        print!("Name indexes: building … ");
         let t = Instant::now();
-        let record_index_mmap = map_file(&p.record_index)?;
-        let (utf8_n, lc_n) = build_name_indexes(
-            hprof_bytes,
-            record_index_mmap.as_ref(),
-            &mut p.utf8,
-            &mut p.load_class,
-        )?;
-        println!(
-            "{utf8_n} UTF-8 names, {lc_n} classes  ({:.1}s)",
-            t.elapsed().as_secs_f64()
+        let mut utf8 = store.create(names::UTF8)?;
+        let mut lc = store.create(names::LOAD_CLASS)?;
+        let (utf8_n, lc_n) =
+            build_name_indexes(hprof, record_index.as_ref(), &mut *utf8, &mut *lc)?;
+        utf8.commit()?;
+        lc.commit()?;
+        steps.finished(&[names::UTF8, names::LOAD_CLASS])?;
+        progress.step(
+            NAMES,
+            &format!("{utf8_n} UTF-8 names, {lc_n} classes ({})", secs(t)),
         );
     }
 
     // ── Reference index ───────────────────────────────────────────────────────
-    if p.refs.exists() {
-        println!("Reference index: skipping");
+    const REFS: &str = "Reference index";
+    if steps.done(&[names::REFS]) {
+        progress.step(REFS, "skipping");
     } else {
-        print!("Reference index: building … ");
         let t = Instant::now();
-        let object_store_mmap = map_file(&p.object_store)?;
-        let utf8_mmap = map_file(&p.utf8)?;
-        let lc_mmap = map_file(&p.load_class)?;
-        let n = build_reference_index(
-            hprof_bytes,
-            object_store_mmap.as_ref(),
-            utf8_mmap.as_ref(),
-            lc_mmap.as_ref(),
-            &mut p.refs,
-        )?;
-        println!("{n} references  ({:.1}s)", t.elapsed().as_secs_f64());
+        let n = build_reference_index(hprof, object_store.as_ref(), store)?;
+        steps.finished(&[names::REFS])?;
+        progress.step(REFS, &format!("{n} references ({})", secs(t)));
     }
 
     // ── Dominator tree + retained heap sizes ─────────────────────────────────
-    let dominator_done = p.dominators.exists() && p.retained.exists();
-    if dominator_done {
-        println!("Dominator tree + retained sizes: skipping");
+    const DOM: &str = "Dominator tree + retained sizes";
+    if !opts.retained {
+        progress.step(DOM, "skipped (retained heap disabled)");
+    } else if steps.done(&names::RETAINED_SET) {
+        progress.step(DOM, "skipping");
     } else {
-        print!("Dominator tree + retained sizes: building … ");
+        // Fail fast if this step's memory would not fit (see dominator docs).
+        let objects = (object_store.len() / SUB_INDEX_ENTRY_SIZE) as u64;
+        let references = (store.open(names::REFS)?.len() / REF_ENTRY_SIZE) as u64;
+        let estimate = check_memory(objects, references, opts.max_memory)?;
+        progress.step(
+            DOM,
+            &format!(
+                "{objects} objects, {references} references: estimated peak memory {} MB",
+                estimate / (1024 * 1024)
+            ),
+        );
         let t = Instant::now();
-        let root_mmaps = [
-            p.root_unknown.open_mmap()?,
-            p.root_jni_global.open_mmap()?,
-            p.root_jni_local.open_mmap()?,
-            p.root_java_frame.open_mmap()?,
-            p.root_native_stack.open_mmap()?,
-            p.root_sticky_class.open_mmap()?,
-            p.root_thread_block.open_mmap()?,
-            p.root_monitor_used.open_mmap()?,
-            p.root_thread_obj.open_mmap()?,
-        ];
-        let root_readers = [
-            RootIndexReader::from_ref(root_mmaps[0].as_ref())?,
-            RootIndexReader::from_ref(root_mmaps[1].as_ref())?,
-            RootIndexReader::from_ref(root_mmaps[2].as_ref())?,
-            RootIndexReader::from_ref(root_mmaps[3].as_ref())?,
-            RootIndexReader::from_ref(root_mmaps[4].as_ref())?,
-            RootIndexReader::from_ref(root_mmaps[5].as_ref())?,
-            RootIndexReader::from_ref(root_mmaps[6].as_ref())?,
-            RootIndexReader::from_ref(root_mmaps[7].as_ref())?,
-            RootIndexReader::from_ref(root_mmaps[8].as_ref())?,
-        ];
-        let (dom_n, ret_n) = build_dominator_and_retained(
-            &hprof_pb,
-            &p.object_store,
-            &root_readers,
-            &mut p.dominators,
-            &mut p.retained,
-        )?;
-        println!(
-            "{dom_n} dominator entries, {ret_n} retained entries  ({:.1}s)",
-            t.elapsed().as_secs_f64()
+        let root_sources: Vec<ByteSource> = names::ROOTS
+            .iter()
+            .map(|n| store.open(n))
+            .collect::<Result<_, _>>()?;
+        for s in &root_sources {
+            RootIndexReader::from_ref(s.as_ref())?;
+        }
+        let root_readers: [RootIndexReader<'_>; 9] =
+            std::array::from_fn(|i| RootIndexReader::from_slice(root_sources[i].as_ref()));
+        let (dom_n, ret_n) =
+            build_dominator_and_retained(hprof, object_store.as_ref(), &root_readers, store)?;
+        steps.finished(&names::RETAINED_SET)?;
+        progress.step(
+            DOM,
+            &format!(
+                "{dom_n} dominator entries, {ret_n} retained entries ({})",
+                secs(t)
+            ),
         );
     }
 
     // ── Auxiliary indexes ─────────────────────────────────────────────────────
-    let aux_done = p.frames.exists()
-        && p.traces.exists()
-        && p.start_threads.exists()
-        && p.end_threads.exists()
-        && p.unload_classes.exists();
-
-    if aux_done {
-        println!("Auxiliary indexes: skipping");
+    const AUX: &str = "Auxiliary indexes";
+    let aux_outputs = [
+        names::FRAMES,
+        names::TRACES,
+        names::START_THREADS,
+        names::END_THREADS,
+        names::UNLOAD_CLASSES,
+    ];
+    if steps.done(&aux_outputs) {
+        progress.step(AUX, "skipping");
     } else {
-        print!("Auxiliary indexes: building … ");
         let t = Instant::now();
-        let frames = build_frame_index(hprof_bytes, &p.record_index, &mut p.frames)?;
-        let traces = build_trace_index(hprof_bytes, &p.record_index, &mut p.traces)?;
-        let start_threads =
-            build_start_thread_index(hprof_bytes, &p.record_index, &mut p.start_threads)?;
-        let end_threads = build_end_thread_index(hprof_bytes, &p.record_index, &mut p.end_threads)?;
-        let unload_classes =
-            build_unload_class_index(hprof_bytes, &p.record_index, &mut p.unload_classes)?;
-        println!(
-            "{frames} frames, {traces} traces, {start_threads} threads, \
-             {end_threads} ends, {unload_classes} unloads  ({:.1}s)",
-            t.elapsed().as_secs_f64()
+        let ri = record_index.as_ref();
+        let mut counts = [0u64; 5];
+        type AuxBuilder = fn(&[u8], &[u8], &mut dyn StoreWriter) -> Result<u64, HprofError>;
+        let builders: [AuxBuilder; 5] = [
+            build_frame_index,
+            build_trace_index,
+            build_start_thread_index,
+            build_end_thread_index,
+            build_unload_class_index,
+        ];
+        for (i, (name, build)) in aux_outputs.iter().zip(builders.iter()).enumerate() {
+            let mut w = store.create(name)?;
+            counts[i] = build(hprof, ri, &mut *w)?;
+            w.commit()?;
+        }
+        steps.finished(&aux_outputs)?;
+        progress.step(
+            AUX,
+            &format!(
+                "{} frames, {} traces, {} threads, {} ends, {} unloads ({})",
+                counts[0],
+                counts[1],
+                counts[2],
+                counts[3],
+                counts[4],
+                secs(t)
+            ),
         );
     }
 
     // ── Array size indexes ────────────────────────────────────────────────────
-    let arrays_done = ArrayKind::ALL.iter().all(|k| p.array_size(*k).exists());
-    if arrays_done {
-        println!("Array size indexes: skipping");
+    const ARRAYS: &str = "Array size indexes";
+    if steps.done(&names::ARRAYS) {
+        progress.step(ARRAYS, "skipping");
     } else {
-        print!("Array size indexes: building … ");
         let t = Instant::now();
-        let mut array_outputs = [
-            p.dir.join(ArrayKind::Boolean.file_name()),
-            p.dir.join(ArrayKind::Char.file_name()),
-            p.dir.join(ArrayKind::Float.file_name()),
-            p.dir.join(ArrayKind::Double.file_name()),
-            p.dir.join(ArrayKind::Byte.file_name()),
-            p.dir.join(ArrayKind::Short.file_name()),
-            p.dir.join(ArrayKind::Int.file_name()),
-            p.dir.join(ArrayKind::Long.file_name()),
-            p.dir.join(ArrayKind::Object.file_name()),
-        ];
-        let object_store_mmap2 = map_file(&p.object_store)?;
-        let counts =
-            build_array_size_indexes(hprof_bytes, object_store_mmap2.as_ref(), &mut array_outputs)?;
+        let counts = build_array_size_indexes(hprof, object_store.as_ref(), store)?;
+        steps.finished(&names::ARRAYS)?;
         let mut summary = String::new();
         for (kind, count) in ArrayKind::ALL.iter().zip(counts.iter()) {
             if *count > 0 {
                 write!(summary, " {}={count}", kind.slug()).unwrap_or(());
             }
         }
-        println!("({:.1}s){summary}", t.elapsed().as_secs_f64());
+        progress.step(ARRAYS, &format!("({}){summary}", secs(t)));
     }
 
-    Ok(p)
+    Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::{MANIFEST_NAME, MemStore};
+    use crate::progress::NoProgress;
+    use crate::test_util::standard_heap;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicIsize, Ordering};
+
+    fn all_final_names() -> Vec<&'static str> {
+        let mut v = vec![
+            MANIFEST_NAME,
+            names::RECORD_INDEX,
+            names::OBJECT_STORE,
+            names::INSTANCES_BY_CLASS,
+            names::CLASS_HISTOGRAM,
+            names::UTF8,
+            names::LOAD_CLASS,
+            names::REFS,
+            names::FRAMES,
+            names::TRACES,
+            names::START_THREADS,
+            names::END_THREADS,
+            names::UNLOAD_CLASSES,
+        ];
+        v.extend(names::RETAINED_SET);
+        v.extend(names::ROOTS);
+        v.extend(names::ARRAYS);
+        v
+    }
+
+    /// Every entry except the manifest (whose timestamps vary).
+    fn content_without_manifest(store: &MemStore) -> BTreeMap<String, Vec<u8>> {
+        let mut s = store.snapshot();
+        s.remove(MANIFEST_NAME);
+        s
+    }
+
+    #[test]
+    fn pipeline_builds_every_entry_in_memory_and_removes_intermediates() {
+        let hprof = standard_heap();
+        let store = MemStore::new();
+        build_indexes(&hprof, &store, &IndexOptions::default(), &NoProgress).unwrap();
+
+        let mut expected = all_final_names();
+        expected.sort();
+        assert_eq!(store.list("").unwrap(), expected);
+        assert!(store.list(names::HEAP_INDEX_PREFIX).unwrap().is_empty());
+
+        let manifest = Manifest::read(&store).unwrap().unwrap();
+        for name in all_final_names() {
+            if name != MANIFEST_NAME {
+                assert!(manifest.is_built(name), "{name} not in manifest");
+            }
+        }
+        assert!(manifest.matches(&HprofIdentity::of(&hprof).unwrap()));
+    }
+
+    #[test]
+    fn pipeline_skips_retained_when_disabled_and_adds_it_later() {
+        let hprof = standard_heap();
+        let store = MemStore::new();
+        let opts = IndexOptions {
+            retained: false,
+            force: false,
+            ..IndexOptions::default()
+        };
+        build_indexes(&hprof, &store, &opts, &NoProgress).unwrap();
+        assert!(!store.exists(names::DOMINATORS));
+        assert!(!store.exists(names::RETAINED));
+        assert!(store.exists(names::REFS));
+
+        // A later run with retained enabled builds only the missing step.
+        let log = Log::default();
+        build_indexes(&hprof, &store, &IndexOptions::default(), &log).unwrap();
+        let lines = log.lines();
+        assert!(store.exists(names::RETAINED));
+        assert!(
+            lines
+                .iter()
+                .filter(|l| !l.ends_with("skipping"))
+                .all(|l| l.starts_with("Dominator tree")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn pipeline_second_run_is_a_no_op_and_force_rebuilds() {
+        let hprof = standard_heap();
+        let store = MemStore::new();
+        build_indexes(&hprof, &store, &IndexOptions::default(), &NoProgress).unwrap();
+        let before = content_without_manifest(&store);
+
+        let log = Log::default();
+        build_indexes(&hprof, &store, &IndexOptions::default(), &log).unwrap();
+        let lines = log.lines();
+        assert!(lines.iter().all(|l| l.ends_with("skipping")), "{lines:?}");
+        assert_eq!(content_without_manifest(&store), before);
+
+        let opts = IndexOptions {
+            retained: true,
+            force: true,
+            ..IndexOptions::default()
+        };
+        let log = Log::default();
+        build_indexes(&hprof, &store, &opts, &log).unwrap();
+        let lines = log.lines();
+        assert!(lines.iter().all(|l| !l.ends_with("skipping")), "{lines:?}");
+        assert_eq!(content_without_manifest(&store), before);
+    }
+
+    #[test]
+    fn entries_not_in_the_manifest_are_rebuilt() {
+        let hprof = standard_heap();
+        let store = MemStore::new();
+        build_indexes(&hprof, &store, &IndexOptions::default(), &NoProgress).unwrap();
+        // Forge a manifest that forgets the reference index: the file exists
+        // but must be rebuilt because completion is tracked in the manifest.
+        let mut m = Manifest::read(&store).unwrap().unwrap();
+        m.built.remove(names::REFS);
+        m.write(&store).unwrap();
+        let log = Log::default();
+        build_indexes(&hprof, &store, &IndexOptions::default(), &log).unwrap();
+        let rebuilt: Vec<String> = log
+            .lines()
+            .into_iter()
+            .filter(|l| !l.ends_with("skipping"))
+            .collect();
+        assert_eq!(rebuilt.len(), 1, "{rebuilt:?}");
+        assert!(rebuilt[0].starts_with("Reference index"));
+    }
+
+    #[test]
+    fn manifest_for_another_hprof_triggers_full_rebuild() {
+        let hprof = standard_heap();
+        // A different length, and the same length dumped at another time.
+        let edits: [fn(&mut Manifest); 2] = [|m| m.hprof_len += 1, |m| m.hprof_timestamp_ms += 1];
+        for edit in edits {
+            let store = MemStore::new();
+            build_indexes(&hprof, &store, &IndexOptions::default(), &NoProgress).unwrap();
+            let mut m = Manifest::read(&store).unwrap().unwrap();
+            edit(&mut m);
+            m.write(&store).unwrap();
+            let log = Log::default();
+            build_indexes(&hprof, &store, &IndexOptions::default(), &log).unwrap();
+            let lines = log.lines();
+            assert!(
+                lines[0].starts_with("Manifest: rebuilding everything"),
+                "{lines:?}"
+            );
+            assert!(
+                lines[1..].iter().all(|l| !l.ends_with("skipping")),
+                "{lines:?}"
+            );
+        }
+    }
+
+    /// Interrupt the build by failing the n-th byte write, then finish it with
+    /// a healthy store: the result must equal an uninterrupted build.
+    #[test]
+    fn interrupted_builds_resume_to_the_same_result() {
+        let hprof = standard_heap();
+        let reference = MemStore::new();
+        build_indexes(&hprof, &reference, &IndexOptions::default(), &NoProgress).unwrap();
+        let expected = content_without_manifest(&reference);
+
+        // How many `write` calls does a full build make?  (Counted through
+        // the same wrapper with a budget that never runs out.)
+        let counter = Arc::new(AtomicIsize::new(isize::MAX));
+        let counting = FailingStore {
+            inner: MemStore::new(),
+            budget: Arc::clone(&counter),
+        };
+        build_indexes(&hprof, &counting, &IndexOptions::default(), &NoProgress).unwrap();
+        let total_writes = isize::MAX - counter.load(Ordering::SeqCst);
+        assert!(
+            total_writes > 20,
+            "fixture too small: {total_writes} writes"
+        );
+
+        // Crash at a spread of points, including the first write of the last
+        // step and the very last write.
+        let budgets = [
+            1,
+            3,
+            total_writes / 8,
+            total_writes / 4,
+            total_writes / 2,
+            (total_writes * 3) / 4,
+            total_writes - 1,
+        ];
+        for fail_after_writes in budgets {
+            let store = MemStore::new();
+            let failing = FailingStore {
+                inner: store.clone(),
+                budget: Arc::new(AtomicIsize::new(fail_after_writes)),
+            };
+            let interrupted =
+                build_indexes(&hprof, &failing, &IndexOptions::default(), &NoProgress);
+            assert!(
+                interrupted.is_err(),
+                "build with write budget {fail_after_writes}/{total_writes} should fail"
+            );
+            // Resume with a healthy store: every step whose manifest entry is
+            // missing is redone, leftover parts are cleaned up, and the
+            // result equals the reference (an extra entry would show up as a
+            // difference).
+            build_indexes(&hprof, &store, &IndexOptions::default(), &NoProgress).unwrap();
+            assert_eq!(
+                content_without_manifest(&store),
+                expected,
+                "resumed build differs from reference (budget {fail_after_writes}/{total_writes})"
+            );
+        }
+    }
+
+    #[test]
+    fn dominator_step_is_refused_when_it_would_not_fit_and_can_be_retried() {
+        let hprof = standard_heap();
+        let store = MemStore::new();
+        let tiny = IndexOptions {
+            max_memory: Some(1),
+            ..IndexOptions::default()
+        };
+        let err = build_indexes(&hprof, &store, &tiny, &NoProgress)
+            .expect_err("a 1-byte budget cannot fit the dominator step");
+        assert!(
+            matches!(err, HprofError::InsufficientMemory { needed, available: 1, .. } if needed > 1),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("--no-retained"), "{msg}");
+        // Everything before the refused step was built and recorded, nothing
+        // of the retained family exists, and no scratch entry leaked.
+        assert!(store.exists(names::REFS));
+        assert!(!store.exists(names::DOMINATORS));
+        assert!(store.list(".part.").unwrap().is_empty());
+
+        // Disabling the step avoids the check entirely...
+        let skip = IndexOptions {
+            retained: false,
+            max_memory: Some(1),
+            ..IndexOptions::default()
+        };
+        build_indexes(&hprof, &store, &skip, &NoProgress).unwrap();
+        // ...and a sufficient budget lets the same store finish the job.
+        let roomy = IndexOptions {
+            max_memory: Some(u64::MAX),
+            ..IndexOptions::default()
+        };
+        build_indexes(&hprof, &store, &roomy, &NoProgress).unwrap();
+        assert!(store.exists(names::RETAINED_BY_SIZE));
+    }
+
+    #[test]
+    fn index_directory_defaults_next_to_the_dump_and_can_be_overridden() {
+        let dump = Path::new("/tmp/heap.dump");
+        assert_eq!(default_index_dir(dump), Path::new("/tmp/heap.indexes"));
+        assert_eq!(
+            IndexOptions::default().dir_for(dump),
+            Path::new("/tmp/heap.indexes")
+        );
+        let custom = IndexOptions {
+            index_dir: Some(PathBuf::from("/fast/idx")),
+            ..IndexOptions::default()
+        };
+        assert_eq!(custom.dir_for(dump), Path::new("/fast/idx"));
+    }
+
+    // ── Test doubles ──────────────────────────────────────────────────────────
+
+    /// Progress sink that records every line.
+    #[derive(Default)]
+    struct Log(std::sync::Mutex<Vec<String>>);
+
+    impl Log {
+        fn lines(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl Progress for Log {
+        fn step(&self, stage: &str, detail: &str) {
+            self.0.lock().unwrap().push(format!("{stage}: {detail}"));
+        }
+    }
+
+    /// A store whose writers fail once a shared budget of `write` calls is
+    /// exhausted — simulates a crash part-way through a build.
+    struct FailingStore {
+        inner: MemStore,
+        budget: Arc<AtomicIsize>,
+    }
+
+    impl IndexStore for FailingStore {
+        fn open(&self, name: &str) -> Result<ByteSource, HprofError> {
+            self.inner.open(name)
+        }
+        fn create(&self, name: &str) -> Result<Box<dyn StoreWriter>, HprofError> {
+            Ok(Box::new(FailingWriter {
+                inner: self.inner.create(name)?,
+                budget: Arc::clone(&self.budget),
+            }))
+        }
+        fn exists(&self, name: &str) -> bool {
+            self.inner.exists(name)
+        }
+        fn remove(&self, name: &str) -> Result<(), HprofError> {
+            self.inner.remove(name)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>, HprofError> {
+            self.inner.list(prefix)
+        }
+    }
+
+    struct FailingWriter {
+        inner: Box<dyn StoreWriter>,
+        budget: Arc<AtomicIsize>,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.budget.fetch_sub(1, Ordering::SeqCst) <= 0 {
+                return Err(std::io::Error::other("simulated crash"));
+            }
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl StoreWriter for FailingWriter {
+        fn as_mut_bytes(&mut self) -> Result<&mut [u8], HprofError> {
+            self.inner.as_mut_bytes()
+        }
+        fn commit(self: Box<Self>) -> Result<(), HprofError> {
+            self.inner.commit()
+        }
+    }
 }

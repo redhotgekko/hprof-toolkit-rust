@@ -1,43 +1,28 @@
-//! Search all live `java.lang.String` instances for a substring.
+//! Find `java.lang.String` objects whose text matches a regex, in parallel.
+//! Only the String instances are visited (per-class index), and one
+//! `Matcher` serves every rayon worker.
 //!
-//! Useful for hunting down which objects are holding onto a specific
-//! configuration value, URL, or player name that you know should appear
-//! in the heap.
-//!
-//! ```text
-//! cargo run --example find_strings -- <needle>
-//! ```
-//!
-//! Output:
-//! ```text
-//! object_id=0x1a2b3c4d  "localhost:25565"
-//! object_id=0x1a2b3c4e  "localhost:19132"
-//! ```
+//!     cargo run --release --example find_strings -- heap.hprof '^jdbc:'
 
-use hprof_toolkit::{
-    heap_query::JavaValue, hprof::HprofError, pipeline::build_all_indexes, query::HeapQuery,
-};
-use std::path::Path;
+use hprof_toolkit::prelude::*;
 
-fn main() -> Result<(), HprofError> {
-    let needle = std::env::args().nth(1).unwrap_or_else(|| {
-        eprintln!("Usage: find_strings <needle>");
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args().skip(1);
+    let (Some(path), Some(pattern)) = (args.next(), args.next()) else {
+        eprintln!("usage: find_strings <heap.hprof> <regex>");
         std::process::exit(1);
-    });
-
-    let path = Path::new("./heap.dump");
-    let indexes = build_all_indexes(path)?;
-    let query = HeapQuery::open(path, &indexes)?;
-
-    // resolve_value follows the backing byte[] + coder field to decode the string.
-    query.par_resolved_instances_of("java.lang.String", |inst| {
-        if let Ok(JavaValue::String(_, s)) = query.resolve_value(inst.object_id)
-            && s.contains(needle.as_str())
-        {
-            println!("object_id=0x{:x}  {:?}", inst.object_id, s);
+    };
+    let heap = HeapQuery::open(path)?;
+    let matcher = Matcher::new(&SearchQuery::regex(pattern))?;
+    let Some(string_class) = heap.find_class_by_name("java.lang.String") else {
+        return Ok(());
+    };
+    heap.par_instances_of(string_class).try_for_each(|inst| {
+        let id = inst?.object_id;
+        if let Some(text) = heap.string(id)?.filter(|s| matcher.is_match(s)) {
+            println!("0x{id:x}  {text:?}");
         }
-        Ok(())
+        Ok::<(), HprofError>(())
     })?;
-
     Ok(())
 }

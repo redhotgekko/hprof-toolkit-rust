@@ -13,34 +13,25 @@
 //!
 //! ## Usage
 //!
-//! ```rust,ignore
-//! use hprof_toolkit::query::HeapQuery;
-//! use hprof_toolkit::resolved::{ResolvedInstance, ResolvedClass};
-//! use hprof_toolkit::heap_parser::SubRecord;
+//! ```no_run
+//! use hprof_toolkit::prelude::*;
 //!
-//! for result in query.iter_objects() {
-//!     match result? {
-//!         SubRecord::InstanceDump(inst) => {
-//!             let resolved = ResolvedInstance::from_dump(&query, &inst)?;
-//!             println!("{}: {:?}", resolved.class_name, resolved.fields);
-//!         }
-//!         SubRecord::ClassDump(cd) => {
-//!             let resolved = ResolvedClass::from_dump(&query, &cd)?;
-//!             println!("class {} ({} static fields)", resolved.class_name, resolved.static_fields.len());
-//!         }
+//! let heap = HeapQuery::open("heap.hprof")?;
+//! for record in heap.objects() {
+//!     match record?.resolve(&heap)? {
+//!         Resolved::Instance(i) => println!("{}: {:?}", i.class_name, i.fields),
+//!         Resolved::Class(c) => println!("class {} ({} statics)", c.class_name, c.static_fields.len()),
 //!         _ => {}
 //!     }
 //! }
+//! # Ok::<(), HprofError>(())
 //! ```
 
-use crate::heap_parser::{
-    ClassDump, InstanceDump, ObjArrayDump, PrimArrayDump, RootJavaFrame, RootJniGlobal,
-    RootJniLocal, RootMonitorUsed, RootNativeStack, RootStickyClass, RootThreadBlock,
-    RootThreadObj, RootUnknown,
-};
-use crate::heap_query::JavaValue;
-use crate::hprof::HprofError;
-use crate::query::HeapQuery;
+use crate::class_key::ClassKey;
+use crate::heap_parser::{ClassDump, InstanceDump, ObjArrayDump, PrimArrayDump, SubRecord};
+use crate::hprof::{BasicType, HprofError};
+use crate::query::{HeapQuery, ScanResult, ScanWindow, StringMatch};
+use crate::search::{Matcher, SearchMode};
 
 // ── Value ─────────────────────────────────────────────────────────────────────
 
@@ -69,7 +60,7 @@ pub enum Value {
     /// `java.lang.String`
     String(u64, std::string::String),
     /// `java.lang.Integer`
-    Integer(u64, i32),
+    BoxedInt(u64, i32),
     /// `java.lang.Long`
     BoxedLong(u64, i64),
     /// `java.lang.Double`
@@ -92,41 +83,9 @@ pub enum Value {
 
 // ── FieldType ─────────────────────────────────────────────────────────────────
 
-/// The declared type of an instance or static field.
-///
-/// Maps the hprof type codes (2, 4–11) to named variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FieldType {
-    Object,
-    Bool,
-    Char,
-    Float,
-    Double,
-    Byte,
-    Short,
-    Int,
-    Long,
-}
-
-impl FieldType {
-    /// Convert an hprof type code to a [`FieldType`].
-    ///
-    /// Returns `None` for unknown codes.
-    pub fn from_type_code(code: u8) -> Option<Self> {
-        match code {
-            2 => Some(Self::Object),
-            4 => Some(Self::Bool),
-            5 => Some(Self::Char),
-            6 => Some(Self::Float),
-            7 => Some(Self::Double),
-            8 => Some(Self::Byte),
-            9 => Some(Self::Short),
-            10 => Some(Self::Int),
-            11 => Some(Self::Long),
-            _ => None,
-        }
-    }
-}
+/// The declared type of a field: an alias of the crate-wide
+/// [`BasicType`].
+pub type FieldType = crate::hprof::BasicType;
 
 // ── ResolvedInstance ──────────────────────────────────────────────────────────
 
@@ -156,7 +115,10 @@ impl ResolvedInstance {
     /// value.  Object-typed fields that point to wrapper instances (String,
     /// Integer, Long, …) are resolved to their corresponding [`Value`] variants.
     pub fn from_dump(query: &HeapQuery, inst: &InstanceDump<'_>) -> Result<Self, HprofError> {
-        let class_name = query.class_name(inst.class_id)?.unwrap_or_default();
+        let class_name = query
+            .class_name(inst.class_id)
+            .map(|n| n.to_string())
+            .unwrap_or_default();
         let raw_fields = query.instance_fields(inst)?;
         let fields = raw_fields
             .into_iter()
@@ -210,10 +172,13 @@ pub struct ResolvedClass {
 impl ResolvedClass {
     /// Resolve a [`ClassDump`] into a fully populated [`ResolvedClass`].
     pub fn from_dump(query: &HeapQuery, cd: &ClassDump<'_>) -> Result<Self, HprofError> {
-        let class_name = query.class_name(cd.class_id)?.unwrap_or_default();
+        let class_name = query
+            .class_name(cd.class_id)
+            .map(|n| n.to_string())
+            .unwrap_or_default();
 
         let super_class_name = if cd.super_class_id != 0 {
-            query.class_name(cd.super_class_id)?
+            query.class_name(cd.super_class_id).map(|n| n.to_string())
         } else {
             None
         };
@@ -232,7 +197,7 @@ impl ResolvedClass {
         for fd_result in cd.instance_fields() {
             let fd = fd_result?;
             let name = query.lookup_name(fd.name_id)?.unwrap_or_default();
-            let field_type = FieldType::from_type_code(fd.field_type).unwrap_or(FieldType::Object);
+            let field_type = FieldType::from_code(fd.field_type).unwrap_or(FieldType::Object);
             instance_fields.push(FieldDescriptor { name, field_type });
         }
 
@@ -253,7 +218,7 @@ impl ResolvedClass {
 
 /// A fully resolved OBJ_ARRAY_DUMP.
 ///
-/// The element class name is resolved via the load-class → UTF-8 name index
+/// The array class name is resolved via the load-class → UTF-8 name index
 /// chain.  Each element object ID is resolved through
 /// [`HeapQuery::resolve_value`] so wrapper types (String, Integer, …) become
 /// rich [`Value`] variants.
@@ -265,10 +230,12 @@ pub struct ResolvedObjArray {
     pub stack_trace_serial: u32,
     /// Number of elements in the array.
     pub num_elements: u32,
-    /// Heap ID of the element class (e.g. the class object for `String`).
-    pub element_class_id: u64,
-    /// Dot-notation element class name (e.g. `"java.lang.String"`).
-    pub element_class_name: std::string::String,
+    /// Heap ID of the array's class object (`[Ljava.lang.String;`).
+    pub array_class_id: u64,
+    /// JVM name of the array class (e.g. `"[Ljava.lang.String;"`); use
+    /// [`HeapQuery::key_name`] with `ClassKey::ObjArray(array_class_id)` for
+    /// the Java form `java.lang.String[]`.
+    pub array_class_name: std::string::String,
     /// Resolved element values in array order.
     pub elements: Vec<Value>,
 }
@@ -276,23 +243,23 @@ pub struct ResolvedObjArray {
 impl ResolvedObjArray {
     /// Resolve an [`ObjArrayDump`] into a fully populated [`ResolvedObjArray`].
     ///
-    /// Resolves the element class name and then resolves each element object ID
+    /// Resolves the array class name and then resolves each element object ID
     /// through [`HeapQuery::resolve_value`].
     pub fn from_dump(query: &HeapQuery, arr: &ObjArrayDump<'_>) -> Result<Self, HprofError> {
-        let element_class_name = query.class_name(arr.element_class_id)?.unwrap_or_default();
+        let array_class_name = query
+            .class_name(arr.array_class_id)
+            .map(|n| n.to_string())
+            .unwrap_or_default();
         let elements = arr
             .elements()
-            .map(|id| {
-                let jv = query.resolve_value(id)?;
-                Ok(java_value_to_value(jv))
-            })
+            .map(|id| query.resolve_value(id))
             .collect::<Result<Vec<_>, HprofError>>()?;
         Ok(Self {
             array_id: arr.array_id,
             stack_trace_serial: arr.stack_trace_serial,
             num_elements: arr.num_elements,
-            element_class_id: arr.element_class_id,
-            element_class_name,
+            array_class_id: arr.array_class_id,
+            array_class_name,
             elements,
         })
     }
@@ -369,107 +336,159 @@ pub enum ResolvedRoot {
 }
 
 impl ResolvedRoot {
-    /// Resolve a [`RootUnknown`] record.
-    pub fn from_unknown(query: &HeapQuery, root: &RootUnknown) -> Result<Self, HprofError> {
-        let object_type_name = query.object_type_name(root.object_id)?;
-        Ok(Self::Unknown {
-            object_id: root.object_id,
-            object_type_name,
-        })
+    /// The id of the rooted object (the class for a sticky-class root, the
+    /// thread object for a thread-object root).
+    pub fn object_id(&self) -> u64 {
+        match self {
+            Self::Unknown { object_id, .. }
+            | Self::JniGlobal { object_id, .. }
+            | Self::JniLocal { object_id, .. }
+            | Self::JavaFrame { object_id, .. }
+            | Self::NativeStack { object_id, .. }
+            | Self::ThreadBlock { object_id, .. }
+            | Self::MonitorUsed { object_id, .. } => *object_id,
+            Self::StickyClass { class_id, .. } => *class_id,
+            Self::ThreadObj {
+                thread_object_id, ..
+            } => *thread_object_id,
+        }
     }
 
-    /// Resolve a [`RootJniGlobal`] record.
-    pub fn from_jni_global(query: &HeapQuery, root: &RootJniGlobal) -> Result<Self, HprofError> {
-        let object_type_name = query.object_type_name(root.object_id)?;
-        Ok(Self::JniGlobal {
-            object_id: root.object_id,
-            jni_global_ref_id: root.jni_global_ref_id,
-            object_type_name,
-        })
+    /// Type name of the rooted object (the class name for a sticky class).
+    pub fn type_name(&self) -> &str {
+        match self {
+            Self::Unknown {
+                object_type_name, ..
+            }
+            | Self::JniGlobal {
+                object_type_name, ..
+            }
+            | Self::JniLocal {
+                object_type_name, ..
+            }
+            | Self::JavaFrame {
+                object_type_name, ..
+            }
+            | Self::NativeStack {
+                object_type_name, ..
+            }
+            | Self::ThreadBlock {
+                object_type_name, ..
+            }
+            | Self::MonitorUsed {
+                object_type_name, ..
+            }
+            | Self::ThreadObj {
+                object_type_name, ..
+            } => object_type_name,
+            Self::StickyClass { class_name, .. } => class_name,
+        }
     }
 
-    /// Resolve a [`RootJniLocal`] record.
-    pub fn from_jni_local(query: &HeapQuery, root: &RootJniLocal) -> Result<Self, HprofError> {
-        let object_type_name = query.object_type_name(root.object_id)?;
-        Ok(Self::JniLocal {
-            object_id: root.object_id,
-            thread_serial: root.thread_serial,
-            frame_number: root.frame_number,
-            object_type_name,
-        })
-    }
-
-    /// Resolve a [`RootJavaFrame`] record.
-    pub fn from_java_frame(query: &HeapQuery, root: &RootJavaFrame) -> Result<Self, HprofError> {
-        let object_type_name = query.object_type_name(root.object_id)?;
-        Ok(Self::JavaFrame {
-            object_id: root.object_id,
-            thread_serial: root.thread_serial,
-            frame_number: root.frame_number,
-            object_type_name,
-        })
-    }
-
-    /// Resolve a [`RootNativeStack`] record.
-    pub fn from_native_stack(
-        query: &HeapQuery,
-        root: &RootNativeStack,
-    ) -> Result<Self, HprofError> {
-        let object_type_name = query.object_type_name(root.object_id)?;
-        Ok(Self::NativeStack {
-            object_id: root.object_id,
-            thread_serial: root.thread_serial,
-            object_type_name,
-        })
-    }
-
-    /// Resolve a [`RootStickyClass`] record.
+    /// Resolve a GC-root sub-record, naming the rooted object's type.
     ///
-    /// Resolves the class name via the load-class → UTF-8 name index chain.
-    pub fn from_sticky_class(
+    /// Returns `Ok(None)` when `record` is not one of the nine root kinds.
+    pub fn from_sub_record(
         query: &HeapQuery,
-        root: &RootStickyClass,
-    ) -> Result<Self, HprofError> {
-        let class_name = query.class_name(root.class_id)?.unwrap_or_default();
-        Ok(Self::StickyClass {
-            class_id: root.class_id,
-            class_name,
-        })
+        record: &SubRecord<'_>,
+    ) -> Result<Option<Self>, HprofError> {
+        let type_name = |id: u64| query.object_type_name(id);
+        Ok(Some(match record {
+            SubRecord::RootUnknown(r) => Self::Unknown {
+                object_id: r.object_id,
+                object_type_name: type_name(r.object_id),
+            },
+            SubRecord::RootJniGlobal(r) => Self::JniGlobal {
+                object_id: r.object_id,
+                jni_global_ref_id: r.jni_global_ref_id,
+                object_type_name: type_name(r.object_id),
+            },
+            SubRecord::RootJniLocal(r) => Self::JniLocal {
+                object_id: r.object_id,
+                thread_serial: r.thread_serial,
+                frame_number: r.frame_number,
+                object_type_name: type_name(r.object_id),
+            },
+            SubRecord::RootJavaFrame(r) => Self::JavaFrame {
+                object_id: r.object_id,
+                thread_serial: r.thread_serial,
+                frame_number: r.frame_number,
+                object_type_name: type_name(r.object_id),
+            },
+            SubRecord::RootNativeStack(r) => Self::NativeStack {
+                object_id: r.object_id,
+                thread_serial: r.thread_serial,
+                object_type_name: type_name(r.object_id),
+            },
+            SubRecord::RootStickyClass(r) => Self::StickyClass {
+                class_id: r.class_id,
+                class_name: query.class_label(r.class_id),
+            },
+            SubRecord::RootThreadBlock(r) => Self::ThreadBlock {
+                object_id: r.object_id,
+                thread_serial: r.thread_serial,
+                object_type_name: type_name(r.object_id),
+            },
+            SubRecord::RootMonitorUsed(r) => Self::MonitorUsed {
+                object_id: r.object_id,
+                object_type_name: type_name(r.object_id),
+            },
+            SubRecord::RootThreadObj(r) => Self::ThreadObj {
+                thread_object_id: r.thread_object_id,
+                thread_serial: r.thread_serial,
+                stack_trace_serial: r.stack_trace_serial,
+                object_type_name: type_name(r.thread_object_id),
+            },
+            _ => return Ok(None),
+        }))
     }
+}
 
-    /// Resolve a [`RootThreadBlock`] record.
-    pub fn from_thread_block(
-        query: &HeapQuery,
-        root: &RootThreadBlock,
-    ) -> Result<Self, HprofError> {
-        let object_type_name = query.object_type_name(root.object_id)?;
-        Ok(Self::ThreadBlock {
-            object_id: root.object_id,
-            thread_serial: root.thread_serial,
-            object_type_name,
-        })
-    }
+// ── Resolved (any sub-record) ─────────────────────────────────────────────────
 
-    /// Resolve a [`RootMonitorUsed`] record.
-    pub fn from_monitor_used(
-        query: &HeapQuery,
-        root: &RootMonitorUsed,
-    ) -> Result<Self, HprofError> {
-        let object_type_name = query.object_type_name(root.object_id)?;
-        Ok(Self::MonitorUsed {
-            object_id: root.object_id,
-            object_type_name,
-        })
-    }
+/// Any sub-record, fully resolved.  Produced by [`SubRecord::resolve`].
+#[derive(Debug, Clone)]
+pub enum Resolved {
+    Instance(ResolvedInstance),
+    Class(ResolvedClass),
+    ObjArray(ResolvedObjArray),
+    PrimArray(ResolvedPrimArray),
+    Root(ResolvedRoot),
+}
 
-    /// Resolve a [`RootThreadObj`] record.
-    pub fn from_thread_obj(query: &HeapQuery, root: &RootThreadObj) -> Result<Self, HprofError> {
-        let object_type_name = query.object_type_name(root.thread_object_id)?;
-        Ok(Self::ThreadObj {
-            thread_object_id: root.thread_object_id,
-            thread_serial: root.thread_serial,
-            stack_trace_serial: root.stack_trace_serial,
-            object_type_name,
+impl SubRecord<'_> {
+    /// Resolve this record: names looked up, wrapper objects unwrapped,
+    /// primitive arrays decoded.  One call for any kind of object.
+    ///
+    /// ```no_run
+    /// # use hprof_toolkit::prelude::*;
+    /// # let heap = HeapQuery::open("heap.hprof")?;
+    /// if let Some(record) = heap.object(0x1234)? {
+    ///     match record.resolve(&heap)? {
+    ///         Resolved::Instance(i) => println!("{} with {} fields", i.class_name, i.fields.len()),
+    ///         other => println!("{other:?}"),
+    ///     }
+    /// }
+    /// # Ok::<(), HprofError>(())
+    /// ```
+    pub fn resolve(&self, query: &HeapQuery) -> Result<Resolved, HprofError> {
+        Ok(match self {
+            SubRecord::InstanceDump(i) => {
+                Resolved::Instance(ResolvedInstance::from_dump(query, i)?)
+            }
+            SubRecord::ClassDump(c) => Resolved::Class(ResolvedClass::from_dump(query, c)?),
+            SubRecord::ObjArrayDump(a) => {
+                Resolved::ObjArray(ResolvedObjArray::from_dump(query, a)?)
+            }
+            SubRecord::PrimArrayDump(a) => Resolved::PrimArray(ResolvedPrimArray::from_dump(a)?),
+            root => match ResolvedRoot::from_sub_record(query, root)? {
+                Some(r) => Resolved::Root(r),
+                None => {
+                    return Err(HprofError::Internal(
+                        "sub-record is neither an object nor a GC root".to_owned(),
+                    ));
+                }
+            },
         })
     }
 }
@@ -501,6 +520,184 @@ pub enum PrimArrayElements {
     Long(Vec<i64>),
 }
 
+impl PrimArrayElements {
+    /// Number of decoded elements.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Bool(v) => v.len(),
+            Self::Char(v) => v.len(),
+            Self::Float(v) => v.len(),
+            Self::Double(v) => v.len(),
+            Self::Byte(v) => v.len(),
+            Self::Short(v) => v.len(),
+            Self::Int(v) => v.len(),
+            Self::Long(v) => v.len(),
+        }
+    }
+
+    /// `true` when no elements were decoded.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Each element rendered as text.  With `quote_chars`, `char` elements
+    /// appear as `'a'`; without, as `a`.  Invalid UTF-16 units show as U+FFFD.
+    pub fn to_strings(&self, quote_chars: bool) -> Vec<String> {
+        fn all<T: ToString>(v: &[T]) -> Vec<String> {
+            v.iter().map(T::to_string).collect()
+        }
+        match self {
+            Self::Bool(v) => all(v),
+            Self::Char(v) => v
+                .iter()
+                .map(|&u| {
+                    let c = char::from_u32(u32::from(u)).unwrap_or('\u{FFFD}');
+                    if quote_chars {
+                        format!("'{c}'")
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect(),
+            Self::Float(v) => all(v),
+            Self::Double(v) => all(v),
+            Self::Byte(v) => all(v),
+            Self::Short(v) => all(v),
+            Self::Int(v) => all(v),
+            Self::Long(v) => all(v),
+        }
+    }
+}
+
+/// A window of a primitive array's elements; see [`HeapQuery::prim_array`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrimArrayWindow {
+    /// The array's object id.
+    pub array_id: u64,
+    /// Element type (never [`BasicType::Object`]).
+    pub element_type: BasicType,
+    /// Length of the whole array.
+    pub total: usize,
+    /// Index of the first decoded element.
+    pub offset: usize,
+    /// The decoded elements, at most the requested limit.
+    pub elements: PrimArrayElements,
+}
+
+impl PrimArrayWindow {
+    /// `true` when elements exist beyond this window.
+    pub fn has_more(&self) -> bool {
+        self.offset + self.elements.len() < self.total
+    }
+}
+
+impl HeapQuery {
+    /// Decode a window of the primitive array `array_id`, reading only the
+    /// bytes inside the window.  `None` when `array_id` is not a primitive
+    /// array.
+    pub fn prim_array(
+        &self,
+        array_id: u64,
+        page: crate::query::Page,
+    ) -> Result<Option<PrimArrayWindow>, HprofError> {
+        let Some(SubRecord::PrimArrayDump(arr)) = self.object(array_id)? else {
+            return Ok(None);
+        };
+        let elements = parse_prim_window(arr.data, arr.element_type, page.offset, page.limit)?;
+        Ok(Some(PrimArrayWindow {
+            array_id,
+            element_type: BasicType::from_code_or_err(arr.element_type)?,
+            total: arr.num_elements as usize,
+            offset: page.offset.min(arr.num_elements as usize),
+            elements,
+        }))
+    }
+
+    /// The text of the `java.lang.String` `string_id`; `None` when the id is
+    /// not a String.  Handles both `char[]` and compact `byte[]` strings.
+    pub fn string(&self, string_id: u64) -> Result<Option<String>, HprofError> {
+        Ok(match self.resolve_value(string_id)? {
+            Value::String(_, s) => Some(s),
+            _ => None,
+        })
+    }
+
+    /// `java.lang.String` objects whose text matches `matcher`, scanning
+    /// strings in id order within `window`.
+    ///
+    /// Reads string contents, so it is bounded: at most `window.max_scan`
+    /// strings are decoded per call and the result says where to continue.
+    /// Fuzzy matching is refused (`InvalidArgument`): a subsequence matches
+    /// almost any text and cannot rank across a bounded window.
+    ///
+    /// ```no_run
+    /// use hprof_toolkit::prelude::*;
+    ///
+    /// let heap = HeapQuery::open("heap.hprof")?;
+    /// let m = Matcher::new(&SearchQuery::regex(r"^jdbc:"))?;
+    /// let mut window = ScanWindow::first();
+    /// loop {
+    ///     let found = heap.search_strings(&m, window)?;
+    ///     for s in &found.items {
+    ///         println!("0x{:x} {}", s.object_id, s.preview);
+    ///     }
+    ///     match found.next_window(window) {
+    ///         Some(next) => window = next,
+    ///         None => break,
+    ///     }
+    /// }
+    /// # Ok::<(), HprofError>(())
+    /// ```
+    pub fn search_strings(
+        &self,
+        matcher: &Matcher,
+        window: ScanWindow,
+    ) -> Result<ScanResult<StringMatch>, HprofError> {
+        if matcher.mode() == SearchMode::Fuzzy {
+            return Err(HprofError::InvalidArgument(
+                "fuzzy search is not available for string contents; use contains, exact or regex"
+                    .to_owned(),
+            ));
+        }
+        let Some(string_class) = self.find_class_by_name("java.lang.String") else {
+            return Ok(ScanResult::empty());
+        };
+        let key = ClassKey::Class(string_class);
+        let total = self.instance_count(key);
+        let mut items = Vec::new();
+        let mut scanned = 0usize;
+        // Skip on the index entries (O(1)) and decode only the strings scanned.
+        for entry in self
+            .class_entries(key)
+            .skip(window.cursor)
+            .take(window.max_scan)
+        {
+            scanned += 1;
+            let Some(inst) = self.instance_from_entry(&entry).transpose()? else {
+                continue;
+            };
+            let text = self.string_of(&inst)?;
+            if matcher.is_match(&text) {
+                items.push(StringMatch {
+                    object_id: inst.object_id,
+                    length_chars: text.chars().count(),
+                    preview: text.chars().take(StringMatch::PREVIEW_CHARS).collect(),
+                });
+                if items.len() >= window.max_results {
+                    break;
+                }
+            }
+        }
+        let next = window.cursor + scanned;
+        Ok(ScanResult {
+            items,
+            scanned,
+            total,
+            next_cursor: (next < total).then_some(next),
+        })
+    }
+}
+
 /// A fully resolved primitive array dump.
 ///
 /// The raw big-endian bytes from the hprof file are decoded into a typed
@@ -524,8 +721,8 @@ impl ResolvedPrimArray {
     /// Decodes the raw big-endian bytes in `arr.data` according to
     /// `arr.element_type`.  Returns [`HprofError::UnknownPrimitiveType`] for
     /// unrecognised element type codes.
-    pub fn from_dump(_query: &HeapQuery, arr: &PrimArrayDump<'_>) -> Result<Self, HprofError> {
-        let elements = parse_prim_elements(arr.data, arr.element_type, arr.num_elements)?;
+    pub fn from_dump(arr: &PrimArrayDump<'_>) -> Result<Self, HprofError> {
+        let elements = parse_prim_window(arr.data, arr.element_type, 0, arr.num_elements as usize)?;
         Ok(Self {
             array_id: arr.array_id,
             stack_trace_serial: arr.stack_trace_serial,
@@ -538,107 +735,39 @@ impl ResolvedPrimArray {
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 /// Decode big-endian raw bytes into a [`PrimArrayElements`] variant.
-fn parse_prim_elements(
+/// Decode elements `offset..offset + limit` (clamped to the array) of a
+/// primitive array whose raw big-endian bytes are `data`.
+fn parse_prim_window(
     data: &[u8],
     element_type: u8,
-    num_elements: u32,
+    offset: usize,
+    limit: usize,
 ) -> Result<PrimArrayElements, HprofError> {
-    let n = num_elements as usize;
-    match element_type {
-        4 => {
-            // boolean: 1 byte each (0 = false, anything else = true)
-            Ok(PrimArrayElements::Bool(
-                data[..n].iter().map(|&b| b != 0).collect(),
-            ))
-        }
-        5 => {
-            // char: 2 bytes big-endian each
-            let mut v = Vec::with_capacity(n);
-            for i in 0..n {
-                let off = i * 2;
-                v.push(u16::from_be_bytes([data[off], data[off + 1]]));
-            }
-            Ok(PrimArrayElements::Char(v))
-        }
-        6 => {
-            // float: 4 bytes big-endian each
-            let mut v = Vec::with_capacity(n);
-            for i in 0..n {
-                let off = i * 4;
-                let bits =
-                    u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-                v.push(f32::from_bits(bits));
-            }
-            Ok(PrimArrayElements::Float(v))
-        }
-        7 => {
-            // double: 8 bytes big-endian each
-            let mut v = Vec::with_capacity(n);
-            for i in 0..n {
-                let off = i * 8;
-                let bits = u64::from_be_bytes([
-                    data[off],
-                    data[off + 1],
-                    data[off + 2],
-                    data[off + 3],
-                    data[off + 4],
-                    data[off + 5],
-                    data[off + 6],
-                    data[off + 7],
-                ]);
-                v.push(f64::from_bits(bits));
-            }
-            Ok(PrimArrayElements::Double(v))
-        }
-        8 => {
-            // byte: 1 byte each (signed)
-            Ok(PrimArrayElements::Byte(
-                data[..n].iter().map(|&b| b as i8).collect(),
-            ))
-        }
-        9 => {
-            // short: 2 bytes big-endian each (signed)
-            let mut v = Vec::with_capacity(n);
-            for i in 0..n {
-                let off = i * 2;
-                v.push(i16::from_be_bytes([data[off], data[off + 1]]));
-            }
-            Ok(PrimArrayElements::Short(v))
-        }
-        10 => {
-            // int: 4 bytes big-endian each (signed)
-            let mut v = Vec::with_capacity(n);
-            for i in 0..n {
-                let off = i * 4;
-                v.push(i32::from_be_bytes([
-                    data[off],
-                    data[off + 1],
-                    data[off + 2],
-                    data[off + 3],
-                ]));
-            }
-            Ok(PrimArrayElements::Int(v))
-        }
-        11 => {
-            // long: 8 bytes big-endian each (signed)
-            let mut v = Vec::with_capacity(n);
-            for i in 0..n {
-                let off = i * 8;
-                v.push(i64::from_be_bytes([
-                    data[off],
-                    data[off + 1],
-                    data[off + 2],
-                    data[off + 3],
-                    data[off + 4],
-                    data[off + 5],
-                    data[off + 6],
-                    data[off + 7],
-                ]));
-            }
-            Ok(PrimArrayElements::Long(v))
-        }
-        other => Err(HprofError::UnknownPrimitiveType(other)),
+    let ty = BasicType::from_code_or_err(element_type)?;
+    if !ty.is_primitive() {
+        return Err(HprofError::UnknownPrimitiveType(element_type));
     }
+    let size = ty.size(0);
+    let total = data.len() / size;
+    let start = offset.min(total);
+    let end = start.saturating_add(limit).min(total);
+    let window = &data[start * size..end * size];
+
+    fn chunks<const N: usize, T>(window: &[u8], f: impl Fn([u8; N]) -> T) -> Vec<T> {
+        window.as_chunks::<N>().0.iter().map(|c| f(*c)).collect()
+    }
+
+    Ok(match ty {
+        BasicType::Boolean => PrimArrayElements::Bool(window.iter().map(|&b| b != 0).collect()),
+        BasicType::Char => PrimArrayElements::Char(chunks(window, u16::from_be_bytes)),
+        BasicType::Float => PrimArrayElements::Float(chunks(window, f32::from_be_bytes)),
+        BasicType::Double => PrimArrayElements::Double(chunks(window, f64::from_be_bytes)),
+        BasicType::Byte => PrimArrayElements::Byte(window.iter().map(|&b| b as i8).collect()),
+        BasicType::Short => PrimArrayElements::Short(chunks(window, i16::from_be_bytes)),
+        BasicType::Int => PrimArrayElements::Int(chunks(window, i32::from_be_bytes)),
+        BasicType::Long => PrimArrayElements::Long(chunks(window, i64::from_be_bytes)),
+        BasicType::Object => unreachable!("rejected above"),
+    })
 }
 
 // ── Supporting types ──────────────────────────────────────────────────────────
@@ -692,27 +821,7 @@ fn field_value_to_value(
         crate::heap_parser::FieldValue::Short(v) => Ok(Value::Short(v)),
         crate::heap_parser::FieldValue::Int(v) => Ok(Value::Int(v)),
         crate::heap_parser::FieldValue::Long(v) => Ok(Value::Long(v)),
-        crate::heap_parser::FieldValue::Object(id) => {
-            let jv = query.resolve_value(id)?;
-            Ok(java_value_to_value(jv))
-        }
-    }
-}
-
-/// Convert a [`JavaValue`] (from wrapper type resolution) to a [`Value`].
-fn java_value_to_value(jv: JavaValue) -> Value {
-    match jv {
-        JavaValue::Null => Value::Null,
-        JavaValue::String(id, s) => Value::String(id, s),
-        JavaValue::Integer(id, v) => Value::Integer(id, v),
-        JavaValue::Long(id, v) => Value::BoxedLong(id, v),
-        JavaValue::Double(id, v) => Value::BoxedDouble(id, v),
-        JavaValue::Float(id, v) => Value::BoxedFloat(id, v),
-        JavaValue::Short(id, v) => Value::BoxedShort(id, v),
-        JavaValue::Byte(id, v) => Value::BoxedByte(id, v),
-        JavaValue::Boolean(id, v) => Value::BoxedBoolean(id, v),
-        JavaValue::Character(id, v) => Value::BoxedCharacter(id, v),
-        JavaValue::Object(id) => Value::Object(id),
+        crate::heap_parser::FieldValue::Object(id) => query.resolve_value(id),
     }
 }
 
@@ -721,265 +830,104 @@ fn java_value_to_value(jv: JavaValue) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::array_index::build_array_size_indexes;
-    use crate::aux_index::{
-        build_end_thread_index, build_frame_index, build_start_thread_index, build_trace_index,
-        build_unload_class_index,
-    };
-    use crate::heap_index::index_heap_dumps;
-    use crate::heap_parser::SubRecord;
-    use crate::heap_query::build_name_indexes;
-    use crate::object_store::combine_sort_and_split;
-    use crate::record_index::index_hprof;
-    use crate::ref_index::build_reference_index;
-    use crate::vfs::SubIndexDir;
+    use crate::heap_parser::{FieldValue, SubRecord};
+    use crate::test_util::{ClassSpec, HprofBuilder, build_in_memory, standard_heap, ty};
 
-    // ── Minimal hprof builder ─────────────────────────────────────────────────
-
-    fn write_record(buf: &mut Vec<u8>, tag: u8, body: &[u8]) {
-        buf.push(tag);
-        buf.extend_from_slice(&0u32.to_be_bytes());
-        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        buf.extend_from_slice(body);
+    fn query() -> HeapQuery {
+        build_in_memory(&standard_heap())
     }
 
-    /// Build a minimal hprof with:
-    ///
-    /// - UTF8(1,"count"), UTF8(2,"java/lang/Object"), UTF8(3,"java/lang/Integer"),
-    ///   UTF8(4,"value"), UTF8(5,"myField"), UTF8(6,"java/lang/String"),
-    ///   UTF8(7,"[C"), UTF8(8,"java/util/ArrayList")
-    /// - LOAD_CLASS for Integer (0x10), Object (0x20), String (0x30),
-    ///   char[] (0x40), ArrayList (0x50)
-    /// - HEAP_DUMP_SEGMENT:
-    ///   CLASS_DUMP(0x10 = Integer, super=0x20, 1 int field "value")
-    ///   CLASS_DUMP(0x20 = Object, super=0, 0 fields)
-    ///   CLASS_DUMP(0x30 = String, super=0x20, 1 obj field "value" → char[])
-    ///   CLASS_DUMP(0x40 = char[], super=0x20, 0 instance fields)
-    ///   CLASS_DUMP(0x50 = ArrayList, super=0x20,
-    ///   static: "count"(int)=7,
-    ///   instance: "myField"(obj))
-    ///   INSTANCE_DUMP(0x100, class=0x10, data=int(42))    -- Integer(42)
-    ///   PRIM_ARRAY_DUMP(0x200, type=char, "hi")           -- char[] backing String
-    ///   INSTANCE_DUMP(0x300, class=0x30, value→0x200)      -- String "hi"
-    ///   INSTANCE_DUMP(0x400, class=0x50, myField→0x100)   -- ArrayList{myField=Integer(42)}
-    fn build_test_hprof() -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"JAVA PROFILE 1.0.2\0");
-        buf.extend_from_slice(&8u32.to_be_bytes()); // id_size = 8
-        buf.extend_from_slice(&0u64.to_be_bytes());
+    #[test]
+    fn search_strings_finds_matching_strings() {
+        use crate::search::SearchQuery;
+        use crate::test_util::std_ids::STRING_HI;
+        let q = query();
+        let m = Matcher::new(&SearchQuery::regex("^h.$")).unwrap();
+        let r = q.search_strings(&m, ScanWindow::first()).unwrap();
+        assert_eq!(r.total, 1);
+        assert_eq!(r.scanned, 1);
+        assert_eq!(r.next_cursor, None);
+        assert_eq!(r.items.len(), 1);
+        assert_eq!(r.items[0].object_id, STRING_HI);
+        assert_eq!(r.items[0].length_chars, 2);
+        assert_eq!(r.items[0].preview, "hi");
 
-        let utf8 = |buf: &mut Vec<u8>, id: u64, s: &[u8]| {
-            let mut body = Vec::new();
-            body.extend_from_slice(&id.to_be_bytes());
-            body.extend_from_slice(s);
-            write_record(buf, 0x01, &body);
-        };
-        utf8(&mut buf, 1, b"count");
-        utf8(&mut buf, 2, b"java/lang/Object");
-        utf8(&mut buf, 3, b"java/lang/Integer");
-        utf8(&mut buf, 4, b"value");
-        utf8(&mut buf, 5, b"myField");
-        utf8(&mut buf, 6, b"java/lang/String");
-        utf8(&mut buf, 7, b"[C");
-        utf8(&mut buf, 8, b"java/util/ArrayList");
+        let miss = Matcher::new(&SearchQuery::contains("bye")).unwrap();
+        assert!(
+            q.search_strings(&miss, ScanWindow::first())
+                .unwrap()
+                .items
+                .is_empty()
+        );
 
-        let load_class = |buf: &mut Vec<u8>, serial: u32, class_id: u64, name_id: u64| {
-            let mut body = Vec::new();
-            body.extend_from_slice(&serial.to_be_bytes());
-            body.extend_from_slice(&class_id.to_be_bytes());
-            body.extend_from_slice(&0u32.to_be_bytes());
-            body.extend_from_slice(&name_id.to_be_bytes());
-            write_record(buf, 0x02, &body);
-        };
-        load_class(&mut buf, 1, 0x10, 3); // Integer
-        load_class(&mut buf, 2, 0x20, 2); // Object
-        load_class(&mut buf, 3, 0x30, 6); // String
-        load_class(&mut buf, 4, 0x40, 7); // char[]
-        load_class(&mut buf, 5, 0x50, 8); // ArrayList
-
-        let mut seg = Vec::new();
-
-        // ── CLASS_DUMP(0x10 = Integer, super=0x20, 1 int field "value") ──
-        seg.push(0x20u8);
-        seg.extend_from_slice(&0x10u64.to_be_bytes()); // class_id
-        seg.extend_from_slice(&0u32.to_be_bytes()); // stack_serial
-        seg.extend_from_slice(&0x20u64.to_be_bytes()); // super
-        seg.extend_from_slice(&[0u8; 8 * 5]); // loader+..
-        seg.extend_from_slice(&4u32.to_be_bytes()); // instance_size
-        seg.extend_from_slice(&0u16.to_be_bytes()); // cp_count
-        seg.extend_from_slice(&0u16.to_be_bytes()); // statics_count
-        seg.extend_from_slice(&1u16.to_be_bytes()); // instance_fields_count
-        seg.extend_from_slice(&4u64.to_be_bytes()); // name_id=4 ("value")
-        seg.push(10u8); // type = int
-
-        // ── CLASS_DUMP(0x20 = Object, super=0) ──
-        seg.push(0x20u8);
-        seg.extend_from_slice(&0x20u64.to_be_bytes());
-        seg.extend_from_slice(&0u32.to_be_bytes());
-        seg.extend_from_slice(&0u64.to_be_bytes()); // no super
-        seg.extend_from_slice(&[0u8; 8 * 5]);
-        seg.extend_from_slice(&0u32.to_be_bytes());
-        seg.extend_from_slice(&0u16.to_be_bytes());
-        seg.extend_from_slice(&0u16.to_be_bytes());
-        seg.extend_from_slice(&0u16.to_be_bytes());
-
-        // ── CLASS_DUMP(0x30 = String, super=0x20, 1 obj field "value") ──
-        seg.push(0x20u8);
-        seg.extend_from_slice(&0x30u64.to_be_bytes());
-        seg.extend_from_slice(&0u32.to_be_bytes());
-        seg.extend_from_slice(&0x20u64.to_be_bytes()); // super = Object
-        seg.extend_from_slice(&[0u8; 8 * 5]);
-        seg.extend_from_slice(&8u32.to_be_bytes()); // instance_size = 8 (one id)
-        seg.extend_from_slice(&0u16.to_be_bytes()); // cp_count
-        seg.extend_from_slice(&0u16.to_be_bytes()); // statics_count
-        seg.extend_from_slice(&1u16.to_be_bytes()); // instance_fields_count
-        seg.extend_from_slice(&4u64.to_be_bytes()); // name_id=4 ("value")
-        seg.push(2u8); // type = object
-
-        // ── CLASS_DUMP(0x40 = char[], super=0x20, 0 fields) ──
-        seg.push(0x20u8);
-        seg.extend_from_slice(&0x40u64.to_be_bytes());
-        seg.extend_from_slice(&0u32.to_be_bytes());
-        seg.extend_from_slice(&0x20u64.to_be_bytes());
-        seg.extend_from_slice(&[0u8; 8 * 5]);
-        seg.extend_from_slice(&0u32.to_be_bytes());
-        seg.extend_from_slice(&0u16.to_be_bytes());
-        seg.extend_from_slice(&0u16.to_be_bytes());
-        seg.extend_from_slice(&0u16.to_be_bytes());
-
-        // ── CLASS_DUMP(0x50 = ArrayList, super=0x20) ──
-        //    static: "count" (int) = 7
-        //    instance: "myField" (object)
-        seg.push(0x20u8);
-        seg.extend_from_slice(&0x50u64.to_be_bytes());
-        seg.extend_from_slice(&0u32.to_be_bytes());
-        seg.extend_from_slice(&0x20u64.to_be_bytes()); // super = Object
-        seg.extend_from_slice(&[0u8; 8 * 5]);
-        seg.extend_from_slice(&8u32.to_be_bytes()); // instance_size = 8 (one id)
-        seg.extend_from_slice(&0u16.to_be_bytes()); // cp_count = 0
-        seg.extend_from_slice(&1u16.to_be_bytes()); // statics_count = 1
-        // static field: name_id=1 ("count"), type=int(10), value=7
-        seg.extend_from_slice(&1u64.to_be_bytes()); // name_id
-        seg.push(10u8); // type = int
-        seg.extend_from_slice(&7i32.to_be_bytes()); // value = 7
-        seg.extend_from_slice(&1u16.to_be_bytes()); // instance_fields_count = 1
-        // instance field: name_id=5 ("myField"), type=object(2)
-        seg.extend_from_slice(&5u64.to_be_bytes()); // name_id
-        seg.push(2u8); // type = object
-
-        // ── INSTANCE_DUMP(0x100, class=0x10 Integer, data=42) ──
-        seg.push(0x21u8);
-        seg.extend_from_slice(&0x100u64.to_be_bytes()); // object_id
-        seg.extend_from_slice(&0u32.to_be_bytes());
-        seg.extend_from_slice(&0x10u64.to_be_bytes()); // class_id = Integer
-        seg.extend_from_slice(&4u32.to_be_bytes()); // data_len = 4
-        seg.extend_from_slice(&42i32.to_be_bytes()); // value = 42
-
-        // ── PRIM_ARRAY_DUMP(0x200, type=char, ['h','i']) ──
-        seg.push(0x23u8);
-        seg.extend_from_slice(&0x200u64.to_be_bytes()); // array_id
-        seg.extend_from_slice(&0u32.to_be_bytes()); // stack_serial
-        seg.extend_from_slice(&2u32.to_be_bytes()); // num_elements = 2
-        seg.push(5u8); // element_type = char
-        seg.extend_from_slice(&('h' as u16).to_be_bytes());
-        seg.extend_from_slice(&('i' as u16).to_be_bytes());
-
-        // ── INSTANCE_DUMP(0x300, class=0x30 String, value→0x200) ──
-        seg.push(0x21u8);
-        seg.extend_from_slice(&0x300u64.to_be_bytes()); // object_id
-        seg.extend_from_slice(&0u32.to_be_bytes());
-        seg.extend_from_slice(&0x30u64.to_be_bytes()); // class_id = String
-        seg.extend_from_slice(&8u32.to_be_bytes()); // data_len = 8 (one id)
-        seg.extend_from_slice(&0x200u64.to_be_bytes()); // value field → char[] 0x200
-
-        // ── INSTANCE_DUMP(0x400, class=0x50 ArrayList, myField→0x100) ──
-        seg.push(0x21u8);
-        seg.extend_from_slice(&0x400u64.to_be_bytes()); // object_id
-        seg.extend_from_slice(&0u32.to_be_bytes());
-        seg.extend_from_slice(&0x50u64.to_be_bytes()); // class_id = ArrayList
-        seg.extend_from_slice(&8u32.to_be_bytes()); // data_len = 8 (one id)
-        seg.extend_from_slice(&0x100u64.to_be_bytes()); // myField → Integer 0x100
-
-        write_record(&mut buf, 0x1C, &seg); // HEAP_DUMP_SEGMENT
-        buf
+        let fuzzy = Matcher::new(&SearchQuery::fuzzy("hi")).unwrap();
+        assert!(matches!(
+            q.search_strings(&fuzzy, ScanWindow::first()),
+            Err(HprofError::InvalidArgument(_))
+        ));
     }
 
-    /// Build all indexes and return a [`HeapQuery`] entirely in memory.
-    fn build_query(hprof_data: &[u8]) -> HeapQuery {
-        let hprof = hprof_data.to_vec();
-        let mut p1 = Vec::new();
-        let p2d = SubIndexDir::mem();
-        let mut p4 = Vec::new();
-        let mut utf8 = Vec::new();
-        let mut lc = Vec::new();
-        let mut frames = Vec::new();
-        let mut traces = Vec::new();
-        let mut st = Vec::new();
-        let mut et = Vec::new();
-        let mut uc = Vec::new();
-        let mut refs = Vec::new();
-        // 9 separate root buffers (one per GC root type in canonical order).
-        let mut r0: Vec<u8> = Vec::new();
-        let mut r1: Vec<u8> = Vec::new();
-        let mut r2: Vec<u8> = Vec::new();
-        let mut r3: Vec<u8> = Vec::new();
-        let mut r4: Vec<u8> = Vec::new();
-        let mut r5: Vec<u8> = Vec::new();
-        let mut r6: Vec<u8> = Vec::new();
-        let mut r7: Vec<u8> = Vec::new();
-        let mut r8: Vec<u8> = Vec::new();
-        let mut arrays: [Vec<u8>; 9] = std::array::from_fn(|_| Vec::new());
+    #[test]
+    fn search_strings_resumes_from_the_cursor_and_stops_at_max_results() {
+        use crate::search::SearchQuery;
+        const STRING_CLASS: u64 = 0x10;
+        let mut b = HprofBuilder::new(8)
+            .utf8(1, "value")
+            .utf8(2, "java/lang/String")
+            .load_class(1, STRING_CLASS, 2)
+            .class_dump(
+                ClassSpec::new(STRING_CLASS)
+                    .instance_size(8)
+                    .field(1, ty::OBJECT),
+            );
+        for i in 0..30u64 {
+            let text = if i % 10 == 5 {
+                format!("needle {i}")
+            } else {
+                format!("s-{i:02}")
+            };
+            b = b.char_array(0x1000 + i, &text).instance_values(
+                0x2000 + i,
+                STRING_CLASS,
+                &[FieldValue::Object(0x1000 + i)],
+            );
+        }
+        let q = build_in_memory(&b.build());
+        let m = Matcher::new(&SearchQuery::contains("NEEDLE")).unwrap();
 
-        index_hprof(&hprof, &mut p1).unwrap();
-        index_heap_dumps(&hprof, &p1, &p2d).unwrap();
+        // Two windows of 10: the first finds string 5, the second string 15.
+        let window = ScanWindow::new(0, 10, 20);
+        let first = q.search_strings(&m, window).unwrap();
+        assert_eq!(first.total, 30);
+        assert_eq!(first.scanned, 10);
+        assert_eq!(first.next_cursor, Some(10));
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.items[0].object_id, 0x2005);
+        let second = q
+            .search_strings(&m, first.next_window(window).unwrap())
+            .unwrap();
+        assert_eq!(second.items[0].object_id, 0x200f);
+        assert_eq!(second.next_cursor, Some(20));
 
-        combine_sort_and_split(
-            &p2d,
-            &mut p4,
-            &mut [
-                &mut r0, &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7, &mut r8,
-            ],
-        )
-        .unwrap();
+        // max_results stops the scan early, and the cursor points just past
+        // the last string examined.
+        let capped = q.search_strings(&m, ScanWindow::new(0, 30, 1)).unwrap();
+        assert_eq!(capped.items.len(), 1);
+        assert_eq!(capped.scanned, 6);
+        assert_eq!(capped.next_cursor, Some(6));
 
-        build_name_indexes(&hprof, &p1, &mut utf8, &mut lc).unwrap();
-        build_reference_index(&hprof, &p4, &utf8, &lc, &mut refs).unwrap();
-        build_frame_index(&hprof, &p1, &mut frames).unwrap();
-        build_trace_index(&hprof, &p1, &mut traces).unwrap();
-        build_start_thread_index(&hprof, &p1, &mut st).unwrap();
-        build_end_thread_index(&hprof, &p1, &mut et).unwrap();
-        build_unload_class_index(&hprof, &p1, &mut uc).unwrap();
-
-        build_array_size_indexes(&hprof, &p4, &mut arrays).unwrap();
-
-        HeapQuery::from_sources(
-            &hprof,
-            &p4,
-            &utf8,
-            &lc,
-            &frames,
-            &traces,
-            &st,
-            &et,
-            &uc,
-            &refs,
-            [&r0, &r1, &r2, &r3, &r4, &r5, &r6, &r7, &r8],
-            [
-                &arrays[0], &arrays[1], &arrays[2], &arrays[3], &arrays[4], &arrays[5], &arrays[6],
-                &arrays[7], &arrays[8],
-            ],
-        )
-        .unwrap()
+        // The last window reaches the end.
+        let last = q.search_strings(&m, ScanWindow::new(20, 100, 20)).unwrap();
+        assert_eq!(last.next_cursor, None);
+        assert_eq!(last.items[0].object_id, 0x2019);
     }
 
     // ── ResolvedInstance tests ────────────────────────────────────────────────
 
     #[test]
     fn resolved_instance_class_name() {
-        let query = build_query(&build_test_hprof());
-        let SubRecord::InstanceDump(inst) = query.find_instance(0x400).unwrap().unwrap() else {
-            panic!("expected InstanceDump");
-        };
+        let query = query();
+        let inst = query.instance(0x400).unwrap().unwrap();
         let resolved = ResolvedInstance::from_dump(&query, &inst).unwrap();
         assert_eq!(resolved.object_id, 0x400);
         assert_eq!(resolved.class_name, "java.util.ArrayList");
@@ -987,13 +935,10 @@ mod tests {
 
     #[test]
     fn resolved_instance_primitive_field() {
-        let query = build_query(&build_test_hprof());
-        let SubRecord::InstanceDump(inst) = query.find_instance(0x100).unwrap().unwrap() else {
-            panic!("expected InstanceDump");
-        };
+        let query = query();
+        let inst = query.instance(0x100).unwrap().unwrap();
         let resolved = ResolvedInstance::from_dump(&query, &inst).unwrap();
         assert_eq!(resolved.class_name, "java.lang.Integer");
-        // Integer has one int field "value" = 42 (stored directly as Int)
         assert_eq!(resolved.fields.len(), 1);
         assert_eq!(resolved.fields[0].name, "value");
         assert_eq!(resolved.fields[0].value, Value::Int(42));
@@ -1001,49 +946,32 @@ mod tests {
 
     #[test]
     fn resolved_instance_object_field_resolved_to_integer() {
-        let query = build_query(&build_test_hprof());
-        let SubRecord::InstanceDump(inst) = query.find_instance(0x400).unwrap().unwrap() else {
-            panic!("expected InstanceDump");
-        };
+        let query = query();
+        let inst = query.instance(0x400).unwrap().unwrap();
         let resolved = ResolvedInstance::from_dump(&query, &inst).unwrap();
-        // ArrayList.myField → Integer(0x100, 42)
         assert_eq!(resolved.fields.len(), 1);
         assert_eq!(resolved.fields[0].name, "myField");
-        assert_eq!(resolved.fields[0].value, Value::Integer(0x100, 42));
+        assert_eq!(resolved.fields[0].value, Value::BoxedInt(0x100, 42));
     }
 
     #[test]
     fn resolved_instance_string_field() {
-        let query = build_query(&build_test_hprof());
-        let SubRecord::InstanceDump(inst) = query.find_instance(0x300).unwrap().unwrap() else {
-            panic!("expected InstanceDump");
-        };
+        let query = query();
+        let inst = query.instance(0x300).unwrap().unwrap();
         let resolved = ResolvedInstance::from_dump(&query, &inst).unwrap();
         assert_eq!(resolved.class_name, "java.lang.String");
-        // String.value is the char[] backing array (0x200 — a PRIM_ARRAY_DUMP).
-        // resolve_value(0x200) cannot unwrap a prim array as a String; it returns
-        // Value::Object.  String resolution happens at the STRING INSTANCE level
-        // (0x300), not the char-array level.
+        // String.value is the char[] backing array (a PRIM_ARRAY_DUMP), which
+        // resolve_value cannot unwrap on its own; String resolution happens at
+        // the String instance level, not the char-array level.
         assert_eq!(resolved.fields.len(), 1);
         assert_eq!(resolved.fields[0].name, "value");
         assert_eq!(resolved.fields[0].value, Value::Object(0x200));
     }
 
-    /// When an object field in some other instance points to a String INSTANCE,
-    /// resolve_value resolves it all the way to Value::String.
     #[test]
     fn object_field_pointing_to_string_instance_is_resolved() {
-        let query = build_query(&build_test_hprof());
-        // The ArrayList (0x400) has "myField" → Integer (0x100).
-        // Verify that a String INSTANCE (0x300) is resolved correctly when
-        // accessed via resolve_value directly (simulating a field reference).
-        let java_val = query.resolve_value(0x300).unwrap();
-        assert!(
-            matches!(java_val, crate::heap_query::JavaValue::String(0x300, ref s) if s == "hi"),
-            "expected String(0x300, \"hi\"), got {java_val:?}"
-        );
-        // And the corresponding Value conversion:
-        let value = super::java_value_to_value(java_val);
+        let query = query();
+        let value = query.resolve_value(0x300).unwrap();
         assert_eq!(value, Value::String(0x300, "hi".to_string()));
     }
 
@@ -1051,10 +979,8 @@ mod tests {
 
     #[test]
     fn resolved_class_names() {
-        let query = build_query(&build_test_hprof());
-        let SubRecord::ClassDump(cd) = query.find_class(0x50).unwrap().unwrap() else {
-            panic!("expected ClassDump");
-        };
+        let query = query();
+        let cd = query.class(0x50).unwrap().unwrap();
         let resolved = ResolvedClass::from_dump(&query, &cd).unwrap();
         assert_eq!(resolved.class_id, 0x50);
         assert_eq!(resolved.class_name, "java.util.ArrayList");
@@ -1066,10 +992,8 @@ mod tests {
 
     #[test]
     fn resolved_class_static_fields() {
-        let query = build_query(&build_test_hprof());
-        let SubRecord::ClassDump(cd) = query.find_class(0x50).unwrap().unwrap() else {
-            panic!("expected ClassDump");
-        };
+        let query = query();
+        let cd = query.class(0x50).unwrap().unwrap();
         let resolved = ResolvedClass::from_dump(&query, &cd).unwrap();
         assert_eq!(resolved.static_fields.len(), 1);
         assert_eq!(resolved.static_fields[0].name, "count");
@@ -1078,10 +1002,8 @@ mod tests {
 
     #[test]
     fn resolved_class_instance_field_descriptors() {
-        let query = build_query(&build_test_hprof());
-        let SubRecord::ClassDump(cd) = query.find_class(0x50).unwrap().unwrap() else {
-            panic!("expected ClassDump");
-        };
+        let query = query();
+        let cd = query.class(0x50).unwrap().unwrap();
         let resolved = ResolvedClass::from_dump(&query, &cd).unwrap();
         assert_eq!(resolved.instance_fields.len(), 1);
         assert_eq!(resolved.instance_fields[0].name, "myField");
@@ -1090,22 +1012,22 @@ mod tests {
 
     #[test]
     fn field_type_from_type_code() {
-        assert_eq!(FieldType::from_type_code(2), Some(FieldType::Object));
-        assert_eq!(FieldType::from_type_code(4), Some(FieldType::Bool));
-        assert_eq!(FieldType::from_type_code(10), Some(FieldType::Int));
-        assert_eq!(FieldType::from_type_code(11), Some(FieldType::Long));
-        assert_eq!(FieldType::from_type_code(99), None);
+        assert_eq!(FieldType::from_code(2), Some(FieldType::Object));
+        assert_eq!(FieldType::from_code(4), Some(FieldType::Boolean));
+        assert_eq!(FieldType::from_code(10), Some(FieldType::Int));
+        assert_eq!(FieldType::from_code(11), Some(FieldType::Long));
+        assert_eq!(FieldType::from_code(99), None);
     }
 
     // ── ResolvedPrimArray tests ───────────────────────────────────────────────
 
     #[test]
     fn resolved_prim_array_metadata() {
-        let query = build_query(&build_test_hprof());
-        let SubRecord::PrimArrayDump(arr) = query.find(0x200).unwrap().unwrap() else {
+        let query = query();
+        let SubRecord::PrimArrayDump(arr) = query.object(0x200).unwrap().unwrap() else {
             panic!("expected PrimArrayDump");
         };
-        let resolved = ResolvedPrimArray::from_dump(&query, &arr).unwrap();
+        let resolved = ResolvedPrimArray::from_dump(&arr).unwrap();
         assert_eq!(resolved.array_id, 0x200);
         assert_eq!(resolved.stack_trace_serial, 0);
         assert_eq!(resolved.num_elements, 2);
@@ -1113,45 +1035,25 @@ mod tests {
 
     #[test]
     fn resolved_prim_array_char_elements() {
-        let query = build_query(&build_test_hprof());
-        let SubRecord::PrimArrayDump(arr) = query.find(0x200).unwrap().unwrap() else {
+        let query = query();
+        let SubRecord::PrimArrayDump(arr) = query.object(0x200).unwrap().unwrap() else {
             panic!("expected PrimArrayDump");
         };
-        let resolved = ResolvedPrimArray::from_dump(&query, &arr).unwrap();
+        let resolved = ResolvedPrimArray::from_dump(&arr).unwrap();
         assert_eq!(
             resolved.elements,
-            PrimArrayElements::Char(vec!['h' as u16, 'i' as u16])
+            PrimArrayElements::Char(vec![u16::from(b'h'), u16::from(b'i')])
         );
     }
 
     #[test]
     fn resolved_prim_array_int_roundtrip() {
-        // Build a minimal hprof with a single int[] of [1, 2, 3].
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"JAVA PROFILE 1.0.2\0");
-        buf.extend_from_slice(&8u32.to_be_bytes()); // id_size = 8
-        buf.extend_from_slice(&0u64.to_be_bytes());
-
-        let mut seg = Vec::new();
-        seg.push(0x23u8); // PRIM_ARRAY_DUMP
-        seg.extend_from_slice(&0x500u64.to_be_bytes()); // array_id
-        seg.extend_from_slice(&0u32.to_be_bytes()); // stack_serial
-        seg.extend_from_slice(&3u32.to_be_bytes()); // num_elements = 3
-        seg.push(10u8); // element_type = int
-        seg.extend_from_slice(&1i32.to_be_bytes());
-        seg.extend_from_slice(&2i32.to_be_bytes());
-        seg.extend_from_slice(&3i32.to_be_bytes());
-
-        buf.push(0x1Cu8); // HEAP_DUMP_SEGMENT
-        buf.extend_from_slice(&0u32.to_be_bytes());
-        buf.extend_from_slice(&(seg.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&seg);
-
-        let query = build_query(&buf);
-        let SubRecord::PrimArrayDump(arr) = query.find(0x500).unwrap().unwrap() else {
+        let hprof = HprofBuilder::new(8).int_array(0x500, &[1, 2, 3]).build();
+        let query = build_in_memory(&hprof);
+        let SubRecord::PrimArrayDump(arr) = query.object(0x500).unwrap().unwrap() else {
             panic!("expected PrimArrayDump");
         };
-        let resolved = ResolvedPrimArray::from_dump(&query, &arr).unwrap();
+        let resolved = ResolvedPrimArray::from_dump(&arr).unwrap();
         assert_eq!(resolved.num_elements, 3);
         assert_eq!(resolved.elements, PrimArrayElements::Int(vec![1, 2, 3]));
     }
@@ -1159,324 +1061,349 @@ mod tests {
     #[test]
     fn resolved_prim_array_unknown_type_error() {
         let data = &[0u8; 4];
-        let result = super::parse_prim_elements(data, 99, 1);
+        let result = super::parse_prim_window(data, 99, 0, 1);
         assert!(matches!(result, Err(HprofError::UnknownPrimitiveType(99))));
     }
 
     // ── ResolvedObjArray tests ────────────────────────────────────────────────
 
-    /// Build a minimal hprof with:
-    /// - UTF8(1,"java/lang/Integer"), UTF8(2,"value"), UTF8(3,"java/lang/Object")
-    /// - LOAD_CLASS(0x10=Integer, name_id=1), LOAD_CLASS(0x20=Object, name_id=3)
-    /// - HEAP_DUMP_SEGMENT:
-    ///   CLASS_DUMP(0x10=Integer, super=0x20, 1 int field "value")
-    ///   CLASS_DUMP(0x20=Object, super=0)
-    ///   INSTANCE_DUMP(0x100, class=0x10, value=99)
-    ///   OBJ_ARRAY_DUMP(0x200, elem_class=0x10, elements=[0x100, 0])
-    fn build_obj_array_hprof() -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"JAVA PROFILE 1.0.2\0");
-        buf.extend_from_slice(&8u32.to_be_bytes());
-        buf.extend_from_slice(&0u64.to_be_bytes());
-
-        let utf8 = |buf: &mut Vec<u8>, id: u64, s: &[u8]| {
-            let mut body = Vec::new();
-            body.extend_from_slice(&id.to_be_bytes());
-            body.extend_from_slice(s);
-            buf.push(0x01);
-            buf.extend_from_slice(&0u32.to_be_bytes());
-            buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
-            buf.extend_from_slice(&body);
-        };
-        utf8(&mut buf, 1, b"java/lang/Integer");
-        utf8(&mut buf, 2, b"value");
-        utf8(&mut buf, 3, b"java/lang/Object");
-
-        let load_class = |buf: &mut Vec<u8>, serial: u32, class_id: u64, name_id: u64| {
-            let mut body = Vec::new();
-            body.extend_from_slice(&serial.to_be_bytes());
-            body.extend_from_slice(&class_id.to_be_bytes());
-            body.extend_from_slice(&0u32.to_be_bytes());
-            body.extend_from_slice(&name_id.to_be_bytes());
-            buf.push(0x02);
-            buf.extend_from_slice(&0u32.to_be_bytes());
-            buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
-            buf.extend_from_slice(&body);
-        };
-        load_class(&mut buf, 1, 0x10, 1); // Integer
-        load_class(&mut buf, 2, 0x20, 3); // Object
-
-        let mut seg = Vec::new();
-
-        // CLASS_DUMP(0x10=Integer, super=0x20, instance_size=4, 1 int field "value")
-        seg.push(0x20u8);
-        seg.extend_from_slice(&0x10u64.to_be_bytes());
-        seg.extend_from_slice(&0u32.to_be_bytes());
-        seg.extend_from_slice(&0x20u64.to_be_bytes());
-        seg.extend_from_slice(&[0u8; 8 * 5]);
-        seg.extend_from_slice(&4u32.to_be_bytes());
-        seg.extend_from_slice(&0u16.to_be_bytes()); // cp=0
-        seg.extend_from_slice(&0u16.to_be_bytes()); // statics=0
-        seg.extend_from_slice(&1u16.to_be_bytes()); // fields=1
-        seg.extend_from_slice(&2u64.to_be_bytes()); // name_id=2 "value"
-        seg.push(10u8); // int
-
-        // CLASS_DUMP(0x20=Object, super=0, no fields)
-        seg.push(0x20u8);
-        seg.extend_from_slice(&0x20u64.to_be_bytes());
-        seg.extend_from_slice(&0u32.to_be_bytes());
-        seg.extend_from_slice(&0u64.to_be_bytes());
-        seg.extend_from_slice(&[0u8; 8 * 5]);
-        seg.extend_from_slice(&0u32.to_be_bytes());
-        seg.extend_from_slice(&0u16.to_be_bytes());
-        seg.extend_from_slice(&0u16.to_be_bytes());
-        seg.extend_from_slice(&0u16.to_be_bytes());
-
-        // INSTANCE_DUMP(0x100, class=0x10 Integer, value=99)
-        seg.push(0x21u8);
-        seg.extend_from_slice(&0x100u64.to_be_bytes());
-        seg.extend_from_slice(&0u32.to_be_bytes());
-        seg.extend_from_slice(&0x10u64.to_be_bytes());
-        seg.extend_from_slice(&4u32.to_be_bytes());
-        seg.extend_from_slice(&99i32.to_be_bytes());
-
-        // OBJ_ARRAY_DUMP(0x200, elem_class=0x10, 2 elements: [0x100, 0])
-        seg.push(0x22u8);
-        seg.extend_from_slice(&0x200u64.to_be_bytes()); // array_id
-        seg.extend_from_slice(&0u32.to_be_bytes()); // stack_serial
-        seg.extend_from_slice(&2u32.to_be_bytes()); // num_elements
-        seg.extend_from_slice(&0x10u64.to_be_bytes()); // element_class_id
-        seg.extend_from_slice(&0x100u64.to_be_bytes()); // elem[0] → Integer(99)
-        seg.extend_from_slice(&0u64.to_be_bytes()); // elem[1] → null
-
-        buf.push(0x1Cu8); // HEAP_DUMP_SEGMENT
-        buf.extend_from_slice(&0u32.to_be_bytes());
-        buf.extend_from_slice(&(seg.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&seg);
-
-        buf
+    /// Integer(0x10 ⊂ Object 0x20); INSTANCE 0x100 = Integer(99);
+    /// OBJ_ARRAY 0x200 of Integer = [0x100, null].
+    fn obj_array_heap() -> Vec<u8> {
+        HprofBuilder::new(8)
+            .utf8(1, "java/lang/Integer")
+            .utf8(2, "value")
+            .utf8(3, "java/lang/Object")
+            .utf8(4, "[Ljava/lang/Integer;")
+            .load_class(1, 0x10, 1)
+            .load_class(2, 0x20, 3)
+            .load_class(3, 0x30, 4)
+            .class_dump(
+                ClassSpec::new(0x10)
+                    .super_class(0x20)
+                    .instance_size(4)
+                    .field(2, ty::INT),
+            )
+            .class_dump(ClassSpec::new(0x20))
+            .class_dump(ClassSpec::new(0x30))
+            .instance_values(0x100, 0x10, &[FieldValue::Int(99)])
+            .obj_array(0x200, 0x30, &[0x100, 0])
+            .build()
     }
 
     #[test]
     fn resolved_obj_array_metadata() {
-        let query = build_query(&build_obj_array_hprof());
-        let SubRecord::ObjArrayDump(arr) = query.find(0x200).unwrap().unwrap() else {
+        let query = build_in_memory(&obj_array_heap());
+        let SubRecord::ObjArrayDump(arr) = query.object(0x200).unwrap().unwrap() else {
             panic!("expected ObjArrayDump");
         };
         let resolved = ResolvedObjArray::from_dump(&query, &arr).unwrap();
         assert_eq!(resolved.array_id, 0x200);
         assert_eq!(resolved.num_elements, 2);
-        assert_eq!(resolved.element_class_name, "java.lang.Integer");
+        assert_eq!(resolved.array_class_id, 0x30);
+        assert_eq!(resolved.array_class_name, "[Ljava.lang.Integer;");
+        assert_eq!(
+            query.key_name(crate::class_key::ClassKey::ObjArray(0x30)),
+            "java.lang.Integer[]"
+        );
     }
 
     #[test]
     fn resolved_obj_array_elements_resolved() {
-        let query = build_query(&build_obj_array_hprof());
-        let SubRecord::ObjArrayDump(arr) = query.find(0x200).unwrap().unwrap() else {
+        let query = build_in_memory(&obj_array_heap());
+        let SubRecord::ObjArrayDump(arr) = query.object(0x200).unwrap().unwrap() else {
             panic!("expected ObjArrayDump");
         };
         let resolved = ResolvedObjArray::from_dump(&query, &arr).unwrap();
-        // elem[0] is Integer(0x100, 99), elem[1] is null
-        assert_eq!(resolved.elements[0], Value::Integer(0x100, 99));
+        assert_eq!(resolved.elements[0], Value::BoxedInt(0x100, 99));
         assert_eq!(resolved.elements[1], Value::Null);
     }
 
     // ── ResolvedRoot tests ────────────────────────────────────────────────────
     //
     // The raw root structs are constructed directly; HeapQuery is used only for
-    // object_type_name / class_name resolution against the existing test objects.
+    // object_type_name / class_name resolution against the fixture objects.
+
+    fn resolve_root(query: &HeapQuery, record: SubRecord<'_>) -> ResolvedRoot {
+        ResolvedRoot::from_sub_record(query, &record)
+            .unwrap()
+            .expect("a root record")
+    }
 
     #[test]
     fn resolved_root_unknown() {
-        let query = build_query(&build_test_hprof());
-        // 0x400 is java.util.ArrayList in the test hprof
+        let query = query();
         let root = crate::heap_parser::RootUnknown { object_id: 0x400 };
-        let resolved = ResolvedRoot::from_unknown(&query, &root).unwrap();
-        assert!(matches!(
-            resolved,
-            ResolvedRoot::Unknown {
-                object_id: 0x400,
-                ..
-            }
-        ));
-        if let ResolvedRoot::Unknown {
-            object_type_name, ..
+        let resolved = resolve_root(&query, SubRecord::RootUnknown(root));
+        let ResolvedRoot::Unknown {
+            object_id,
+            object_type_name,
         } = &resolved
-        {
-            assert_eq!(object_type_name, "java.util.ArrayList");
-        }
+        else {
+            panic!("expected Unknown");
+        };
+        assert_eq!(*object_id, 0x400);
+        assert_eq!(object_type_name, "java.util.ArrayList");
     }
 
     #[test]
     fn resolved_root_jni_global() {
-        let query = build_query(&build_test_hprof());
+        let query = query();
         let root = crate::heap_parser::RootJniGlobal {
             object_id: 0x100,
             jni_global_ref_id: 0xABCD,
         };
-        let resolved = ResolvedRoot::from_jni_global(&query, &root).unwrap();
-        if let ResolvedRoot::JniGlobal {
+        let resolved = resolve_root(&query, SubRecord::RootJniGlobal(root));
+        let ResolvedRoot::JniGlobal {
             object_id,
             jni_global_ref_id,
             object_type_name,
         } = &resolved
-        {
-            assert_eq!(*object_id, 0x100);
-            assert_eq!(*jni_global_ref_id, 0xABCD);
-            assert_eq!(object_type_name, "java.lang.Integer");
-        } else {
+        else {
             panic!("expected JniGlobal");
-        }
+        };
+        assert_eq!(*object_id, 0x100);
+        assert_eq!(*jni_global_ref_id, 0xABCD);
+        assert_eq!(object_type_name, "java.lang.Integer");
     }
 
     #[test]
     fn resolved_root_jni_local() {
-        let query = build_query(&build_test_hprof());
+        let query = query();
         let root = crate::heap_parser::RootJniLocal {
             object_id: 0x100,
             thread_serial: 1,
             frame_number: 2,
         };
-        let resolved = ResolvedRoot::from_jni_local(&query, &root).unwrap();
-        if let ResolvedRoot::JniLocal {
+        let resolved = resolve_root(&query, SubRecord::RootJniLocal(root));
+        let ResolvedRoot::JniLocal {
             thread_serial,
             frame_number,
             ..
         } = &resolved
-        {
-            assert_eq!(*thread_serial, 1);
-            assert_eq!(*frame_number, 2);
-        } else {
+        else {
             panic!("expected JniLocal");
-        }
+        };
+        assert_eq!(*thread_serial, 1);
+        assert_eq!(*frame_number, 2);
     }
 
     #[test]
     fn resolved_root_java_frame() {
-        let query = build_query(&build_test_hprof());
+        let query = query();
         let root = crate::heap_parser::RootJavaFrame {
             object_id: 0x100,
             thread_serial: 3,
             frame_number: 7,
         };
-        let resolved = ResolvedRoot::from_java_frame(&query, &root).unwrap();
-        if let ResolvedRoot::JavaFrame {
+        let resolved = resolve_root(&query, SubRecord::RootJavaFrame(root));
+        let ResolvedRoot::JavaFrame {
             thread_serial,
             frame_number,
             ..
         } = &resolved
-        {
-            assert_eq!(*thread_serial, 3);
-            assert_eq!(*frame_number, 7);
-        } else {
+        else {
             panic!("expected JavaFrame");
-        }
+        };
+        assert_eq!(*thread_serial, 3);
+        assert_eq!(*frame_number, 7);
     }
 
     #[test]
     fn resolved_root_native_stack() {
-        let query = build_query(&build_test_hprof());
+        let query = query();
         let root = crate::heap_parser::RootNativeStack {
             object_id: 0x400,
             thread_serial: 5,
         };
-        let resolved = ResolvedRoot::from_native_stack(&query, &root).unwrap();
-        if let ResolvedRoot::NativeStack {
+        let resolved = resolve_root(&query, SubRecord::RootNativeStack(root));
+        let ResolvedRoot::NativeStack {
             thread_serial,
             object_type_name,
             ..
         } = &resolved
-        {
-            assert_eq!(*thread_serial, 5);
-            assert_eq!(object_type_name, "java.util.ArrayList");
-        } else {
+        else {
             panic!("expected NativeStack");
-        }
+        };
+        assert_eq!(*thread_serial, 5);
+        assert_eq!(object_type_name, "java.util.ArrayList");
     }
 
     #[test]
     fn resolved_root_sticky_class() {
-        let query = build_query(&build_test_hprof());
-        // 0x10 is the Integer class in the test hprof
+        let query = query();
         let root = crate::heap_parser::RootStickyClass { class_id: 0x10 };
-        let resolved = ResolvedRoot::from_sticky_class(&query, &root).unwrap();
-        if let ResolvedRoot::StickyClass {
+        let resolved = resolve_root(&query, SubRecord::RootStickyClass(root));
+        let ResolvedRoot::StickyClass {
             class_id,
             class_name,
         } = &resolved
-        {
-            assert_eq!(*class_id, 0x10);
-            assert_eq!(class_name, "java.lang.Integer");
-        } else {
+        else {
             panic!("expected StickyClass");
-        }
+        };
+        assert_eq!(*class_id, 0x10);
+        assert_eq!(class_name, "java.lang.Integer");
     }
 
     #[test]
     fn resolved_root_thread_block() {
-        let query = build_query(&build_test_hprof());
+        let query = query();
         let root = crate::heap_parser::RootThreadBlock {
             object_id: 0x400,
             thread_serial: 9,
         };
-        let resolved = ResolvedRoot::from_thread_block(&query, &root).unwrap();
-        if let ResolvedRoot::ThreadBlock { thread_serial, .. } = &resolved {
-            assert_eq!(*thread_serial, 9);
-        } else {
+        let resolved = resolve_root(&query, SubRecord::RootThreadBlock(root));
+        let ResolvedRoot::ThreadBlock { thread_serial, .. } = &resolved else {
             panic!("expected ThreadBlock");
-        }
+        };
+        assert_eq!(*thread_serial, 9);
     }
 
     #[test]
     fn resolved_root_monitor_used() {
-        let query = build_query(&build_test_hprof());
+        let query = query();
         let root = crate::heap_parser::RootMonitorUsed { object_id: 0x300 };
-        let resolved = ResolvedRoot::from_monitor_used(&query, &root).unwrap();
-        if let ResolvedRoot::MonitorUsed {
+        let resolved = resolve_root(&query, SubRecord::RootMonitorUsed(root));
+        let ResolvedRoot::MonitorUsed {
             object_type_name, ..
         } = &resolved
-        {
-            assert_eq!(object_type_name, "java.lang.String");
-        } else {
+        else {
             panic!("expected MonitorUsed");
-        }
+        };
+        assert_eq!(object_type_name, "java.lang.String");
     }
 
     #[test]
     fn resolved_root_thread_obj() {
-        let query = build_query(&build_test_hprof());
+        let query = query();
         let root = crate::heap_parser::RootThreadObj {
             thread_object_id: 0x400,
             thread_serial: 2,
             stack_trace_serial: 42,
         };
-        let resolved = ResolvedRoot::from_thread_obj(&query, &root).unwrap();
-        if let ResolvedRoot::ThreadObj {
+        let resolved = resolve_root(&query, SubRecord::RootThreadObj(root));
+        let ResolvedRoot::ThreadObj {
             thread_serial,
             stack_trace_serial,
             ..
         } = &resolved
-        {
-            assert_eq!(*thread_serial, 2);
-            assert_eq!(*stack_trace_serial, 42);
-        } else {
+        else {
             panic!("expected ThreadObj");
-        }
+        };
+        assert_eq!(*thread_serial, 2);
+        assert_eq!(*stack_trace_serial, 42);
     }
 
     #[test]
     fn resolved_root_unknown_object_id_not_found_falls_back_to_object() {
-        let query = build_query(&build_test_hprof());
-        // Use an object_id that does not exist in the index.
+        let query = query();
         let root = crate::heap_parser::RootUnknown { object_id: 0xDEAD };
-        let resolved = ResolvedRoot::from_unknown(&query, &root).unwrap();
-        if let ResolvedRoot::Unknown {
+        let resolved = resolve_root(&query, SubRecord::RootUnknown(root));
+        let ResolvedRoot::Unknown {
             object_type_name, ..
         } = &resolved
-        {
-            assert_eq!(object_type_name, "Object");
-        } else {
+        else {
             panic!("expected Unknown");
-        }
+        };
+        assert_eq!(object_type_name, "Object");
+    }
+
+    // ── SubRecord::resolve ────────────────────────────────────────────────────
+
+    #[test]
+    fn sub_record_resolve_covers_every_object_kind() {
+        let query = query();
+        let inst = query
+            .object(0x400)
+            .unwrap()
+            .unwrap()
+            .resolve(&query)
+            .unwrap();
+        assert!(matches!(inst, Resolved::Instance(ref i) if i.class_name == "java.util.ArrayList"));
+        let class = query
+            .object(0x50)
+            .unwrap()
+            .unwrap()
+            .resolve(&query)
+            .unwrap();
+        assert!(matches!(class, Resolved::Class(_)));
+        let prim = query
+            .object(0x200)
+            .unwrap()
+            .unwrap()
+            .resolve(&query)
+            .unwrap();
+        assert!(matches!(prim, Resolved::PrimArray(_)));
+    }
+
+    #[test]
+    fn from_sub_record_ignores_non_roots_and_resolves_roots() {
+        let query = query();
+        let inst = query.object(0x400).unwrap().unwrap();
+        assert!(
+            ResolvedRoot::from_sub_record(&query, &inst)
+                .unwrap()
+                .is_none()
+        );
+        let root = SubRecord::RootUnknown(crate::heap_parser::RootUnknown { object_id: 0x400 });
+        assert!(matches!(
+            root.resolve(&query).unwrap(),
+            Resolved::Root(ResolvedRoot::Unknown {
+                object_id: 0x400,
+                ..
+            })
+        ));
+    }
+
+    // ── Windowed primitive arrays and strings ─────────────────────────────────
+
+    #[test]
+    fn prim_array_windows_are_clamped_and_report_more() {
+        use crate::query::Page;
+        let bytes = HprofBuilder::new(8)
+            .int_array(0x10, &[10, 20, 30, 40, 50])
+            .byte_array(0x20, &[1, 0xFF])
+            .build();
+        let heap = crate::test_util::build_in_memory(&bytes);
+
+        let w = heap.prim_array(0x10, Page::new(1, 2)).unwrap().unwrap();
+        assert_eq!(w.elements, PrimArrayElements::Int(vec![20, 30]));
+        assert_eq!((w.total, w.offset), (5, 1));
+        assert!(w.has_more());
+
+        let tail = heap.prim_array(0x10, Page::new(3, 100)).unwrap().unwrap();
+        assert_eq!(tail.elements, PrimArrayElements::Int(vec![40, 50]));
+        assert!(!tail.has_more());
+
+        let past = heap.prim_array(0x10, Page::new(99, 5)).unwrap().unwrap();
+        assert!(past.elements.is_empty());
+        assert_eq!(past.offset, 5);
+
+        let bytes = heap.prim_array(0x20, Page::first(10)).unwrap().unwrap();
+        assert_eq!(bytes.elements, PrimArrayElements::Byte(vec![1, -1]));
+        assert_eq!(bytes.element_type, BasicType::Byte);
+
+        // Not a primitive array / not present.
+        assert!(heap.prim_array(0x99, Page::first(1)).unwrap().is_none());
+    }
+
+    #[test]
+    fn prim_array_elements_render_as_text() {
+        let chars = PrimArrayElements::Char(vec![u16::from(b'h'), u16::from(b'i')]);
+        assert_eq!(chars.to_strings(true), ["'h'", "'i'"]);
+        assert_eq!(chars.to_strings(false), ["h", "i"]);
+        assert_eq!(
+            PrimArrayElements::Bool(vec![true, false]).to_strings(true),
+            ["true", "false"]
+        );
+        assert_eq!(PrimArrayElements::Long(vec![-5]).to_strings(true), ["-5"]);
+    }
+
+    #[test]
+    fn string_returns_text_only_for_strings() {
+        let heap = query();
+        assert_eq!(heap.string(0x300).unwrap().as_deref(), Some("hi"));
+        assert_eq!(heap.string(0x100).unwrap(), None);
+        assert_eq!(heap.string(0).unwrap(), None);
     }
 }

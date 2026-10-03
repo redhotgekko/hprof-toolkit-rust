@@ -1,5 +1,5 @@
 use crate::hprof::error::HprofError;
-use crate::hprof::record::{read_u16_be, read_u32_be, read_u64_be};
+use crate::hprof::record::{read_id, read_u16_be, read_u32_be};
 
 // ── Sub-record tag constants (HPROF_GC_* from heapDumper.cpp) ────────────────
 
@@ -62,6 +62,27 @@ impl SubIndexEntry {
             object_id,
             position,
         }
+    }
+}
+
+impl crate::index::Entry for SubIndexEntry {
+    const SIZE: usize = SUB_INDEX_ENTRY_SIZE;
+    const KEY_OFFSET: usize = 8;
+
+    fn from_bytes(b: &[u8]) -> Self {
+        Self {
+            tag: b[0],
+            object_id: crate::index::read_u64_le(b, 8),
+            position: crate::index::read_u64_le(b, 16),
+        }
+    }
+
+    fn write_to(&self, out: &mut [u8]) {
+        out.copy_from_slice(&self.to_bytes());
+    }
+
+    fn key(&self) -> u64 {
+        self.object_id
     }
 }
 
@@ -174,7 +195,7 @@ pub fn sub_record_size(body: &[u8], pos: usize, id_size: usize) -> Result<usize,
             1 + id + 4 + id + 4 + read_u32_be(body, data_len_off) as usize
         }
 
-        // OBJ_ARRAY_DUMP: subtag + array_id + stack_serial(u32) + num_elements(u32) + elem_class_id + elements
+        // OBJ_ARRAY_DUMP: subtag + array_id + stack_serial(u32) + num_elements(u32) + array_class_id + elements
         TAG_OBJ_ARRAY_DUMP => {
             let num_off = pos + 1 + id + 4;
             if num_off + 4 > body.len() {
@@ -279,37 +300,7 @@ fn class_dump_size(body: &[u8], pos: usize, id_size: usize) -> Result<usize, Hpr
 ///   2=object(id_size), 4=bool(1), 5=char(2), 6=float(4), 7=double(8),
 ///   8=byte(1), 9=short(2), 10=int(4), 11=long(8)
 pub fn value_size(type_id: u8, id_size: usize) -> Result<usize, HprofError> {
-    match type_id {
-        2 => Ok(id_size),
-        4 => Ok(1),
-        5 => Ok(2),
-        6 => Ok(4),
-        7 => Ok(8),
-        8 => Ok(1),
-        9 => Ok(2),
-        10 => Ok(4),
-        11 => Ok(8),
-        other => Err(HprofError::UnknownPrimitiveType(other)),
-    }
-}
-
-/// Read an id-sized value at `offset` within `data`, zero-extending to u64.
-fn read_id(data: &[u8], offset: usize, id_size: usize) -> Result<u64, HprofError> {
-    match id_size {
-        4 => {
-            if offset + 4 > data.len() {
-                return Err(HprofError::UnexpectedEof(offset));
-            }
-            Ok(read_u32_be(data, offset) as u64)
-        }
-        8 => {
-            if offset + 8 > data.len() {
-                return Err(HprofError::UnexpectedEof(offset));
-            }
-            Ok(read_u64_be(data, offset))
-        }
-        _ => Err(HprofError::InvalidIdSize(id_size as u32)),
-    }
+    Ok(crate::hprof::BasicType::from_code_or_err(type_id)?.size(id_size))
 }
 
 #[cfg(test)]

@@ -27,24 +27,35 @@ impl IndexEntry {
         buf[8..16].copy_from_slice(&self.position.to_le_bytes());
         buf
     }
+}
 
-    pub fn from_bytes(bytes: &[u8; INDEX_ENTRY_SIZE]) -> Self {
-        let tag = bytes[0];
-        let body_length = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-        let position = u64::from_le_bytes([
-            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
-        ]);
+/// Record-index entries are unsorted (hprof record order); the key is the
+/// file position, which is at least strictly increasing.
+impl crate::index::Entry for IndexEntry {
+    const SIZE: usize = INDEX_ENTRY_SIZE;
+    const KEY_OFFSET: usize = 8;
+
+    fn from_bytes(b: &[u8]) -> Self {
         Self {
-            tag,
-            body_length,
-            position,
+            tag: b[0],
+            body_length: crate::index::read_u32_le(b, 4),
+            position: crate::index::read_u64_le(b, 8),
         }
+    }
+
+    fn write_to(&self, out: &mut [u8]) {
+        out.copy_from_slice(&self.to_bytes());
+    }
+
+    fn key(&self) -> u64 {
+        self.position
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::Entry;
 
     #[test]
     fn round_trip() {

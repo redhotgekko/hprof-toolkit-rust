@@ -1,53 +1,20 @@
 //! Field value and wrapper type resolution helpers.
 
 use crate::heap_parser::FieldValue;
-use crate::hprof::HprofError;
 use crate::hprof::record::{read_u16_be, read_u32_be, read_u64_be};
+use crate::hprof::{BasicType, HprofError};
 
-// ── ResolvedField ─────────────────────────────────────────────────────────────
+// ── Field ─────────────────────────────────────────────────────────────────────
 
-/// A single instance field with its resolved name and raw hprof value.
-#[derive(Debug, Clone)]
-pub struct ResolvedField {
+/// A single instance field with its resolved name and raw value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Field {
     /// Field name (from the UTF-8 name index).
     pub name: String,
-    /// hprof type code (2=object, 4=bool, 5=char, 6=float, 7=double,
-    /// 8=byte, 9=short, 10=int, 11=long).
-    pub field_type: u8,
+    /// Declared type of the field.
+    pub ty: BasicType,
     /// Raw field value parsed from the instance data bytes.
     pub value: FieldValue,
-}
-
-// ── JavaValue ─────────────────────────────────────────────────────────────────
-
-/// A Java value, potentially unwrapping common Java wrapper types.
-///
-/// The first element of each tuple is always the `object_id` of the wrapper
-/// instance, preserving the link back to the original heap object.
-#[derive(Debug, Clone)]
-pub enum JavaValue {
-    /// `java.lang.String` instance: `(object_id, string_content)`.
-    String(u64, std::string::String),
-    /// `java.lang.Boolean` instance: `(object_id, value)`.
-    Boolean(u64, bool),
-    /// `java.lang.Byte` instance: `(object_id, value)`.
-    Byte(u64, i8),
-    /// `java.lang.Short` instance: `(object_id, value)`.
-    Short(u64, i16),
-    /// `java.lang.Character` instance: `(object_id, UTF-16 code unit)`.
-    Character(u64, u16),
-    /// `java.lang.Integer` instance: `(object_id, value)`.
-    Integer(u64, i32),
-    /// `java.lang.Long` instance: `(object_id, value)`.
-    Long(u64, i64),
-    /// `java.lang.Float` instance: `(object_id, value)`.
-    Float(u64, f32),
-    /// `java.lang.Double` instance: `(object_id, value)`.
-    Double(u64, f64),
-    /// Generic object reference (not a recognised wrapper type).
-    Object(u64),
-    /// Null reference (`object_id == 0`).
-    Null,
 }
 
 // ── Field-value parser ────────────────────────────────────────────────────────
@@ -61,75 +28,27 @@ pub fn read_field_value(
     field_type: u8,
     id_size: usize,
 ) -> Result<(FieldValue, usize), HprofError> {
-    match field_type {
-        2 => {
-            // Object reference
-            if offset + id_size > data.len() {
-                return Err(HprofError::UnexpectedEof(offset));
-            }
-            let id = match id_size {
-                4 => read_u32_be(data, offset) as u64,
-                8 => read_u64_be(data, offset),
-                _ => return Err(HprofError::InvalidIdSize(id_size as u32)),
-            };
-            Ok((FieldValue::Object(id), id_size))
-        }
-        4 => {
-            if offset + 1 > data.len() {
-                return Err(HprofError::UnexpectedEof(offset));
-            }
-            Ok((FieldValue::Bool(data[offset] != 0), 1))
-        }
-        5 => {
-            if offset + 2 > data.len() {
-                return Err(HprofError::UnexpectedEof(offset));
-            }
-            Ok((FieldValue::Char(read_u16_be(data, offset)), 2))
-        }
-        6 => {
-            if offset + 4 > data.len() {
-                return Err(HprofError::UnexpectedEof(offset));
-            }
-            Ok((
-                FieldValue::Float(f32::from_bits(read_u32_be(data, offset))),
-                4,
-            ))
-        }
-        7 => {
-            if offset + 8 > data.len() {
-                return Err(HprofError::UnexpectedEof(offset));
-            }
-            Ok((
-                FieldValue::Double(f64::from_bits(read_u64_be(data, offset))),
-                8,
-            ))
-        }
-        8 => {
-            if offset + 1 > data.len() {
-                return Err(HprofError::UnexpectedEof(offset));
-            }
-            Ok((FieldValue::Byte(data[offset] as i8), 1))
-        }
-        9 => {
-            if offset + 2 > data.len() {
-                return Err(HprofError::UnexpectedEof(offset));
-            }
-            Ok((FieldValue::Short(read_u16_be(data, offset) as i16), 2))
-        }
-        10 => {
-            if offset + 4 > data.len() {
-                return Err(HprofError::UnexpectedEof(offset));
-            }
-            Ok((FieldValue::Int(read_u32_be(data, offset) as i32), 4))
-        }
-        11 => {
-            if offset + 8 > data.len() {
-                return Err(HprofError::UnexpectedEof(offset));
-            }
-            Ok((FieldValue::Long(read_u64_be(data, offset) as i64), 8))
-        }
-        other => Err(HprofError::UnknownPrimitiveType(other)),
+    let ty = BasicType::from_code_or_err(field_type)?;
+    let len = ty.size(id_size);
+    if offset + len > data.len() {
+        return Err(HprofError::UnexpectedEof(offset));
     }
+    let value = match ty {
+        BasicType::Object => FieldValue::Object(match id_size {
+            4 => read_u32_be(data, offset) as u64,
+            8 => read_u64_be(data, offset),
+            _ => return Err(HprofError::InvalidIdSize(id_size as u32)),
+        }),
+        BasicType::Boolean => FieldValue::Bool(data[offset] != 0),
+        BasicType::Char => FieldValue::Char(read_u16_be(data, offset)),
+        BasicType::Float => FieldValue::Float(f32::from_bits(read_u32_be(data, offset))),
+        BasicType::Double => FieldValue::Double(f64::from_bits(read_u64_be(data, offset))),
+        BasicType::Byte => FieldValue::Byte(data[offset] as i8),
+        BasicType::Short => FieldValue::Short(read_u16_be(data, offset) as i16),
+        BasicType::Int => FieldValue::Int(read_u32_be(data, offset) as i32),
+        BasicType::Long => FieldValue::Long(read_u64_be(data, offset) as i64),
+    };
+    Ok((value, len))
 }
 
 // ── String decoding ───────────────────────────────────────────────────────────
@@ -145,8 +64,10 @@ pub fn decode_string_bytes(bytes: &[u8], coder: u8) -> std::string::String {
     } else {
         // UTF-16 big-endian.
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_be_bytes(*c))
             .collect();
         std::string::String::from_utf16_lossy(&units)
     }
@@ -155,8 +76,10 @@ pub fn decode_string_bytes(bytes: &[u8], coder: u8) -> std::string::String {
 /// Decode a `char[]` array (element_type = 5) stored as big-endian UTF-16.
 pub fn decode_char_array(bytes: &[u8]) -> std::string::String {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_be_bytes(*c))
         .collect();
     std::string::String::from_utf16_lossy(&units)
 }

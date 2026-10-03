@@ -1,25 +1,12 @@
 pub mod error;
 pub mod header;
 pub mod record;
+pub mod types;
 
 pub use error::HprofError;
 pub use header::HprofHeader;
 pub use record::{RecordHeader, RecordTag};
-
-use memmap2::Mmap;
-use std::fs::File;
-use std::path::Path;
-
-/// Open a file read-only and memory-map it.
-///
-/// Used by both `HprofFile::open` and the heap parser's `SubIndexReader`.
-#[allow(unsafe_code)]
-pub fn map_file(path: &Path) -> Result<Mmap, HprofError> {
-    let file = File::open(path)?;
-    // SAFETY: file opened read-only and not modified while mapped.
-    let mmap = unsafe { Mmap::map(&file) }?;
-    Ok(mmap)
-}
+pub use types::BasicType;
 
 /// A memory-mapped hprof file.
 ///
@@ -27,18 +14,31 @@ pub fn map_file(path: &Path) -> Result<Mmap, HprofError> {
 /// through the mmap slice — no heap dump content is loaded into memory.
 pub struct HprofFile<'a> {
     mmap: &'a [u8],
-    pub header: HprofHeader,
+    id_size: u32,
+    data_offset: usize,
 }
 
 impl<'a> HprofFile<'a> {
     pub fn from_ref(data: &'a [u8]) -> Result<Self, HprofError> {
         let header = HprofHeader::parse(data)?;
-        Ok(Self { mmap: data, header })
+        Ok(Self::from_parts(data, &header))
     }
 
-    /// Construct from pre-parsed header (avoids re-parsing on every access).
-    pub fn from_parts(data: &'a [u8], header: HprofHeader) -> Self {
-        Self { mmap: data, header }
+    /// Construct from a pre-parsed header (avoids re-parsing on every access).
+    ///
+    /// Copies only the two scalars the file needs, so this is free: it is
+    /// called for every object lookup.
+    pub fn from_parts(data: &'a [u8], header: &HprofHeader) -> Self {
+        Self {
+            mmap: data,
+            id_size: header.id_size,
+            data_offset: header.data_offset,
+        }
+    }
+
+    /// Identifier size in bytes (4 or 8).
+    pub fn id_size(&self) -> u32 {
+        self.id_size
     }
 
     /// Return the full file contents as a byte slice.
@@ -55,7 +55,7 @@ impl<'a> HprofFile<'a> {
     pub fn record_headers(&self) -> RecordHeaderIter<'_> {
         RecordHeaderIter {
             data: self.mmap,
-            pos: self.header.data_offset,
+            pos: self.data_offset,
         }
     }
 }

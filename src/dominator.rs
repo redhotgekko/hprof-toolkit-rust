@@ -15,22 +15,36 @@
 //!
 //! ## Memory usage
 //!
-//! Requires O(N + E) RAM where N is the number of heap objects and E is the
-//! total number of object references.  For production use on very large heap
-//! dumps (> 100 M objects), a file-backed implementation is recommended.
+//! This is the one build step whose private memory grows with the heap:
+//! O(N + E) where N is the number of heap objects and E the number of object
+//! references.  What is resident, by phase (N objects, E references):
+//!
+//! | Phase | Resident |
+//! |---|---|
+//! | CSR build, pass 1 | ≈ 24·N (per-chunk metadata, consumed and freed in order) |
+//! | CSR build, pass 2 + merge | 24·N + 4·E (the `(to, from)` pairs live in a scratch store entry, sorted on the store) |
+//! | after the build | 20·N + 4·E (ids, shallow sizes, offsets, edges) |
+//! | colouring + partition dominators | + up to ≈ 52·N + 8·E for the largest partition |
+//!
+//! [`estimate_memory_bytes`] turns that into a single conservative figure
+//! (`72·N + 12·E`, ≈ 20 % above the measured peak on a 767 MB dump) that the
+//! pipeline checks against available memory before starting; see
+//! [`check_memory`].  Beyond that only an out-of-core algorithm helps (plan
+//! task S6.1).
 
+use crate::class_layout::{
+    ClassCache, build_class_cache, count_instance_refs, for_each_instance_ref,
+};
 use crate::heap_index::sub_record::{
     SubIndexEntry, TAG_CLASS_DUMP, TAG_INSTANCE_DUMP, TAG_OBJ_ARRAY_DUMP, TAG_PRIM_ARRAY_DUMP,
 };
 use crate::heap_parser::record::FieldValue;
 use crate::heap_parser::{SubIndexReader, SubRecord, parse_sub_record};
-use crate::heap_query::resolve::read_field_value;
 use crate::hprof::{HprofError, HprofFile};
+use crate::index::{Entry, IndexStore, RecordFile, RecordWriter, names, read_u64_le};
 use crate::root_index::RootIndexReader;
-use crate::vfs::{MMapReader, MMapWriter};
 use rayon::prelude::*;
 use std::collections::VecDeque;
-use std::io::Write;
 
 // ── Entry format ──────────────────────────────────────────────────────────────
 
@@ -45,31 +59,79 @@ pub const RETAINED_ENTRY_SIZE: usize = 16;
 /// ID in any hprof file.
 pub const VIRTUAL_ROOT_ID: u64 = 0;
 
+// ── Memory estimate and guard ─────────────────────────────────────────────────
+
+/// Bytes of private memory per object in [`estimate_memory_bytes`].
+const BYTES_PER_OBJECT: u64 = 72;
+/// Bytes of private memory per object reference in [`estimate_memory_bytes`].
+const BYTES_PER_REFERENCE: u64 = 12;
+
+/// Conservative estimate of the peak private memory
+/// [`build_dominator_and_retained`] needs for a heap with `objects`
+/// sub-records and `references` object references.
+///
+/// Calibrated on a 767 MB dump (9.7 M objects, 18.2 M references, measured
+/// peak 726 MB vs. estimate 875 MB).
+pub fn estimate_memory_bytes(objects: u64, references: u64) -> u64 {
+    objects
+        .saturating_mul(BYTES_PER_OBJECT)
+        .saturating_add(references.saturating_mul(BYTES_PER_REFERENCE))
+}
+
+/// Memory currently available to this process, when the platform reports it.
+pub fn available_memory_bytes() -> Option<u64> {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    match sys.available_memory() {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// Fail fast when the dominator step would not fit.
+///
+/// `limit` overrides the detected available memory (`None` = detect; if the
+/// platform reports nothing the check passes).  Returns the estimate on
+/// success so callers can report it.
+pub fn check_memory(objects: u64, references: u64, limit: Option<u64>) -> Result<u64, HprofError> {
+    let needed = estimate_memory_bytes(objects, references);
+    if let Some(available) = limit.or_else(available_memory_bytes)
+        && needed > available
+    {
+        return Err(HprofError::InsufficientMemory {
+            step: "the dominator tree and retained sizes",
+            needed,
+            available,
+        });
+    }
+    Ok(needed)
+}
+
 // ── Public build function ─────────────────────────────────────────────────────
 
-/// Build `dominators.bin` and `retained.bin` for a heap dump.
+/// Build the dominator/retained index family for a heap dump.
 ///
 /// Requires the combined object store index and all nine GC root index readers
-/// to be available.  The two output files are written sorted by `object_id`.
+/// to be available.  Writes `dominators.bin`, `retained.bin`,
+/// `retained_by_size.bin` and `dominator_children.bin` into `store`.
 ///
 /// Returns `(dominator_entry_count, retained_entry_count)`.
 ///
-/// **Memory usage:** O(N + E) where N = number of heap objects and E = number
-/// of object references.  For very large heaps this may require several GB of
-/// RAM; consider adding a `--skip-retained-heap` flag for production use.
+/// **Memory usage:** see the module docs; call [`check_memory`] first to fail
+/// fast instead of exhausting memory.
 pub fn build_dominator_and_retained(
-    hprof_source: &impl MMapReader,
-    combined_source: &impl MMapReader,
+    hprof_bytes: &[u8],
+    combined_slice: &[u8],
     root_readers: &[RootIndexReader<'_>; 9],
-    dominators_out: &mut impl MMapWriter,
-    retained_out: &mut impl MMapWriter,
+    store: &dyn IndexStore,
 ) -> Result<(u64, u64), HprofError> {
     // Open indexes.
-    let mmap = hprof_source.open_mmap()?;
-    let hprof = HprofFile::from_ref(mmap.as_ref())?;
-    let combined_bytes = combined_source.open_mmap()?;
-    let combined_slice = combined_bytes.as_ref();
+    let hprof = HprofFile::from_ref(hprof_bytes)?;
     let combined = SubIndexReader::from_ref(combined_slice)?;
+    let combined_file = RecordFile::<SubIndexEntry>::new(combined_slice)?;
+
+    // A leftover scratch entry from an interrupted run is never valid.
+    store.remove_prefix(&names::part_prefix(names::DOMINATORS))?;
 
     // ── Pass 1 (sequential): build class field-layout cache ───────────────────
     // Eliminates O(depth × log N) binary searches per instance in pass 2.
@@ -77,7 +139,7 @@ pub fn build_dominator_and_retained(
 
     // ── Streaming two-pass CSR build ──────────────────────────────────────────
     let (compact_ids, shallow_sizes, fwd_off, fwd_edges) =
-        build_forward_csr_streaming(&hprof, &combined, &class_cache)?;
+        build_forward_csr_streaming(&hprof, combined_file, &class_cache, store)?;
     let n = compact_ids.len();
 
     // ── GC roots as compact indices ───────────────────────────────────────────
@@ -95,77 +157,153 @@ pub fn build_dominator_and_retained(
     let retained = compute_retained_from_doms(n, &global_doms, &shallow_sizes);
 
     // ── Write output files ────────────────────────────────────────────────────
-    let (dom_count, ret_count) = write_outputs(
-        n,
-        &compact_ids,
-        &global_doms,
-        &retained,
-        dominators_out,
-        retained_out,
-    )?;
-
-    Ok((dom_count, ret_count))
+    write_outputs(n, &compact_ids, &global_doms, &retained, store)
 }
 
 // ── Public reader: DominatorIndex ─────────────────────────────────────────────
+
+/// One `dominators.bin` record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DomEntry {
+    pub object_id: u64,
+    /// [`VIRTUAL_ROOT_ID`] when the object is a direct GC root.
+    pub dominator_id: u64,
+}
+
+impl Entry for DomEntry {
+    const SIZE: usize = DOM_ENTRY_SIZE;
+    const KEY_OFFSET: usize = 0;
+
+    fn from_bytes(b: &[u8]) -> Self {
+        Self {
+            object_id: read_u64_le(b, 0),
+            dominator_id: read_u64_le(b, 8),
+        }
+    }
+
+    fn write_to(&self, out: &mut [u8]) {
+        out[0..8].copy_from_slice(&self.object_id.to_le_bytes());
+        out[8..16].copy_from_slice(&self.dominator_id.to_le_bytes());
+    }
+
+    fn key(&self) -> u64 {
+        self.object_id
+    }
+}
+
+/// One `retained.bin` record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetainedEntry {
+    pub object_id: u64,
+    pub retained_bytes: u64,
+}
+
+impl Entry for RetainedEntry {
+    const SIZE: usize = RETAINED_ENTRY_SIZE;
+    const KEY_OFFSET: usize = 0;
+
+    fn from_bytes(b: &[u8]) -> Self {
+        Self {
+            object_id: read_u64_le(b, 0),
+            retained_bytes: read_u64_le(b, 8),
+        }
+    }
+
+    fn write_to(&self, out: &mut [u8]) {
+        out[0..8].copy_from_slice(&self.object_id.to_le_bytes());
+        out[8..16].copy_from_slice(&self.retained_bytes.to_le_bytes());
+    }
+
+    fn key(&self) -> u64 {
+        self.object_id
+    }
+}
+
+/// One `retained_by_size.bin` record: the retained index re-keyed by size,
+/// sorted **descending** (largest retained size first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetainedBySizeEntry {
+    pub retained_bytes: u64,
+    pub object_id: u64,
+}
+
+impl Entry for RetainedBySizeEntry {
+    const SIZE: usize = 16;
+    const KEY_OFFSET: usize = 0;
+
+    fn from_bytes(b: &[u8]) -> Self {
+        Self {
+            retained_bytes: read_u64_le(b, 0),
+            object_id: read_u64_le(b, 8),
+        }
+    }
+
+    fn write_to(&self, out: &mut [u8]) {
+        out[0..8].copy_from_slice(&self.retained_bytes.to_le_bytes());
+        out[8..16].copy_from_slice(&self.object_id.to_le_bytes());
+    }
+
+    fn key(&self) -> u64 {
+        self.retained_bytes
+    }
+}
+
+/// One `dominator_children.bin` record: the dominator tree keyed by parent,
+/// sorted by `(dominator_id, object_id)`, so the children of `X` are
+/// `range(X)`.  Children of the virtual root have `dominator_id ==`
+/// [`VIRTUAL_ROOT_ID`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DomChildEntry {
+    pub dominator_id: u64,
+    pub object_id: u64,
+}
+
+impl Entry for DomChildEntry {
+    const SIZE: usize = 16;
+    const KEY_OFFSET: usize = 0;
+
+    fn from_bytes(b: &[u8]) -> Self {
+        Self {
+            dominator_id: read_u64_le(b, 0),
+            object_id: read_u64_le(b, 8),
+        }
+    }
+
+    fn write_to(&self, out: &mut [u8]) {
+        out[0..8].copy_from_slice(&self.dominator_id.to_le_bytes());
+        out[8..16].copy_from_slice(&self.object_id.to_le_bytes());
+    }
+
+    fn key(&self) -> u64 {
+        self.dominator_id
+    }
+}
 
 /// Read-only handle to a sorted `dominators.bin` index file.
 ///
 /// Each entry stores `(object_id, dominator_id)`.  A `dominator_id` of
 /// [`VIRTUAL_ROOT_ID`] (`0`) means the object is a direct GC root.
+#[derive(Clone, Copy)]
 pub struct DominatorIndex<'a> {
-    data: &'a [u8],
+    file: RecordFile<'a, DomEntry>,
 }
 
 impl<'a> DominatorIndex<'a> {
     pub fn from_ref(bytes: &'a [u8]) -> Result<Self, HprofError> {
-        if !bytes.len().is_multiple_of(DOM_ENTRY_SIZE) {
-            return Err(HprofError::InvalidIndexFile);
-        }
-        Ok(Self { data: bytes })
+        Ok(Self {
+            file: RecordFile::new(bytes)?,
+        })
     }
 
     pub(crate) fn from_slice(bytes: &'a [u8]) -> Self {
-        debug_assert!(bytes.len().is_multiple_of(DOM_ENTRY_SIZE));
-        Self { data: bytes }
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        self.data
-    }
-
-    /// Total number of entries.
-    pub fn len(&self) -> usize {
-        self.as_slice().len() / DOM_ENTRY_SIZE
-    }
-
-    /// Returns `true` if the index contains no entries.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        Self {
+            file: RecordFile::from_slice(bytes),
+        }
     }
 
     /// Return the `dominator_id` of `object_id`, or `None` if not found.
-    ///
-    /// O(log n) binary search.
     pub fn find(&self, object_id: u64) -> Option<u64> {
-        let data = self.as_slice();
-        let n = self.len();
-        let mut lo = 0usize;
-        let mut hi = n;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let key = read_u64_le(data, mid * DOM_ENTRY_SIZE);
-            if key < object_id {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        if lo < n && read_u64_le(data, lo * DOM_ENTRY_SIZE) == object_id {
-            Some(read_u64_le(data, lo * DOM_ENTRY_SIZE + 8))
-        } else {
-            None
-        }
+        self.file.find(object_id).map(|e| e.dominator_id)
     }
 }
 
@@ -174,332 +312,244 @@ impl<'a> DominatorIndex<'a> {
 /// Read-only handle to a sorted `retained.bin` index file.
 ///
 /// Each entry stores `(object_id, retained_bytes)`.
+#[derive(Clone, Copy)]
 pub struct RetainedIndex<'a> {
-    data: &'a [u8],
+    file: RecordFile<'a, RetainedEntry>,
 }
 
 impl<'a> RetainedIndex<'a> {
     /// Create a validated reader from a byte slice.
     pub fn from_ref(data: &'a [u8]) -> Result<Self, HprofError> {
-        if !data.len().is_multiple_of(RETAINED_ENTRY_SIZE) {
-            return Err(HprofError::InvalidIndexFile);
-        }
-        Ok(Self { data })
+        Ok(Self {
+            file: RecordFile::new(data)?,
+        })
     }
 
     /// Create a reader from a slice already known to be valid.
     pub(crate) fn from_slice(data: &'a [u8]) -> Self {
-        debug_assert!(data.len().is_multiple_of(RETAINED_ENTRY_SIZE));
-        Self { data }
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        self.data
-    }
-
-    /// Total number of entries.
-    pub fn len(&self) -> usize {
-        self.as_slice().len() / RETAINED_ENTRY_SIZE
-    }
-
-    /// Returns `true` if the index contains no entries.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        Self {
+            file: RecordFile::from_slice(data),
+        }
     }
 
     /// Return the retained heap size in bytes for `object_id`, or `None`.
-    ///
-    /// O(log n) binary search.
     pub fn find(&self, object_id: u64) -> Option<u64> {
-        let data = self.as_slice();
-        let n = self.len();
-        let mut lo = 0usize;
-        let mut hi = n;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let key = read_u64_le(data, mid * RETAINED_ENTRY_SIZE);
-            if key < object_id {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        if lo < n && read_u64_le(data, lo * RETAINED_ENTRY_SIZE) == object_id {
-            Some(read_u64_le(data, lo * RETAINED_ENTRY_SIZE + 8))
-        } else {
-            None
-        }
+        self.file.find(object_id).map(|e| e.retained_bytes)
     }
-
-    /// Iterate all entries in ascending `object_id` order.
-    ///
-    /// Yields `(object_id, retained_bytes)` pairs.
-    pub fn iter(&self) -> RetainedIter<'a> {
-        RetainedIter {
-            data: self.data,
-            pos: 0,
-            len: self.len(),
-        }
-    }
-}
-
-/// Iterator over `(object_id, retained_bytes)` entries in a [`RetainedIndex`].
-pub struct RetainedIter<'a> {
-    data: &'a [u8],
-    pos: usize,
-    len: usize,
-}
-
-impl Iterator for RetainedIter<'_> {
-    type Item = (u64, u64);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.pos >= self.len {
-            return None;
-        }
-        let offset = self.pos * RETAINED_ENTRY_SIZE;
-        let object_id = read_u64_le(self.data, offset);
-        let retained_bytes = read_u64_le(self.data, offset + 8);
-        self.pos += 1;
-        Some((object_id, retained_bytes))
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.len - self.pos;
-        (remaining, Some(remaining))
-    }
-}
-
-// ── Private: class field-layout cache ────────────────────────────────────────
-
-/// Per-class instance field metadata, used to walk field data without repeated
-/// binary searches into the combined index.
-struct ClassLayout {
-    super_class_id: u64,
-    /// hprof field-type code for each instance field in declaration order.
-    /// Type 2 = object reference (id_size bytes); others are primitive types.
-    field_types: Vec<u8>,
-}
-
-/// Sorted-array map from class_id → ClassLayout; binary-search lookup.
-///
-/// Avoids any hash-map overhead: build once, share read-only across threads.
-struct ClassCache {
-    ids: Vec<u64>,
-    layouts: Vec<ClassLayout>,
-}
-
-impl ClassCache {
-    fn get(&self, class_id: u64) -> Option<&ClassLayout> {
-        self.ids
-            .binary_search(&class_id)
-            .ok()
-            .map(|i| &self.layouts[i])
-    }
-}
-
-/// Scan the combined index once, building a [`ClassCache`] for every CLASS_DUMP.
-///
-/// This cache eliminates the O(depth × log N) binary searches that the
-/// previous implementation performed for each instance dump.
-fn build_class_cache(
-    hprof: &HprofFile,
-    combined: &SubIndexReader,
-) -> Result<ClassCache, HprofError> {
-    let mut pairs: Vec<(u64, ClassLayout)> = Vec::new();
-    for entry in combined.iter() {
-        if entry.tag != TAG_CLASS_DUMP {
-            continue;
-        }
-        let rec = parse_sub_record(hprof, &entry)?;
-        let cd = match rec {
-            SubRecord::ClassDump(c) => c,
-            _ => continue,
-        };
-        let field_types: Result<Vec<u8>, HprofError> = cd
-            .instance_fields()
-            .map(|r| r.map(|fd| fd.field_type))
-            .collect();
-        pairs.push((
-            cd.class_id,
-            ClassLayout {
-                super_class_id: cd.super_class_id,
-                field_types: field_types?,
-            },
-        ));
-    }
-    pairs.sort_unstable_by_key(|&(id, _)| id);
-    pairs.dedup_by_key(|(id, _)| *id);
-    let ids = pairs.iter().map(|&(id, _)| id).collect();
-    let layouts = pairs.into_iter().map(|(_, l)| l).collect();
-    Ok(ClassCache { ids, layouts })
 }
 
 // ── Private: streaming two-pass CSR builder ───────────────────────────────────
 //
-// **Pass 1** (parallel): for every heap record, read its outgoing references
-//   to count them exactly, storing only (object_id, shallow, out_degree,
-//   entry_idx) — 24 bytes per object.  No Vec<u64> per object.
+// **Pass 1** (parallel, chunked): for every heap record, read its outgoing
+//   references to count them exactly, producing (object_id, shallow,
+//   out_degree, entry_idx) — 24 bytes per object — in per-chunk vectors.
+//   The object store is sorted by object id, so the chunks are already in
+//   global order: they are consumed one after another straight into
+//   `compact_ids` / `shallow_sizes` / `fwd_off` / `entry_to_compact`, and
+//   each chunk is freed as soon as it has been consumed.  The peak of this
+//   phase is therefore ≈ 24·N bytes (chunks shrinking as the outputs grow),
+//   with no sort and no second copy.
 //
-// **Pass 2** (sequential): re-read each record, appending (to_id, from_compact)
-//   pairs directly into a single flat edge buffer — no per-object allocation.
+// **Pass 2** (sequential): re-read each record and stream
+//   (to_id, from_compact) pairs into a scratch entry of the index store
+//   (`dominators.bin.part.0000`).  The pairs never live in process memory;
+//   on disk they are sorted in place on the store (a file-backed map).
 //
-// After Pass 2: sort the buffer by `to_id`, then merge with `compact_ids` in a
-// two-pointer scan that writes directly into the pre-allocated `fwd_edges` —
-// eliminating the intermediate "translated" Vec of the old approach.
+// **Merge**: a two-pointer scan of the sorted pairs against `compact_ids`
+//   fills `fwd_edges`.  References to ids that are not in the dump
+//   (dangling) leave unfilled slots, which `compact_csr` squeezes out.
 //
-// Peak memory: 24·N + 16·E  bytes
-//    vs old:   40·N + 28·E  bytes  (Vec<RawNode> headers + raw_edges + translated)
+// Resident after the build: 20·N + 4·E bytes (compact_ids, shallow_sizes,
+// fwd_off, fwd_edges).
 
 // (compact_ids, shallow_sizes, fwd_offsets, fwd_edges)
 type ForwardCsr = (Vec<u64>, Vec<u64>, Vec<u32>, Vec<u32>);
 // (object_id, shallow_size, out_degree, entry_index)
 type NodeMeta = (u64, u64, u32, u32);
 
+/// One `(to_id, from_compact)` reference in the scratch entry written by
+/// pass 2.  Sorted ascending by `to_id`.
+#[derive(Debug, Clone, Copy)]
+struct EdgeEntry {
+    to_id: u64,
+    from: u64,
+}
+
+impl Entry for EdgeEntry {
+    const SIZE: usize = 16;
+    const KEY_OFFSET: usize = 0;
+
+    fn from_bytes(b: &[u8]) -> Self {
+        Self {
+            to_id: read_u64_le(b, 0),
+            from: read_u64_le(b, 8),
+        }
+    }
+
+    fn write_to(&self, out: &mut [u8]) {
+        out[0..8].copy_from_slice(&self.to_id.to_le_bytes());
+        out[8..16].copy_from_slice(&self.from.to_le_bytes());
+    }
+
+    fn key(&self) -> u64 {
+        self.to_id
+    }
+}
+
+/// Pass-1 record for one object-store entry, or `None` for GC-root records.
+fn node_meta(
+    hprof: &HprofFile,
+    entry: &SubIndexEntry,
+    k: usize,
+    class_cache: &ClassCache,
+    id_size: usize,
+) -> Result<Option<NodeMeta>, HprofError> {
+    let k = k as u32;
+    match entry.tag {
+        TAG_INSTANCE_DUMP => {
+            let SubRecord::InstanceDump(inst) = parse_sub_record(hprof, entry)? else {
+                return Ok(None);
+            };
+            let shallow = inst.data.len() as u64;
+            let count = count_instance_refs(&inst, class_cache, id_size)? as u32;
+            Ok(Some((inst.object_id, shallow, count, k)))
+        }
+        TAG_CLASS_DUMP => {
+            let SubRecord::ClassDump(cd) = parse_sub_record(hprof, entry)? else {
+                return Ok(None);
+            };
+            let mut count = 0u32;
+            for sf_res in cd.static_fields() {
+                if let FieldValue::Object(id) = sf_res?.value
+                    && id != 0
+                {
+                    count += 1;
+                }
+            }
+            Ok(Some((cd.class_id, 0u64, count, k)))
+        }
+        TAG_OBJ_ARRAY_DUMP => {
+            let SubRecord::ObjArrayDump(arr) = parse_sub_record(hprof, entry)? else {
+                return Ok(None);
+            };
+            let shallow = arr.num_elements as u64 * id_size as u64;
+            let count = arr.elements().filter(|&id| id != 0).count() as u32;
+            Ok(Some((arr.array_id, shallow, count, k)))
+        }
+        TAG_PRIM_ARRAY_DUMP => {
+            let SubRecord::PrimArrayDump(arr) = parse_sub_record(hprof, entry)? else {
+                return Ok(None);
+            };
+            let shallow = arr.num_elements as u64 * prim_elem_byte_size(arr.element_type);
+            Ok(Some((arr.array_id, shallow, 0u32, k)))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn build_forward_csr_streaming(
     hprof: &HprofFile,
-    combined: &SubIndexReader,
+    combined: RecordFile<'_, SubIndexEntry>,
     class_cache: &ClassCache,
+    store: &dyn IndexStore,
 ) -> Result<ForwardCsr, HprofError> {
-    let id_size = hprof.header.id_size as usize;
-    let entries: Vec<SubIndexEntry> = combined.iter().collect();
-    let entry_count = entries.len();
+    let id_size = hprof.id_size() as usize;
+    let entry_count = combined.len();
+    if entry_count >= u32::MAX as usize {
+        return Err(HprofError::Internal(format!(
+            "object store has {entry_count} entries; the dominator builder indexes objects with u32"
+        )));
+    }
 
-    // ── Pass 1 (parallel): count exact out-degrees ────────────────────────────
-    // Yields (object_id, shallow_size, out_degree, original_entry_index).
-    let pass1: Vec<Result<Option<NodeMeta>, HprofError>> = entries
-        .par_iter()
-        .enumerate()
-        .map(|(k, entry)| -> Result<Option<NodeMeta>, HprofError> {
-            match entry.tag {
-                TAG_INSTANCE_DUMP => {
-                    let rec = parse_sub_record(hprof, entry)?;
-                    let inst = match rec {
-                        SubRecord::InstanceDump(i) => i,
-                        _ => return Ok(None),
-                    };
-                    let shallow = inst.data.len() as u64;
-                    let count = count_instance_refs(&inst, class_cache, id_size)? as u32;
-                    Ok(Some((inst.object_id, shallow, count, k as u32)))
+    // ── Pass 1 (parallel, chunked): count exact out-degrees ───────────────────
+    let n_threads = rayon::current_num_threads().max(1);
+    let chunk_len = entry_count.div_ceil(n_threads * 4).max(1);
+    let n_chunks = entry_count.div_ceil(chunk_len);
+    let chunks: Vec<Vec<NodeMeta>> = (0..n_chunks)
+        .into_par_iter()
+        .map(|c| -> Result<Vec<NodeMeta>, HprofError> {
+            let start = c * chunk_len;
+            let end = (start + chunk_len).min(entry_count);
+            let mut out = Vec::with_capacity(end - start);
+            for (i, entry) in combined.iter_range(start, end).enumerate() {
+                if let Some(m) = node_meta(hprof, &entry, start + i, class_cache, id_size)? {
+                    out.push(m);
                 }
-                TAG_CLASS_DUMP => {
-                    let rec = parse_sub_record(hprof, entry)?;
-                    let cd = match rec {
-                        SubRecord::ClassDump(c) => c,
-                        _ => return Ok(None),
-                    };
-                    let mut count = 0u32;
+            }
+            Ok(out)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Consume the chunks in order (they are globally sorted by object id: the
+    // object store is), freeing each one as soon as it has been consumed.
+    let total_meta: usize = chunks.iter().map(Vec::len).sum();
+    let mut compact_ids: Vec<u64> = Vec::with_capacity(total_meta);
+    let mut shallow_sizes: Vec<u64> = Vec::with_capacity(total_meta);
+    let mut fwd_off: Vec<u32> = Vec::with_capacity(total_meta + 1);
+    fwd_off.push(0);
+    // Map original entry index → compact index for O(1) lookup in Pass 2.
+    let mut entry_to_compact: Vec<u32> = vec![u32::MAX; entry_count];
+    let mut running = 0u64;
+    for chunk in chunks {
+        for (id, shallow, degree, entry_idx) in chunk {
+            if let Some(&last) = compact_ids.last() {
+                if id == last {
+                    continue; // duplicate id: keep the first
+                }
+                if id < last {
+                    return Err(HprofError::Corrupt(
+                        "object store is not sorted by object id".to_owned(),
+                    ));
+                }
+            }
+            entry_to_compact[entry_idx as usize] = compact_ids.len() as u32;
+            compact_ids.push(id);
+            shallow_sizes.push(shallow);
+            running += u64::from(degree);
+            check_edge_capacity(running, entry_count as u64)?;
+            fwd_off.push(running as u32);
+        }
+    }
+    let n = compact_ids.len();
+
+    // ── Pass 2 (sequential): stream (to_id, from_compact) to the store ────────
+    let total_edges = fwd_off[n] as usize;
+    let scratch = names::part(names::DOMINATORS, 0);
+    let mut writer = RecordWriter::<EdgeEntry>::new(store.create(&scratch)?);
+    for (k, entry) in combined.iter().enumerate() {
+        let from = entry_to_compact[k];
+        if from == u32::MAX {
+            continue;
+        }
+        let mut emit = |to_id: u64| {
+            writer.push(&EdgeEntry {
+                to_id,
+                from: u64::from(from),
+            })
+        };
+        match entry.tag {
+            TAG_INSTANCE_DUMP => {
+                if let SubRecord::InstanceDump(inst) = parse_sub_record(hprof, &entry)? {
+                    for_each_instance_ref(&inst, class_cache, id_size, &mut emit)?;
+                }
+            }
+            TAG_CLASS_DUMP => {
+                if let SubRecord::ClassDump(cd) = parse_sub_record(hprof, &entry)? {
                     for sf_res in cd.static_fields() {
                         if let FieldValue::Object(id) = sf_res?.value
                             && id != 0
                         {
-                            count += 1;
+                            emit(id)?;
                         }
-                    }
-                    Ok(Some((cd.class_id, 0u64, count, k as u32)))
-                }
-                TAG_OBJ_ARRAY_DUMP => {
-                    let rec = parse_sub_record(hprof, entry)?;
-                    let arr = match rec {
-                        SubRecord::ObjArrayDump(a) => a,
-                        _ => return Ok(None),
-                    };
-                    let shallow = arr.num_elements as u64 * id_size as u64;
-                    let count = arr.elements().filter(|&id| id != 0).count() as u32;
-                    Ok(Some((arr.array_id, shallow, count, k as u32)))
-                }
-                TAG_PRIM_ARRAY_DUMP => {
-                    let rec = parse_sub_record(hprof, entry)?;
-                    let arr = match rec {
-                        SubRecord::PrimArrayDump(a) => a,
-                        _ => return Ok(None),
-                    };
-                    let shallow = arr.num_elements as u64 * prim_elem_byte_size(arr.element_type);
-                    Ok(Some((arr.array_id, shallow, 0u32, k as u32)))
-                }
-                _ => Ok(None),
-            }
-        })
-        .collect();
-
-    // Sort by object_id, assign compact indices.
-    let mut meta: Vec<(u64, u64, u32, u32)> = Vec::with_capacity(entry_count);
-    for r in pass1 {
-        if let Some(m) = r? {
-            meta.push(m);
-        }
-    }
-    meta.sort_unstable_by_key(|&(id, _, _, _)| id);
-    meta.dedup_by_key(|(id, _, _, _)| *id);
-    let n = meta.len();
-
-    let compact_ids: Vec<u64> = meta.iter().map(|&(id, _, _, _)| id).collect();
-    let shallow_sizes: Vec<u64> = meta.iter().map(|&(_, sh, _, _)| sh).collect();
-
-    let mut fwd_off: Vec<u32> = Vec::with_capacity(n + 1);
-    let mut fwd_running = 0u32;
-    fwd_off.push(fwd_running);
-    for &(_, _, deg, _) in &meta {
-        fwd_running = fwd_running.saturating_add(deg);
-        fwd_off.push(fwd_running);
-    }
-
-    // Map original entry index → compact index for O(1) lookup in Pass 2.
-    let mut entry_to_compact: Vec<u32> = vec![u32::MAX; entry_count];
-    for (ci, &(_, _, _, ek)) in meta.iter().enumerate() {
-        entry_to_compact[ek as usize] = ci as u32;
-    }
-    drop(meta); // free 24·N bytes
-
-    // ── Pass 2 (sequential): emit (to_id, from_compact) directly ─────────────
-    // Pre-sized to the exact total from Pass 1 — no reallocation, no per-object
-    // allocation.
-    let total_edges = fwd_off[n] as usize;
-    let mut raw_edges: Vec<(u64, u32)> = Vec::with_capacity(total_edges);
-
-    for (k, entry) in entries.iter().enumerate() {
-        let from_compact = entry_to_compact[k];
-        if from_compact == u32::MAX {
-            continue;
-        }
-        match entry.tag {
-            TAG_INSTANCE_DUMP => {
-                let rec = parse_sub_record(hprof, entry)?;
-                let inst = match rec {
-                    SubRecord::InstanceDump(i) => i,
-                    _ => continue,
-                };
-                collect_instance_ref_pairs(
-                    &inst,
-                    class_cache,
-                    id_size,
-                    from_compact,
-                    &mut raw_edges,
-                )?;
-            }
-            TAG_CLASS_DUMP => {
-                let rec = parse_sub_record(hprof, entry)?;
-                let cd = match rec {
-                    SubRecord::ClassDump(c) => c,
-                    _ => continue,
-                };
-                for sf_res in cd.static_fields() {
-                    if let FieldValue::Object(id) = sf_res?.value
-                        && id != 0
-                    {
-                        raw_edges.push((id, from_compact));
                     }
                 }
             }
             TAG_OBJ_ARRAY_DUMP => {
-                let rec = parse_sub_record(hprof, entry)?;
-                let arr = match rec {
-                    SubRecord::ObjArrayDump(a) => a,
-                    _ => continue,
-                };
-                for id in arr.elements() {
-                    if id != 0 {
-                        raw_edges.push((id, from_compact));
+                if let SubRecord::ObjArrayDump(arr) = parse_sub_record(hprof, &entry)? {
+                    for id in arr.elements() {
+                        if id != 0 {
+                            emit(id)?;
+                        }
                     }
                 }
             }
@@ -507,111 +557,96 @@ fn build_forward_csr_streaming(
         }
     }
     drop(entry_to_compact);
-    drop(entries);
+    // Sort ascending by to_id in place on the store, then commit.
+    writer.finish_sorted()?;
 
-    // ── Sort + two-pointer merge → fill fwd_edges directly ───────────────────
-    // Eliminates the old "translated: Vec<(u32,u32)>" buffer entirely.
-    raw_edges.sort_unstable_by_key(|&(to_id, _)| to_id);
-
+    // ── Merge: two-pointer scan → fill fwd_edges directly ─────────────────────
+    let scratch_src = store.open(&scratch)?;
+    let edges = RecordFile::<EdgeEntry>::new(scratch_src.as_ref())?;
     let mut fwd_edges: Vec<u32> = vec![0u32; total_edges];
     let mut cursor: Vec<u32> = fwd_off[..n].to_vec();
 
     let mut ci = 0usize; // pointer into compact_ids (ascending)
-    let mut ei = 0usize; // pointer into raw_edges (ascending by to_id)
-    while ei < raw_edges.len() && ci < n {
-        let to_id = raw_edges[ei].0;
-        match compact_ids[ci].cmp(&to_id) {
+    let mut iter = edges.iter().peekable();
+    while ci < n {
+        let Some(&e) = iter.peek() else { break };
+        match compact_ids[ci].cmp(&e.to_id) {
             std::cmp::Ordering::Less => ci += 1,
-            std::cmp::Ordering::Greater => ei += 1, // to_id not in graph
+            std::cmp::Ordering::Greater => {
+                iter.next(); // to_id not in the dump (dangling reference)
+            }
             std::cmp::Ordering::Equal => {
                 let to_compact = ci as u32;
-                while ei < raw_edges.len() && raw_edges[ei].0 == to_id {
-                    let from = raw_edges[ei].1 as usize;
+                while let Some(&e2) = iter.peek() {
+                    if e2.to_id != e.to_id {
+                        break;
+                    }
+                    let from = e2.from as usize;
                     let pos = cursor[from] as usize;
                     let limit = fwd_off[from + 1] as usize;
                     if pos < limit {
                         fwd_edges[pos] = to_compact;
                         cursor[from] += 1;
                     }
-                    ei += 1;
+                    iter.next();
                 }
             }
         }
     }
+    drop(iter);
+    drop(scratch_src);
+    store.remove(&scratch)?;
+
+    compact_csr(&mut fwd_off, &mut fwd_edges, &cursor);
 
     Ok((compact_ids, shallow_sizes, fwd_off, fwd_edges))
 }
 
-/// Count non-null outgoing object references in an instance dump without
-/// allocating a collection.  Used by Pass 1 to build exact CSR out-degrees.
-fn count_instance_refs(
-    inst: &crate::heap_parser::InstanceDump<'_>,
-    class_cache: &ClassCache,
-    id_size: usize,
-) -> Result<usize, HprofError> {
-    let mut count = 0usize;
-    let mut offset = 0usize;
-    let mut curr = inst.class_id;
-    while curr != 0 {
-        let layout = match class_cache.get(curr) {
-            Some(l) => l,
-            None => break,
-        };
-        for &ft in &layout.field_types {
-            let (value, sz) = read_field_value(inst.data, offset, ft, id_size)?;
-            offset += sz;
-            if matches!(value, FieldValue::Object(id) if id != 0) {
-                count += 1;
-            }
-        }
-        curr = layout.super_class_id;
-    }
-    Ok(count)
-}
-
-/// Append `(to_id, from_compact)` pairs for every non-null outgoing object
-/// reference in an instance dump into an existing flat buffer.
-/// Used by Pass 2; no intermediate allocation per object.
-fn collect_instance_ref_pairs(
-    inst: &crate::heap_parser::InstanceDump<'_>,
-    class_cache: &ClassCache,
-    id_size: usize,
-    from_compact: u32,
-    out: &mut Vec<(u64, u32)>,
-) -> Result<(), HprofError> {
-    let mut offset = 0usize;
-    let mut curr = inst.class_id;
-    while curr != 0 {
-        let layout = match class_cache.get(curr) {
-            Some(l) => l,
-            None => break,
-        };
-        for &ft in &layout.field_types {
-            let (value, sz) = read_field_value(inst.data, offset, ft, id_size)?;
-            offset += sz;
-            if let FieldValue::Object(id) = value
-                && id != 0
-            {
-                out.push((id, from_compact));
-            }
-        }
-        curr = layout.super_class_id;
+/// Fail unless a CSR with `edges` forward edges over at most `nodes` nodes
+/// can be addressed with `u32` offsets.
+///
+/// The backward CSR holds every forward edge plus one edge per GC root
+/// (at most one per node), so `edges + nodes` must fit in a `u32`.  Without
+/// this check the offsets would wrap and the dominators would be wrong with
+/// no error.
+fn check_edge_capacity(edges: u64, nodes: u64) -> Result<(), HprofError> {
+    if edges + nodes > u64::from(u32::MAX) {
+        return Err(HprofError::TooLarge(format!(
+            "the heap has more than {} references, more than the in-memory dominator              builder can index (plan task S6.1 covers an out-of-core builder)",
+            u32::MAX as u64 - nodes
+        )));
     }
     Ok(())
 }
 
-fn prim_elem_byte_size(type_id: u8) -> u64 {
-    match type_id {
-        4 => 1,  // bool
-        5 => 2,  // char
-        6 => 4,  // float
-        7 => 8,  // double
-        8 => 1,  // byte
-        9 => 2,  // short
-        10 => 4, // int
-        11 => 8, // long
-        _ => 1,
+/// Squeeze the unfilled slots out of a forward CSR in place.
+///
+/// Pass 1 counts every non-null reference, including references to ids that
+/// are not in the dump; the merge only fills slots for references that
+/// resolve.  `filled_end[i]` is the end of node `i`'s filled slots (its
+/// cursor after the merge).  Without this step the unfilled slots would read
+/// as edges to compact node 0.
+fn compact_csr(fwd_off: &mut [u32], fwd_edges: &mut Vec<u32>, filled_end: &[u32]) {
+    let n = filled_end.len();
+    let filled: usize = (0..n).map(|i| (filled_end[i] - fwd_off[i]) as usize).sum();
+    if filled == fwd_edges.len() {
+        return; // no dangling references
     }
+    let mut write = 0usize;
+    for i in 0..n {
+        let old_start = fwd_off[i] as usize; // not yet overwritten
+        let old_end = filled_end[i] as usize;
+        fwd_edges.copy_within(old_start..old_end, write);
+        fwd_off[i] = write as u32;
+        write += old_end - old_start;
+    }
+    fwd_off[n] = write as u32;
+    fwd_edges.truncate(write);
+    fwd_edges.shrink_to_fit();
+}
+
+fn prim_elem_byte_size(type_id: u8) -> u64 {
+    crate::hprof::BasicType::from_code(type_id).map_or(1, |t| t.size(1) as u64)
 }
 
 // ── Test-only: RawNode + build_forward_csr ────────────────────────────────────
@@ -832,7 +867,8 @@ fn build_backward_csr(
     let mut pred_off: Vec<u32> = Vec::with_capacity(n_rpo + 1);
     pred_off.push(0);
     for i in 0..n_rpo {
-        pred_off.push(pred_off[i].saturating_add(in_degree[i]));
+        // Cannot overflow: `check_edge_capacity` bounds forward edges plus roots.
+        pred_off.push(pred_off[i] + in_degree[i]);
     }
 
     let total = pred_off[n_rpo] as usize;
@@ -1266,6 +1302,7 @@ fn run_partitioned_dominators(
         groups.push((root, nodes));
         gi = end;
     }
+    drop(exclusive_pairs); // 8 bytes per exclusive node, not needed again
 
     // Run exclusive partitions in parallel via rayon.
     let exclusive_results: Vec<Vec<(u32, u32)>> = groups
@@ -1274,6 +1311,7 @@ fn run_partitioned_dominators(
             run_exclusive_partition(*root_compact, nodes, fwd_off, fwd_edges)
         })
         .collect();
+    drop(groups);
     for pairs in exclusive_results {
         for (compact_idx, dom_compact) in pairs {
             global_doms[compact_idx as usize] = dom_compact;
@@ -1337,65 +1375,60 @@ fn compute_retained_from_doms(n: usize, global_doms: &[u32], shallow_sizes: &[u6
 
 // ── Private: output writing ───────────────────────────────────────────────────
 
+/// Write the four output entries.
+///
+/// `compact_ids` is sorted ascending, so `dominators.bin` and `retained.bin`
+/// come out sorted by `object_id` without a sort pass; the two derived
+/// entries are sorted in place on the store.
 fn write_outputs(
     n: usize,
     compact_ids: &[u64],
     global_doms: &[u32],
     retained: &[u64],
-    dominators_out: &mut impl MMapWriter,
-    retained_out: &mut impl MMapWriter,
+    store: &dyn IndexStore,
 ) -> Result<(u64, u64), HprofError> {
-    let mut dom_entries: Vec<(u64, u64)> = Vec::with_capacity(n);
-    let mut ret_entries: Vec<(u64, u64)> = Vec::with_capacity(n);
+    let mut dom_w = RecordWriter::<DomEntry>::new(store.create(names::DOMINATORS)?);
+    let mut ret_w = RecordWriter::<RetainedEntry>::new(store.create(names::RETAINED)?);
+    let mut by_size_w =
+        RecordWriter::<RetainedBySizeEntry>::new(store.create(names::RETAINED_BY_SIZE)?);
+    let mut children_w =
+        RecordWriter::<DomChildEntry>::new(store.create(names::DOMINATOR_CHILDREN)?);
 
     for i in 0..n {
         let dom = global_doms[i];
         if dom == u32::MAX {
             continue; // unreachable
         }
-        let obj_id = compact_ids[i];
-        let dom_id = if dom == VROOT_COMPACT {
+        let object_id = compact_ids[i];
+        let dominator_id = if dom == VROOT_COMPACT {
             VIRTUAL_ROOT_ID
         } else {
             compact_ids[dom as usize]
         };
-        dom_entries.push((obj_id, dom_id));
-        ret_entries.push((obj_id, retained[i]));
+        dom_w.push(&DomEntry {
+            object_id,
+            dominator_id,
+        })?;
+        ret_w.push(&RetainedEntry {
+            object_id,
+            retained_bytes: retained[i],
+        })?;
+        by_size_w.push(&RetainedBySizeEntry {
+            retained_bytes: retained[i],
+            object_id,
+        })?;
+        children_w.push(&DomChildEntry {
+            dominator_id,
+            object_id,
+        })?;
     }
 
-    dom_entries.sort_unstable_by_key(|&(id, _)| id);
-    ret_entries.sort_unstable_by_key(|&(id, _)| id);
-
-    let dom_count = dom_entries.len() as u64;
-    let ret_count = ret_entries.len() as u64;
-
-    let mut dom_writer = dominators_out.create_writer()?;
-    for (obj_id, dom_id) in &dom_entries {
-        let mut buf = [0u8; DOM_ENTRY_SIZE];
-        buf[0..8].copy_from_slice(&obj_id.to_le_bytes());
-        buf[8..16].copy_from_slice(&dom_id.to_le_bytes());
-        dom_writer.write_all(&buf)?;
-    }
-    dom_writer.flush()?;
-
-    let mut ret_writer = retained_out.create_writer()?;
-    for (obj_id, ret) in &ret_entries {
-        let mut buf = [0u8; RETAINED_ENTRY_SIZE];
-        buf[0..8].copy_from_slice(&obj_id.to_le_bytes());
-        buf[8..16].copy_from_slice(&ret.to_le_bytes());
-        ret_writer.write_all(&buf)?;
-    }
-    ret_writer.flush()?;
+    let dom_count = dom_w.finish()?;
+    let ret_count = ret_w.finish()?;
+    by_size_w.finish_sorted_desc()?;
+    children_w.finish_sorted_then_by(8)?;
 
     Ok((dom_count, ret_count))
-}
-
-// ── Private: byte utilities ───────────────────────────────────────────────────
-
-fn read_u64_le(data: &[u8], offset: usize) -> u64 {
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&data[offset..offset + 8]);
-    u64::from_le_bytes(bytes)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1403,16 +1436,16 @@ fn read_u64_le(data: &[u8], offset: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::heap_index::index_heap_dumps;
-    use crate::heap_query::build_name_indexes;
-    use crate::object_store::combine_sort_and_split;
-    use crate::record_index::index_hprof;
+    use crate::heap_parser::FieldValue;
+    use crate::index::{IndexStore, MemStore, names};
+    use crate::pipeline::{IndexOptions, build_indexes};
+    use crate::progress::NoProgress;
     use crate::root_index::RootIndexReader;
-    use crate::vfs::SubIndexDir;
+    use crate::test_util::{ClassSpec, HprofBuilder, ty};
 
     // ── Test hprof builder ────────────────────────────────────────────────────
 
-    /// Build a minimal hprof file with the following object graph:
+    /// Object graph:
     ///
     /// ```text
     /// GC_ROOT_STICKY_CLASS → Class(0x100) [static field → Instance(0x200)]
@@ -1421,257 +1454,185 @@ mod tests {
     /// PrimArray(0x400) [int[], 3 elements]
     /// ```
     ///
-    /// Dominator tree:
-    /// ```text
-    /// VROOT → Class(0x100), Class(0x300)
-    /// Class(0x100) → Instance(0x200)
-    /// Instance(0x200) → PrimArray(0x400)
-    /// ```
-    ///
-    /// Retained sizes (shallow using data.len() for instances, elem*size for arrays):
-    /// - PrimArray(0x400): shallow = 3 * 4 = 12
-    /// - Instance(0x200): shallow = 8 (one object-ref field = 8 bytes id_size)
-    ///   retained = 8 + 12 = 20
-    /// - Class(0x100): shallow = 0
-    ///   retained = 0 + 20 = 20
-    /// - Class(0x300): shallow = 0, retained = 0
-    fn build_test_hprof() -> Vec<u8> {
-        let id_size: u32 = 8;
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"JAVA PROFILE 1.0.2\0");
-        buf.extend_from_slice(&id_size.to_be_bytes());
-        buf.extend_from_slice(&0u64.to_be_bytes()); // timestamp
-
-        // Helper: write a top-level record
-        let write_record = |buf: &mut Vec<u8>, tag: u8, body: &[u8]| {
-            buf.push(tag);
-            buf.extend_from_slice(&0u32.to_be_bytes()); // timestamp_delta
-            buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
-            buf.extend_from_slice(body);
-        };
-
-        // UTF8 strings for class names
-        // name_id=1 → "MyClass"
-        let mut utf8_body = Vec::new();
-        utf8_body.extend_from_slice(&1u64.to_be_bytes()); // name_id
-        utf8_body.extend_from_slice(b"MyClass");
-        write_record(&mut buf, 0x01, &utf8_body);
-
-        // name_id=2 → "java/lang/Object"
-        let mut utf8_body2 = Vec::new();
-        utf8_body2.extend_from_slice(&2u64.to_be_bytes());
-        utf8_body2.extend_from_slice(b"java/lang/Object");
-        write_record(&mut buf, 0x01, &utf8_body2);
-
-        // LOAD_CLASS: class_serial=1, class_id=0x100, stack_trace=1, name_id=1
-        let mut lc_body = Vec::new();
-        lc_body.extend_from_slice(&1u32.to_be_bytes()); // class_serial
-        lc_body.extend_from_slice(&0x100u64.to_be_bytes()); // class_id
-        lc_body.extend_from_slice(&1u32.to_be_bytes()); // stack_trace_serial
-        lc_body.extend_from_slice(&1u64.to_be_bytes()); // class_name_id
-        write_record(&mut buf, 0x02, &lc_body);
-
-        // LOAD_CLASS: class_serial=2, class_id=0x300, name_id=2
-        let mut lc_body2 = Vec::new();
-        lc_body2.extend_from_slice(&2u32.to_be_bytes());
-        lc_body2.extend_from_slice(&0x300u64.to_be_bytes());
-        lc_body2.extend_from_slice(&1u32.to_be_bytes());
-        lc_body2.extend_from_slice(&2u64.to_be_bytes());
-        write_record(&mut buf, 0x02, &lc_body2);
-
-        // HEAP_DUMP_SEGMENT containing all sub-records
-        let mut heap = Vec::new();
-
-        // ROOT_STICKY_CLASS(0x100) — marks Class 0x100 as a GC root
-        heap.push(0x05u8); // TAG_ROOT_STICKY_CLASS
-        heap.extend_from_slice(&0x100u64.to_be_bytes());
-
-        // ROOT_STICKY_CLASS(0x300) — marks Class 0x300 as a GC root
-        heap.push(0x05u8);
-        heap.extend_from_slice(&0x300u64.to_be_bytes());
-
-        // CLASS_DUMP(class_id=0x300, super=0, instance_size=0, no fields)
-        {
-            heap.push(0x20u8); // TAG_CLASS_DUMP
-            heap.extend_from_slice(&0x300u64.to_be_bytes()); // class_id
-            heap.extend_from_slice(&0u32.to_be_bytes()); // stack_serial
-            heap.extend_from_slice(&0u64.to_be_bytes()); // super_class_id = 0
-            heap.extend_from_slice(&0u64.to_be_bytes()); // class_loader_id
-            heap.extend_from_slice(&0u64.to_be_bytes()); // signers_id
-            heap.extend_from_slice(&0u64.to_be_bytes()); // domain_id
-            heap.extend_from_slice(&0u64.to_be_bytes()); // reserved1
-            heap.extend_from_slice(&0u64.to_be_bytes()); // reserved2
-            heap.extend_from_slice(&0u32.to_be_bytes()); // instance_size
-            heap.extend_from_slice(&0u16.to_be_bytes()); // cp_count = 0
-            heap.extend_from_slice(&0u16.to_be_bytes()); // statics_count = 0
-            heap.extend_from_slice(&0u16.to_be_bytes()); // instance_fields_count = 0
-        }
-
-        // CLASS_DUMP(class_id=0x100, super=0x300, one instance field: obj-ref)
-        // one static field: Object → 0x200
-        {
-            heap.push(0x20u8);
-            heap.extend_from_slice(&0x100u64.to_be_bytes()); // class_id
-            heap.extend_from_slice(&0u32.to_be_bytes()); // stack_serial
-            heap.extend_from_slice(&0x300u64.to_be_bytes()); // super_class_id
-            heap.extend_from_slice(&0u64.to_be_bytes()); // class_loader_id
-            heap.extend_from_slice(&0u64.to_be_bytes()); // signers_id
-            heap.extend_from_slice(&0u64.to_be_bytes()); // domain_id
-            heap.extend_from_slice(&0u64.to_be_bytes()); // reserved1
-            heap.extend_from_slice(&0u64.to_be_bytes()); // reserved2
-            heap.extend_from_slice(&8u32.to_be_bytes()); // instance_size = 8
-            heap.extend_from_slice(&0u16.to_be_bytes()); // cp_count = 0
-            // 1 static field: name_id=1, type=2 (object), value=0x200
-            heap.extend_from_slice(&1u16.to_be_bytes()); // statics_count = 1
-            heap.extend_from_slice(&1u64.to_be_bytes()); // static field name_id
-            heap.push(2u8); // type = Object
-            heap.extend_from_slice(&0x200u64.to_be_bytes()); // value = 0x200
-            // 1 instance field: name_id=1, type=2 (object-ref, to PrimArray 0x400)
-            heap.extend_from_slice(&1u16.to_be_bytes()); // instance_fields_count = 1
-            heap.extend_from_slice(&1u64.to_be_bytes()); // field name_id
-            heap.push(2u8); // type = Object
-        }
-
-        // INSTANCE_DUMP(object_id=0x200, class=0x100)
-        // data = object-ref 0x400 (the prim array)
-        {
-            heap.push(0x21u8); // TAG_INSTANCE_DUMP
-            heap.extend_from_slice(&0x200u64.to_be_bytes()); // object_id
-            heap.extend_from_slice(&0u32.to_be_bytes()); // stack_serial
-            heap.extend_from_slice(&0x100u64.to_be_bytes()); // class_id
-            heap.extend_from_slice(&8u32.to_be_bytes()); // data_length = 8 (one id-ref)
-            heap.extend_from_slice(&0x400u64.to_be_bytes()); // field value = 0x400
-        }
-
-        // PRIM_ARRAY_DUMP(array_id=0x400, int[], 3 elements)
-        {
-            heap.push(0x23u8); // TAG_PRIM_ARRAY_DUMP
-            heap.extend_from_slice(&0x400u64.to_be_bytes()); // array_id
-            heap.extend_from_slice(&0u32.to_be_bytes()); // stack_serial
-            heap.extend_from_slice(&3u32.to_be_bytes()); // num_elements = 3
-            heap.push(10u8); // element_type = int (4 bytes)
-            heap.extend_from_slice(&[0u8; 12]); // 3 × 4 bytes
-        }
-
-        write_record(&mut buf, 0x1Cu8, &heap);
-        buf
+    /// Dominator tree: VROOT → {0x100, 0x300}; 0x100 → 0x200 → 0x400.
+    /// Retained: 0x400 = 12, 0x200 = 8 + 12 = 20, 0x100 = 20, 0x300 = 0.
+    fn build_test_heap() -> Vec<u8> {
+        HprofBuilder::new(8)
+            .utf8(1, "MyClass")
+            .utf8(2, "java/lang/Object")
+            .load_class(1, 0x100, 1)
+            .load_class(2, 0x300, 2)
+            .root_sticky_class(0x100)
+            .root_sticky_class(0x300)
+            .class_dump(ClassSpec::new(0x300))
+            .class_dump(
+                ClassSpec::new(0x100)
+                    .super_class(0x300)
+                    .instance_size(8)
+                    .static_field(1, FieldValue::Object(0x200))
+                    .field(1, ty::OBJECT),
+            )
+            .instance_values(0x200, 0x100, &[FieldValue::Object(0x400)])
+            .int_array(0x400, &[0, 0, 0])
+            .build()
     }
 
-    fn build_all_indexes(hprof: &Vec<u8>) -> (Vec<u8>, Vec<u8>, Vec<u8>, [Vec<u8>; 9]) {
-        let mut record_idx = Vec::new();
-        let heap_dir = SubIndexDir::mem();
-        index_hprof(hprof, &mut record_idx).unwrap();
-        index_heap_dumps(hprof, &record_idx, &heap_dir).unwrap();
-
-        let mut object_store = Vec::new();
-        let mut r_unknown = Vec::new();
-        let mut r_jni_global = Vec::new();
-        let mut r_jni_local = Vec::new();
-        let mut r_java_frame = Vec::new();
-        let mut r_native_stack = Vec::new();
-        let mut r_sticky = Vec::new();
-        let mut r_thread_block = Vec::new();
-        let mut r_monitor_used = Vec::new();
-        let mut r_thread_obj = Vec::new();
-        combine_sort_and_split(
-            &heap_dir,
-            &mut object_store,
-            &mut [
-                &mut r_unknown,
-                &mut r_jni_global,
-                &mut r_jni_local,
-                &mut r_java_frame,
-                &mut r_native_stack,
-                &mut r_sticky,
-                &mut r_thread_block,
-                &mut r_monitor_used,
-                &mut r_thread_obj,
-            ],
-        )
-        .unwrap();
-
-        let mut utf8 = Vec::new();
-        let mut lc = Vec::new();
-        build_name_indexes(hprof, &record_idx, &mut utf8, &mut lc).unwrap();
-
-        let root_bytes = [
-            r_unknown,
-            r_jni_global,
-            r_jni_local,
-            r_java_frame,
-            r_native_stack,
-            r_sticky,
-            r_thread_block,
-            r_monitor_used,
-            r_thread_obj,
-        ];
-        (object_store, utf8, lc, root_bytes)
+    /// Run the pipeline (without the dominator step) in memory and return the
+    /// object store plus the nine root indexes the builder needs.
+    fn prerequisites(hprof: &[u8]) -> (crate::index::ByteSource, Vec<crate::index::ByteSource>) {
+        let store = MemStore::new();
+        let opts = IndexOptions {
+            retained: false,
+            force: false,
+            ..IndexOptions::default()
+        };
+        build_indexes(hprof, &store, &opts, &NoProgress).unwrap();
+        let roots = names::ROOTS
+            .iter()
+            .map(|n| store.open(n).unwrap())
+            .collect();
+        (store.open(names::OBJECT_STORE).unwrap(), roots)
     }
 
     #[test]
     fn dominator_and_retained_basic() {
-        let hprof = build_test_hprof();
-        let (object_store, _utf8, _lc, root_bytes) = build_all_indexes(&hprof);
+        let hprof = build_test_heap();
+        let (object_store, root_bytes) = prerequisites(&hprof);
+        let root_readers: [RootIndexReader<'_>; 9] =
+            std::array::from_fn(|i| RootIndexReader::from_ref(root_bytes[i].as_ref()).unwrap());
 
-        let root_readers = [
-            RootIndexReader::from_ref(&root_bytes[0]).unwrap(),
-            RootIndexReader::from_ref(&root_bytes[1]).unwrap(),
-            RootIndexReader::from_ref(&root_bytes[2]).unwrap(),
-            RootIndexReader::from_ref(&root_bytes[3]).unwrap(),
-            RootIndexReader::from_ref(&root_bytes[4]).unwrap(),
-            RootIndexReader::from_ref(&root_bytes[5]).unwrap(),
-            RootIndexReader::from_ref(&root_bytes[6]).unwrap(),
-            RootIndexReader::from_ref(&root_bytes[7]).unwrap(),
-            RootIndexReader::from_ref(&root_bytes[8]).unwrap(),
-        ];
-
-        let mut dominators = Vec::new();
-        let mut retained = Vec::new();
-
-        let (dom_count, ret_count) = build_dominator_and_retained(
-            &hprof,
-            &object_store,
-            &root_readers,
-            &mut dominators,
-            &mut retained,
-        )
-        .unwrap();
+        let out = MemStore::new();
+        let (dom_count, ret_count) =
+            build_dominator_and_retained(&hprof, object_store.as_ref(), &root_readers, &out)
+                .unwrap();
 
         assert!(dom_count > 0, "expected dominator entries");
         assert_eq!(dom_count, ret_count);
 
-        let dom_idx = DominatorIndex::from_ref(&dominators).unwrap();
-        let ret_idx = RetainedIndex::from_ref(&retained).unwrap();
+        let dominators = out.open(names::DOMINATORS).unwrap();
+        let retained = out.open(names::RETAINED).unwrap();
+        let dom_idx = DominatorIndex::from_ref(dominators.as_ref()).unwrap();
+        let ret_idx = RetainedIndex::from_ref(retained.as_ref()).unwrap();
+
+        // Derived entries: largest-first ranking and children by parent.
+        let by_size = out.open(names::RETAINED_BY_SIZE).unwrap();
+        let ranked: Vec<(u64, u64)> = RecordFile::<RetainedBySizeEntry>::new(by_size.as_ref())
+            .unwrap()
+            .iter()
+            .map(|e| (e.retained_bytes, e.object_id))
+            .collect();
+        assert_eq!(ranked[0].0, 20);
+        assert_eq!(ranked[ranked.len() - 1], (0, 0x300));
+        let children = out.open(names::DOMINATOR_CHILDREN).unwrap();
+        let children = RecordFile::<DomChildEntry>::new(children.as_ref()).unwrap();
+        let roots: Vec<u64> = children
+            .range(VIRTUAL_ROOT_ID)
+            .map(|e| e.object_id)
+            .collect();
+        assert_eq!(roots, vec![0x100, 0x300]);
+        assert_eq!(
+            children
+                .range(0x100)
+                .map(|e| e.object_id)
+                .collect::<Vec<_>>(),
+            vec![0x200]
+        );
+        assert!(children.range(0x400).next().is_none());
 
         // Class(0x100) and Class(0x300) are GC roots → dominated by VROOT
         assert_eq!(dom_idx.find(0x100), Some(VIRTUAL_ROOT_ID));
         assert_eq!(dom_idx.find(0x300), Some(VIRTUAL_ROOT_ID));
-
         // Instance(0x200) is dominated by Class(0x100) (via static field)
         assert_eq!(dom_idx.find(0x200), Some(0x100));
-
         // PrimArray(0x400) is dominated by Instance(0x200)
         assert_eq!(dom_idx.find(0x400), Some(0x200));
 
-        // PrimArray(0x400): 3 int elements = 12 bytes shallow = 12 retained
         assert_eq!(ret_idx.find(0x400), Some(12));
-
-        // Instance(0x200): 8 bytes shallow + 12 retained from 0x400 = 20
         assert_eq!(ret_idx.find(0x200), Some(20));
-
-        // Class(0x100): 0 shallow + 20 retained from 0x200 = 20
         assert_eq!(ret_idx.find(0x100), Some(20));
-
-        // Class(0x300): no children → 0 retained
         assert_eq!(ret_idx.find(0x300), Some(0));
+    }
+
+    #[test]
+    fn memory_estimate_is_linear_and_the_guard_uses_the_limit() {
+        assert_eq!(estimate_memory_bytes(0, 0), 0);
+        assert_eq!(estimate_memory_bytes(10, 0), 720);
+        assert_eq!(estimate_memory_bytes(0, 10), 120);
+        assert_eq!(estimate_memory_bytes(u64::MAX, u64::MAX), u64::MAX);
+        // 9.7 M objects + 18.2 M references (the calibration dump).
+        let est = estimate_memory_bytes(9_680_000, 18_200_000);
+        assert!(est > 726 * 1024 * 1024 && est < 1200 * 1024 * 1024, "{est}");
+
+        assert_eq!(check_memory(10, 10, Some(10_000)).unwrap(), 840);
+        assert!(matches!(
+            check_memory(10, 10, Some(839)),
+            Err(HprofError::InsufficientMemory {
+                needed: 840,
+                available: 839,
+                ..
+            })
+        ));
+    }
+
+    /// A reference to an object that is not in the dump (dangling) must not
+    /// create an edge.  Regression: the CSR out-degrees counted such
+    /// references but the fill pass skipped them, leaving zero-filled slots
+    /// that read as edges to compact node 0 (the lowest object id).
+    #[test]
+    fn edge_counts_beyond_u32_are_rejected_not_wrapped() {
+        assert!(check_edge_capacity(1_000, 100).is_ok());
+        let max = u64::from(u32::MAX);
+        assert!(check_edge_capacity(max - 100, 100).is_ok());
+        assert!(matches!(
+            check_edge_capacity(max - 99, 100),
+            Err(HprofError::TooLarge(_))
+        ));
+        assert!(check_edge_capacity(max + 1, 0).is_err());
+    }
+
+    #[test]
+    fn dangling_references_do_not_create_edges_to_the_lowest_object() {
+        use crate::test_util::{ClassSpec, HprofBuilder, ty};
+        // 0x50: unreachable instance with the lowest id (compact index 0).
+        // 0x100: sticky-root class; 0x200: instance referenced by its static.
+        // 0x200 has one field pointing at 0x999, which is not in the dump.
+        let hprof = HprofBuilder::new(8)
+            .utf8(1, "C")
+            .utf8(2, "f")
+            .load_class(1, 0x100, 1)
+            .root_sticky_class(0x100)
+            .class_dump(
+                ClassSpec::new(0x100)
+                    .instance_size(8)
+                    .static_field(2, FieldValue::Object(0x200))
+                    .field(2, ty::OBJECT),
+            )
+            .instance_values(0x50, 0x100, &[FieldValue::Object(0)])
+            .instance_values(0x200, 0x100, &[FieldValue::Object(0x999)])
+            .build();
+        let query = crate::test_util::build_in_memory(&hprof);
+        assert_eq!(query.dominator_of(0x200), Some(0x100));
+        assert_eq!(
+            query.dominator_of(0x50),
+            None,
+            "0x50 is unreachable; a dangling reference must not make it reachable"
+        );
+        assert_eq!(query.retained_size(0x50), None);
+        assert_eq!(query.retained_size(0x999), None);
+    }
+
+    #[test]
+    fn full_pipeline_exposes_the_same_answers_through_heap_query() {
+        let hprof = build_test_heap();
+        let query = crate::test_util::build_in_memory(&hprof);
+        assert!(query.has_retained_heap());
+        assert_eq!(query.retained_size(0x200), Some(20));
+        assert_eq!(query.dominator_of(0x400), Some(0x200));
     }
 
     /// Build a compact forward CSR for a simple graph described as a list of
     /// directed edges `(from_object_id, to_object_id)` and a list of all
     /// node object IDs (including isolated nodes).
-    ///
-    /// Returns `(compact_ids, fwd_off, fwd_edges)` suitable for the compact
-    /// RPO / dominator functions.
     fn make_compact_csr(
         all_ids: &[u64],
         edges: &[(u64, u64)],
@@ -1697,18 +1658,15 @@ mod tests {
         let (compact_ids, _shallow, fwd_off, fwd_edges) =
             make_compact_csr(&[1, 2, 3], &[(1, 2), (2, 3)]);
 
-        // compact_ids[0]=1, [1]=2, [2]=3  (sorted by ID)
         let gc_roots_compact: Vec<u32> = vec![0u32]; // id=1 → compact index 0
         let (rpo_order, rpo_of) = compute_rpo_compact(3, &gc_roots_compact, &fwd_off, &fwd_edges);
 
-        // rpo_order[0] = virtual root sentinel
         assert_eq!(rpo_order[0], u32::MAX, "RPO[0] should be virtual root");
-        // rpo_order[1..] = compact indices in DFS order: 0, 1, 2
-        assert_eq!(rpo_order[1], 0); // compact idx 0 = id 1
+        assert_eq!(rpo_order[1], 0);
         assert_eq!(rpo_order[2], 1);
         assert_eq!(rpo_order[3], 2);
 
-        assert_eq!(rpo_of[0], 1); // compact idx 0 → RPO pos 1
+        assert_eq!(rpo_of[0], 1);
         assert_eq!(rpo_of[1], 2);
         assert_eq!(rpo_of[2], 3);
 
@@ -1729,10 +1687,6 @@ mod tests {
             build_backward_csr(n_rpo, &gc_roots, &fwd_off, &fwd_edges, &rpo_of, n);
         let doms = run_dominator(n_rpo, &pred_off, &pred_edges);
 
-        // doms[0] = 0 (VROOT dominates itself)
-        // doms[1] = 0 (A ← VROOT)
-        // doms[2] = 1 (B ← A)
-        // doms[3] = 2 (C ← B)
         assert_eq!(doms[0], 0);
         assert_eq!(doms[1], 0);
         assert_eq!(doms[2], 1);
@@ -1768,10 +1722,9 @@ mod tests {
         let global_doms = run_partitioned_dominators(n, &gc_roots, &fwd_off, &fwd_edges, &color);
         let retained = compute_retained_from_doms(n, &global_doms, &shallow_sizes);
 
-        // compact: id=1→0, id=2→1, id=3→2
-        assert_eq!(retained[2], 30, "C retained"); // compact 2 = id=3
-        assert_eq!(retained[1], 50, "B retained"); // compact 1 = id=2
-        assert_eq!(retained[0], 60, "A retained"); // compact 0 = id=1
+        assert_eq!(retained[2], 30, "C retained");
+        assert_eq!(retained[1], 50, "B retained");
+        assert_eq!(retained[0], 60, "A retained");
 
         let _ = compact_ids;
     }
@@ -1788,7 +1741,7 @@ mod tests {
         assert_eq!(idx.find(20), Some(10));
         assert_eq!(idx.find(30), Some(10));
         assert_eq!(idx.find(99), None);
-        assert_eq!(idx.len(), 3);
+        assert_eq!(idx.file.len(), 3);
     }
 
     #[test]

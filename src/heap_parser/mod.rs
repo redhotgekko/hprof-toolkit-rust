@@ -1,46 +1,37 @@
 pub mod record;
 
+pub(crate) use record::parse_sub_record;
 pub use record::{
     ClassDump, CpEntry, CpEntryIter, FieldValue, InstanceDump, InstanceFieldDescriptor,
     InstanceFieldIter, ObjArrayDump, ObjArrayElemIter, PrimArrayDump, RootJavaFrame, RootJniGlobal,
     RootJniLocal, RootMonitorUsed, RootNativeStack, RootStickyClass, RootThreadBlock,
-    RootThreadObj, RootUnknown, StaticField, StaticFieldIter, SubRecord, parse_sub_record,
+    RootThreadObj, RootUnknown, StaticField, StaticFieldIter, SubRecord,
 };
 
-use crate::heap_index::sub_record::{SUB_INDEX_ENTRY_SIZE, SubIndexEntry};
+use crate::heap_index::sub_record::{
+    SubIndexEntry, TAG_CLASS_DUMP, TAG_INSTANCE_DUMP, TAG_OBJ_ARRAY_DUMP, TAG_PRIM_ARRAY_DUMP,
+};
 use crate::hprof::HprofError;
-use std::path::{Path, PathBuf};
+use crate::index::{RecordFile, RecordIter};
 
 // ── SubIndexReader ────────────────────────────────────────────────────────────
 
-/// Memory-mapped reader for a single heap index sub-index file.
-///
-/// Each file was produced by [`crate::heap_index::index_heap_dumps`] for one
-/// `HPROF_HEAP_DUMP` / `HPROF_HEAP_DUMP_SEGMENT` record.
-pub struct SubIndexReader<'a> {
-    data: &'a [u8],
+/// Iterator over [`SubIndexEntry`] values in a [`SubIndexReader`].
+pub(crate) type SubIndexIter<'a> = RecordIter<'a, SubIndexEntry>;
+
+/// Reader for a heap sub-record index: either one per-segment intermediate
+/// produced by [`crate::heap_index::index_heap_dumps`], or the sorted object
+/// store produced by [`crate::object_store::combine_sort_and_split`].
+#[derive(Clone, Copy)]
+pub(crate) struct SubIndexReader<'a> {
+    file: RecordFile<'a, SubIndexEntry>,
 }
 
 impl<'a> SubIndexReader<'a> {
     pub fn from_ref(bytes: &'a [u8]) -> Result<Self, HprofError> {
-        if !bytes.len().is_multiple_of(SUB_INDEX_ENTRY_SIZE) {
-            return Err(HprofError::InvalidIndexFile);
-        }
-        Ok(Self { data: bytes })
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        self.data
-    }
-
-    /// Number of sub-index entries in this file.
-    pub fn len(&self) -> usize {
-        self.as_slice().len() / SUB_INDEX_ENTRY_SIZE
-    }
-
-    /// Returns `true` if the file contains no entries.
-    pub fn is_empty(&self) -> bool {
-        self.as_slice().is_empty()
+        Ok(Self {
+            file: RecordFile::new(bytes)?,
+        })
     }
 
     /// Iterate over all [`SubIndexEntry`] values in file order.
@@ -48,141 +39,55 @@ impl<'a> SubIndexReader<'a> {
     /// The returned iterator borrows from the underlying data slice (`'a`),
     /// so it can outlive the `SubIndexReader` struct itself.
     pub fn iter(&self) -> SubIndexIter<'a> {
-        SubIndexIter {
-            data: self.data,
-            pos: 0,
-        }
+        self.file.iter()
     }
 
     /// Return the [`SubIndexEntry`] at position `i`, or `None` when
     /// `i >= len()`.
     pub fn entry_at(&self, i: usize) -> Option<SubIndexEntry> {
-        let data = self.as_slice();
-        let start = i * SUB_INDEX_ENTRY_SIZE;
-        let end = start + SUB_INDEX_ENTRY_SIZE;
-        if end > data.len() {
-            return None;
-        }
-        let arr: &[u8; SUB_INDEX_ENTRY_SIZE] = data[start..end].try_into().ok()?;
-        Some(SubIndexEntry::from_bytes(arr))
+        self.file.get(i)
     }
 
-    /// Binary-search for the first entry whose `object_id == target`.
+    /// Binary-search for the entry describing the object `target`.
     ///
-    /// **Requires:** the file must be sorted ascending by `object_id`, as
-    /// produced by [`crate::object_store::combine_and_sort_sub_index`].
+    /// An object that is also a GC root has several entries with the same
+    /// `object_id` (one per root record plus the object record).  This
+    /// returns the **object record** (class dump, instance dump or array
+    /// dump) when one exists, and only falls back to a root record when the
+    /// id has no object record at all — so the answer does not depend on the
+    /// order in which equal ids were sorted.
+    ///
+    /// **Requires:** sorted ascending by `object_id` (the object store).
     pub fn find_by_object_id(&self, target: u64) -> Option<SubIndexEntry> {
         self.find_by_object_id_and_tag(target, None)
     }
 
-    /// Binary-search for the first entry matching `object_id == target` with
-    /// the given `tag` (or any tag if `tag` is `None`).
-    ///
-    /// After locating the insertion point via binary search, scans forward
-    /// through entries that share `target` until the desired tag is found.
+    /// Binary-search for the entry matching `object_id == target` with the
+    /// given `tag`.  With `tag == None` behaves like [`Self::find_by_object_id`].
     ///
     /// **Requires:** sorted ascending by `object_id`.
     pub fn find_by_object_id_and_tag(&self, target: u64, tag: Option<u8>) -> Option<SubIndexEntry> {
-        let data = self.as_slice();
-        let n = self.len();
-
-        // Leftmost binary search: first index where object_id >= target.
-        let mut lo = 0usize;
-        let mut hi = n;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if sub_entry_object_id(data, mid) < target {
-                lo = mid + 1;
-            } else {
-                hi = mid;
+        let mut fallback: Option<SubIndexEntry> = None;
+        for entry in self.file.range(target) {
+            match tag {
+                Some(t) if t == entry.tag => return Some(entry),
+                Some(_) => {}
+                None if is_object_tag(entry.tag) => return Some(entry),
+                None => {
+                    fallback.get_or_insert(entry);
+                }
             }
         }
-
-        // Linear scan through entries that share the target object_id.
-        while lo < n && sub_entry_object_id(data, lo) == target {
-            let start = lo * SUB_INDEX_ENTRY_SIZE;
-            let bytes: [u8; SUB_INDEX_ENTRY_SIZE] =
-                data[start..start + SUB_INDEX_ENTRY_SIZE].try_into().ok()?;
-            let entry = SubIndexEntry::from_bytes(&bytes);
-            if tag.is_none_or(|t| t == entry.tag) {
-                return Some(entry);
-            }
-            lo += 1;
-        }
-        None
+        fallback
     }
 }
 
-/// Read the `object_id` field from entry `idx` in a flat sub-index byte slice.
-fn sub_entry_object_id(data: &[u8], idx: usize) -> u64 {
-    let start = idx * SUB_INDEX_ENTRY_SIZE + 8;
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&data[start..start + 8]);
-    u64::from_le_bytes(bytes)
-}
-
-// ── SubIndexIter ──────────────────────────────────────────────────────────────
-
-/// Iterator over [`SubIndexEntry`] values in a [`SubIndexReader`].
-pub struct SubIndexIter<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> SubIndexIter<'a> {
-    /// Construct an iterator directly from a validated data slice.
-    ///
-    /// The caller must ensure `data.len()` is a multiple of
-    /// [`SUB_INDEX_ENTRY_SIZE`]; this is guaranteed when the slice comes from
-    /// a [`ByteSource`] that was validated at index-open time.
-    pub(crate) fn new(data: &'a [u8]) -> Self {
-        debug_assert!(data.len().is_multiple_of(SUB_INDEX_ENTRY_SIZE));
-        SubIndexIter { data, pos: 0 }
-    }
-}
-
-impl Iterator for SubIndexIter<'_> {
-    type Item = SubIndexEntry;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.pos + SUB_INDEX_ENTRY_SIZE > self.data.len() {
-            return None;
-        }
-        let arr: &[u8; SUB_INDEX_ENTRY_SIZE] = self.data[self.pos..self.pos + SUB_INDEX_ENTRY_SIZE]
-            .try_into()
-            .ok()?;
-        let entry = SubIndexEntry::from_bytes(arr);
-        self.pos += SUB_INDEX_ENTRY_SIZE;
-        Some(entry)
-    }
-}
-
-// ── Directory helpers ─────────────────────────────────────────────────────────
-
-/// Return paths to all heap index sub-index files under `output_dir`.
-///
-/// Files are stored in two-character hex subdirectories (e.g. `output_dir/1f/HPROF_HEAP_DUMP_SEGMENT_31`).
-/// Matches any file whose name starts with `HPROF_HEAP_DUMP`, which covers
-/// both `HPROF_HEAP_DUMP_<pos>` and `HPROF_HEAP_DUMP_SEGMENT_<pos>`.
-pub fn sub_index_paths(output_dir: &Path) -> Result<Vec<PathBuf>, HprofError> {
-    let mut paths = Vec::new();
-    for subdir_entry in std::fs::read_dir(output_dir)? {
-        let subdir_entry = subdir_entry?;
-        if !subdir_entry.file_type()?.is_dir() {
-            continue;
-        }
-        for file_entry in std::fs::read_dir(subdir_entry.path())? {
-            let file_entry = file_entry?;
-            if file_entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("HPROF_HEAP_DUMP")
-            {
-                paths.push(file_entry.path());
-            }
-        }
-    }
-    Ok(paths)
+/// `true` for the four tags that describe a heap object rather than a GC root.
+pub(crate) fn is_object_tag(tag: u8) -> bool {
+    matches!(
+        tag,
+        TAG_CLASS_DUMP | TAG_INSTANCE_DUMP | TAG_OBJ_ARRAY_DUMP | TAG_PRIM_ARRAY_DUMP
+    )
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -192,51 +97,39 @@ mod tests {
     use super::*;
     use crate::heap_index::index_heap_dumps;
     use crate::heap_index::sub_record::TAG_ROOT_STICKY_CLASS;
+    use crate::index::{IndexStore, MemStore, names};
     use crate::record_index::index_hprof;
-    use crate::vfs::SubIndexDir;
+    use crate::test_util::HprofBuilder;
 
-    fn sub_index_readers(all_bytes: &[Vec<u8>]) -> Result<Vec<SubIndexReader<'_>>, HprofError> {
-        all_bytes
-            .iter()
-            .map(|data| data.as_ref())
-            .map(SubIndexReader::from_ref)
-            .collect()
+    fn two_sticky_classes() -> Vec<u8> {
+        HprofBuilder::new(8)
+            .root_sticky_class(1)
+            .root_sticky_class(2)
+            .build()
     }
 
-    fn minimal_hprof_two_sticky_classes() -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"JAVA PROFILE 1.0.2\0");
-        buf.extend_from_slice(&8u32.to_be_bytes());
-        buf.extend_from_slice(&0u64.to_be_bytes());
-        // HEAP_DUMP_SEGMENT: two ROOT_STICKY_CLASS sub-records
-        let mut body = Vec::new();
-        body.push(TAG_ROOT_STICKY_CLASS);
-        body.extend_from_slice(&1u64.to_be_bytes()); // class_id = 1
-        body.push(TAG_ROOT_STICKY_CLASS);
-        body.extend_from_slice(&2u64.to_be_bytes()); // class_id = 2
-        buf.push(0x1C);
-        buf.extend_from_slice(&0u32.to_be_bytes());
-        buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&body);
-        buf
+    /// Index the heap dumps in memory and return every per-segment entry.
+    fn sub_index_sources(hprof_data: &[u8]) -> Vec<crate::index::ByteSource> {
+        let mut idx_buf = Vec::new();
+        let store = MemStore::new();
+        index_hprof(hprof_data, &mut idx_buf).unwrap();
+        index_heap_dumps(hprof_data, &idx_buf, &store).unwrap();
+        store
+            .list(names::HEAP_INDEX_PREFIX)
+            .unwrap()
+            .iter()
+            .map(|n| store.open(n).unwrap())
+            .collect()
     }
 
     #[test]
     fn sub_index_reader_iter() {
-        // Run record_index + heap_index, then read the sub-index with SubIndexReader.
-        let hprof_data = minimal_hprof_two_sticky_classes();
-        let mut idx_buf = Vec::new();
-        let out_dir = SubIndexDir::mem();
+        let hprof_data = two_sticky_classes();
+        let sources = sub_index_sources(&hprof_data);
+        assert_eq!(sources.len(), 1);
 
-        index_hprof(&hprof_data, &mut idx_buf).unwrap();
-        index_heap_dumps(&hprof_data, &idx_buf, &out_dir).unwrap();
-
-        let all_bytes = out_dir.all_file_bytes().unwrap();
-        let readers = sub_index_readers(&all_bytes).unwrap();
-        assert_eq!(readers.len(), 1);
-
-        let reader = &readers[0];
-        assert_eq!(reader.len(), 2);
+        let reader = SubIndexReader::from_ref(sources[0].as_ref()).unwrap();
+        assert_eq!(reader.iter().count(), 2);
 
         let entries: Vec<_> = reader.iter().collect();
         assert_eq!(entries[0].tag, TAG_ROOT_STICKY_CLASS);
@@ -247,17 +140,10 @@ mod tests {
 
     #[test]
     fn parse_sub_record_via_reader() {
-        let hprof_data = minimal_hprof_two_sticky_classes();
-        let mut idx_buf = Vec::new();
-        let out_dir = SubIndexDir::mem();
-
-        index_hprof(&hprof_data, &mut idx_buf).unwrap();
-        index_heap_dumps(&hprof_data, &idx_buf, &out_dir).unwrap();
-
+        let hprof_data = two_sticky_classes();
+        let sources = sub_index_sources(&hprof_data);
         let hprof = crate::hprof::HprofFile::from_ref(&hprof_data).unwrap();
-        let all_bytes = out_dir.all_file_bytes().unwrap();
-        let readers = sub_index_readers(&all_bytes).unwrap();
-        let reader = &readers[0];
+        let reader = SubIndexReader::from_ref(sources[0].as_ref()).unwrap();
 
         let class_ids: Vec<u64> = reader
             .iter()
@@ -272,5 +158,45 @@ mod tests {
             .collect();
 
         assert_eq!(class_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn find_by_object_id_and_tag_scans_duplicates() {
+        // Two entries share object id 5 with different tags; sorted input.
+        let mut data = Vec::new();
+        for (tag, id) in [(0x05u8, 5u64), (0x21, 5), (0x21, 9)] {
+            data.extend_from_slice(
+                &SubIndexEntry {
+                    tag,
+                    object_id: id,
+                    position: 0,
+                }
+                .to_bytes(),
+            );
+        }
+        let reader = SubIndexReader::from_ref(&data).unwrap();
+        // The object record (0x21) wins over the GC-root record (0x05) that
+        // shares its id, regardless of sort order.
+        assert_eq!(reader.find_by_object_id(5).unwrap().tag, 0x21);
+        assert_eq!(
+            reader.find_by_object_id_and_tag(5, Some(0x05)).unwrap().tag,
+            0x05
+        );
+        assert!(reader.find_by_object_id_and_tag(5, Some(0x22)).is_none());
+        assert!(reader.find_by_object_id(7).is_none());
+        assert_eq!(reader.entry_at(2).unwrap().object_id, 9);
+        assert!(reader.entry_at(3).is_none());
+    }
+
+    #[test]
+    fn root_only_id_falls_back_to_root_record() {
+        let data = SubIndexEntry {
+            tag: 0x05,
+            object_id: 7,
+            position: 1,
+        }
+        .to_bytes();
+        let reader = SubIndexReader::from_ref(&data).unwrap();
+        assert_eq!(reader.find_by_object_id(7).unwrap().tag, 0x05);
     }
 }

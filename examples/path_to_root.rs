@@ -1,69 +1,31 @@
-//! Find the GC root path that is keeping a specific object alive.
+//! Why is this object still alive? Prints the reference chain from a GC root,
+//! naming the field that holds each link.
 //!
-//! When you have identified a suspicious object (e.g. from `class_histogram`
-//! or `find_strings`) and want to know *why* it hasn't been collected, this
-//! traces the reference chain back to the nearest GC root.
-//!
-//! ```text
-//! cargo run --example path_to_root -- <object_id_hex>
-//! ```
-//!
-//! Example:
-//! ```text
-//! cargo run --example path_to_root -- 0x1a2b3c4d
-//! ```
-//!
-//! Output:
-//! ```text
-//! Path to root for 0x1a2b3c4d:
-//!   0x1a2b3c4d  java.util.HashMap
-//!   0x00000080  [GC root: JNI global]
-//! ```
+//!     cargo run --release --example path_to_root -- heap.hprof 0x1a2b3c
 
-use hprof_toolkit::{
-    hprof::HprofError,
-    pipeline::build_all_indexes,
-    query::{HeapQuery, RootPathResult},
-};
-use std::path::Path;
+use hprof_toolkit::prelude::*;
 
-fn main() -> Result<(), HprofError> {
-    let hex = std::env::args().nth(1).unwrap_or_else(|| {
-        eprintln!("Usage: path_to_root <object_id_hex>");
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args().skip(1);
+    let (Some(path), Some(id)) = (args.next(), args.next()) else {
+        eprintln!("usage: path_to_root <heap.hprof> <hex id>");
         std::process::exit(1);
-    });
-    let object_id = u64::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap_or_else(|_| {
-        eprintln!("Invalid hex id: {hex}");
-        std::process::exit(1);
-    });
+    };
+    let id = u64::from_str_radix(id.trim_start_matches("0x"), 16)?;
+    let heap = HeapQuery::open(path)?;
 
-    let path = Path::new("./heap.dump");
-    let indexes = build_all_indexes(path)?;
-    let query = HeapQuery::open(path, &indexes)?;
-
-    match query.path_to_root(object_id) {
-        RootPathResult::Found(chain) => {
-            println!("Path to root for 0x{object_id:x}:");
-            for id in &chain {
-                let type_name = query.object_type_name(*id)?;
-                let root_marker = if query.is_gc_root(*id) {
-                    let kinds = query.root_types_of(*id);
-                    format!("  [GC root: {:?}]", kinds)
-                } else {
-                    String::new()
-                };
-                println!("  0x{id:x}  {type_name}{root_marker}");
-            }
-        }
-        RootPathResult::LimitReached => {
-            println!("Search limit reached — object is deeply nested or part of a large graph.");
-        }
-        RootPathResult::NotReachable => {
-            println!(
-                "Object 0x{object_id:x} is not reachable from any GC root (already collected?)."
-            );
-        }
+    let path = heap.path_to_root(id, &RootPathLimits::default());
+    println!(
+        "{:?} after visiting {} objects",
+        path.outcome, path.nodes_visited
+    );
+    for step in &path.steps {
+        let via = step.via.as_ref().map(|e| e.to_string()).unwrap_or_default();
+        println!(
+            "{via:<14} 0x{:x}  {}",
+            step.object_id,
+            heap.object_type_name(step.object_id)
+        );
     }
-
     Ok(())
 }

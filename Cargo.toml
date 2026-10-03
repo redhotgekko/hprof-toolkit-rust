@@ -2,6 +2,7 @@
 name = "hprof-toolkit"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
 
 [lints.clippy]
 unwrap_used = "deny"
@@ -15,3 +16,9 @@ axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+regex = "1"
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
+clap = { version = "4.6.7", features = ["derive"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

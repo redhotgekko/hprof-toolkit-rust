@@ -1,7 +1,8 @@
 //! Binary diff index files for heap dump comparisons.
 //!
 //! [`build_diff_indexes`] performs a single O(n + m) merge-walk over two
-//! sorted combined sub-record indexes and writes three binary output files:
+//! sorted combined sub-record indexes and writes three entries into an
+//! [`IndexStore`] (a directory on disk, or memory in tests):
 //!
 //! * `removed.bin` — objects present only in dump 1 (garbage-collected)
 //! * `added.bin`   — objects present only in dump 2 (newly allocated)
@@ -30,14 +31,19 @@
 //! 24..32  u64 LE    position2 (byte offset in hprof2)
 //! ```
 
-use crate::heap_index::sub_record::{
-    SubIndexEntry, TAG_CLASS_DUMP, TAG_INSTANCE_DUMP, TAG_OBJ_ARRAY_DUMP, TAG_PRIM_ARRAY_DUMP,
-};
-use crate::heap_parser::SubRecord;
+use crate::heap_index::sub_record::SubIndexEntry;
+use crate::heap_parser::{SubRecord, is_object_tag};
 use crate::hprof::HprofError;
+use crate::index::{Entry, IndexStore, RecordWriter, read_u64_le};
 use crate::query::HeapQuery;
-use std::io::Write;
 use std::path::{Path, PathBuf};
+
+/// Entry name of the objects only in the first dump.
+pub const REMOVED: &str = "removed.bin";
+/// Entry name of the objects only in the second dump.
+pub const ADDED: &str = "added.bin";
+/// Entry name of the objects in both dumps.
+pub const COMMON: &str = "common.bin";
 
 // ── Record sizes ──────────────────────────────────────────────────────────────
 
@@ -67,14 +73,6 @@ impl DiffEntry {
         buf[8..16].copy_from_slice(&self.object_id.to_le_bytes());
         buf[16..24].copy_from_slice(&self.position.to_le_bytes());
         buf
-    }
-
-    pub fn from_bytes(bytes: &[u8; DIFF_ENTRY_SIZE]) -> Self {
-        Self {
-            tag: bytes[0],
-            object_id: u64::from_le_bytes(bytes[8..16].try_into().unwrap_or([0u8; 8])),
-            position: u64::from_le_bytes(bytes[16..24].try_into().unwrap_or([0u8; 8])),
-        }
     }
 }
 
@@ -106,63 +104,30 @@ impl CommonEntry {
         buf[24..32].copy_from_slice(&self.position2.to_le_bytes());
         buf
     }
-
-    pub fn from_bytes(bytes: &[u8; COMMON_ENTRY_SIZE]) -> Self {
-        Self {
-            tag: bytes[0],
-            changed: bytes[1] != 0,
-            object_id: u64::from_le_bytes(bytes[8..16].try_into().unwrap_or([0u8; 8])),
-            position1: u64::from_le_bytes(bytes[16..24].try_into().unwrap_or([0u8; 8])),
-            position2: u64::from_le_bytes(bytes[24..32].try_into().unwrap_or([0u8; 8])),
-        }
-    }
 }
 
-// ── DiffIndexPaths ────────────────────────────────────────────────────────────
+// ── Location on disk ──────────────────────────────────────────────────────────
 
-/// Paths to the three diff index files and their parent directory.
-///
-/// The directory is placed adjacent to `hprof1` and named
-/// `{stem1}_vs_{stem2}.diff_indexes`.  For `./heap1.dump` vs `./heap2.dump`
-/// this gives `./heap1_vs_heap2.diff_indexes/`.
-pub struct DiffIndexPaths {
-    pub dir: PathBuf,
-    pub removed: PathBuf,
-    pub added: PathBuf,
-    pub common: PathBuf,
-}
-
-impl DiffIndexPaths {
-    /// Derive diff index paths from the two hprof file paths.
-    pub fn for_hprofs(hprof1: &Path, hprof2: &Path) -> Self {
-        let stem1 = hprof1
-            .file_stem()
+/// Directory that holds the diff entries of `hprof1` against `hprof2`:
+/// `{stem1}_vs_{stem2}.diff_indexes`, next to `hprof1`.
+pub fn diff_dir_for_hprofs(hprof1: &Path, hprof2: &Path) -> PathBuf {
+    let stem = |p: &Path, fallback: &str| {
+        p.file_stem()
             .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "dump1".to_string());
-        let stem2 = hprof2
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "dump2".to_string());
-        let parent = hprof1.parent().unwrap_or(Path::new("."));
-        let dir = parent.join(format!("{stem1}_vs_{stem2}.diff_indexes"));
-        Self {
-            removed: dir.join("removed.bin"),
-            added: dir.join("added.bin"),
-            common: dir.join("common.bin"),
-            dir,
-        }
-    }
-
-    /// Returns `true` when all three index files already exist.
-    pub fn all_exist(&self) -> bool {
-        self.removed.exists() && self.added.exists() && self.common.exists()
-    }
+            .unwrap_or_else(|| fallback.to_string())
+    };
+    let parent = hprof1.parent().unwrap_or(Path::new("."));
+    parent.join(format!(
+        "{}_vs_{}.diff_indexes",
+        stem(hprof1, "dump1"),
+        stem(hprof2, "dump2")
+    ))
 }
 
 // ── Build counts ─────────────────────────────────────────────────────────────
 
 /// Record counts returned by [`build_diff_indexes`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DiffIndexCounts {
     pub removed: u64,
     pub added: u64,
@@ -172,123 +137,82 @@ pub struct DiffIndexCounts {
 
 // ── Builder ───────────────────────────────────────────────────────────────────
 
-/// Build the three diff index files, skipping if they already exist.
+/// Build the three diff entries in `store`, unless all three already exist.
 ///
 /// Performs a single O(n + m) merge-walk of the two sorted combined indexes.
 /// For each common object, the raw data bytes of both records are compared to
-/// set the `changed` flag.
+/// set the `changed` flag.  Output is streamed; memory use is constant.
 ///
-/// Returns the counts of written entries. If all three files exist, returns
-/// zero counts without re-building.
+/// Returns the counts of written entries, or zero counts when the entries
+/// were already present.
 pub fn build_diff_indexes(
     query1: &HeapQuery,
     query2: &HeapQuery,
-    paths: &DiffIndexPaths,
+    store: &dyn IndexStore,
 ) -> Result<DiffIndexCounts, HprofError> {
-    if paths.all_exist() {
-        return Ok(DiffIndexCounts {
-            removed: 0,
-            added: 0,
-            common: 0,
-            common_changed: 0,
-        });
+    if [REMOVED, ADDED, COMMON].iter().all(|n| store.exists(n)) {
+        return Ok(DiffIndexCounts::default());
     }
 
-    std::fs::create_dir_all(&paths.dir)?;
-
-    let mut w_removed = std::io::BufWriter::new(std::fs::File::create(&paths.removed)?);
-    let mut w_added = std::io::BufWriter::new(std::fs::File::create(&paths.added)?);
-    let mut w_common = std::io::BufWriter::new(std::fs::File::create(&paths.common)?);
-
-    let mut counts = DiffIndexCounts {
-        removed: 0,
-        added: 0,
-        common: 0,
-        common_changed: 0,
-    };
+    let mut w_removed = RecordWriter::<DiffEntry>::new(store.create(REMOVED)?);
+    let mut w_added = RecordWriter::<DiffEntry>::new(store.create(ADDED)?);
+    let mut w_common = RecordWriter::<CommonEntry>::new(store.create(COMMON)?);
+    let mut counts = DiffIndexCounts::default();
 
     let mut iter1 = query1.iter_entries().filter(|e| is_object_tag(e.tag));
     let mut iter2 = query2.iter_entries().filter(|e| is_object_tag(e.tag));
     let mut cur1: Option<SubIndexEntry> = iter1.next();
     let mut cur2: Option<SubIndexEntry> = iter2.next();
 
-    loop {
-        match (cur1, cur2) {
-            (None, None) => break,
+    let as_diff = |e: &SubIndexEntry| DiffEntry {
+        tag: e.tag,
+        object_id: e.object_id,
+        position: e.position,
+    };
 
-            (Some(e1), None) => {
-                write_diff_entry(&mut w_removed, &e1)?;
+    loop {
+        let order = match (&cur1, &cur2) {
+            (None, None) => break,
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some(a), Some(b)) => a.object_id.cmp(&b.object_id),
+        };
+        match (order, cur1, cur2) {
+            (std::cmp::Ordering::Less, Some(e1), _) => {
+                w_removed.push(&as_diff(&e1))?;
                 counts.removed += 1;
                 cur1 = iter1.next();
-                cur2 = None;
             }
-
-            (None, Some(e2)) => {
-                write_diff_entry(&mut w_added, &e2)?;
+            (std::cmp::Ordering::Greater, _, Some(e2)) => {
+                w_added.push(&as_diff(&e2))?;
                 counts.added += 1;
-                cur1 = None;
                 cur2 = iter2.next();
             }
-
-            (Some(e1), Some(e2)) => match e1.object_id.cmp(&e2.object_id) {
-                std::cmp::Ordering::Less => {
-                    write_diff_entry(&mut w_removed, &e1)?;
-                    counts.removed += 1;
-                    cur1 = iter1.next();
-                    cur2 = Some(e2);
-                }
-                std::cmp::Ordering::Greater => {
-                    write_diff_entry(&mut w_added, &e2)?;
-                    counts.added += 1;
-                    cur1 = Some(e1);
-                    cur2 = iter2.next();
-                }
-                std::cmp::Ordering::Equal => {
-                    let changed = records_changed(query1, &e1, query2, &e2)?;
-                    let entry = CommonEntry {
-                        tag: e1.tag,
-                        changed,
-                        object_id: e1.object_id,
-                        position1: e1.position,
-                        position2: e2.position,
-                    };
-                    w_common.write_all(&entry.to_bytes())?;
-                    counts.common += 1;
-                    if changed {
-                        counts.common_changed += 1;
-                    }
-                    cur1 = iter1.next();
-                    cur2 = iter2.next();
-                }
-            },
+            (_, Some(e1), Some(e2)) => {
+                let changed = records_changed(query1, &e1, query2, &e2)?;
+                w_common.push(&CommonEntry {
+                    tag: e1.tag,
+                    changed,
+                    object_id: e1.object_id,
+                    position1: e1.position,
+                    position2: e2.position,
+                })?;
+                counts.common += 1;
+                counts.common_changed += u64::from(changed);
+                cur1 = iter1.next();
+                cur2 = iter2.next();
+            }
+            _ => break,
         }
     }
 
-    w_removed.flush()?;
-    w_added.flush()?;
-    w_common.flush()?;
-
+    w_removed.finish()?;
+    w_added.finish()?;
+    w_common.finish()?;
     Ok(counts)
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
-
-fn is_object_tag(tag: u8) -> bool {
-    matches!(
-        tag,
-        TAG_INSTANCE_DUMP | TAG_CLASS_DUMP | TAG_OBJ_ARRAY_DUMP | TAG_PRIM_ARRAY_DUMP
-    )
-}
-
-fn write_diff_entry(w: &mut impl Write, entry: &SubIndexEntry) -> Result<(), HprofError> {
-    let de = DiffEntry {
-        tag: entry.tag,
-        object_id: entry.object_id,
-        position: entry.position,
-    };
-    w.write_all(&de.to_bytes())?;
-    Ok(())
-}
 
 /// Compare the data bytes of two records at the same object_id.
 ///
@@ -316,155 +240,58 @@ fn records_changed(
     })
 }
 
-// ── DiffEntryReader ───────────────────────────────────────────────────────────
+// ── Entry impls ───────────────────────────────────────────────────────────────
 
-/// Reader for `removed.bin` or `added.bin`.
-pub struct DiffEntryReader<'a> {
-    data: &'a [u8],
-}
+impl Entry for DiffEntry {
+    const SIZE: usize = DIFF_ENTRY_SIZE;
+    const KEY_OFFSET: usize = 8;
 
-impl<'a> DiffEntryReader<'a> {
-    /// Create a validated reader from a byte slice.
-    pub fn from_ref(data: &'a [u8]) -> Result<Self, HprofError> {
-        if !data.len().is_multiple_of(DIFF_ENTRY_SIZE) {
-            return Err(HprofError::InvalidIndexFile);
+    fn from_bytes(b: &[u8]) -> Self {
+        Self {
+            tag: b[0],
+            object_id: read_u64_le(b, 8),
+            position: read_u64_le(b, 16),
         }
-        Ok(Self { data })
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_slice(data: &'a [u8]) -> Self {
-        debug_assert!(data.len().is_multiple_of(DIFF_ENTRY_SIZE));
-        Self { data }
+    fn write_to(&self, out: &mut [u8]) {
+        out.copy_from_slice(&self.to_bytes());
     }
 
-    /// Number of entries in the file.
-    pub fn len(&self) -> usize {
-        self.data.len() / DIFF_ENTRY_SIZE
-    }
-
-    /// Returns `true` if there are no entries.
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-
-    /// Return the entry at position `i`, or `None` when `i >= len()`.
-    pub fn entry_at(&self, i: usize) -> Option<DiffEntry> {
-        let start = i * DIFF_ENTRY_SIZE;
-        let end = start + DIFF_ENTRY_SIZE;
-        if end > self.data.len() {
-            return None;
-        }
-        let arr: &[u8; DIFF_ENTRY_SIZE] = self.data[start..end].try_into().ok()?;
-        Some(DiffEntry::from_bytes(arr))
-    }
-
-    /// Iterate all entries in ascending `object_id` order.
-    pub fn iter(&self) -> DiffEntryIter<'a> {
-        DiffEntryIter {
-            data: self.data,
-            pos: 0,
-        }
+    fn key(&self) -> u64 {
+        self.object_id
     }
 }
 
-/// Iterator over [`DiffEntry`] values.
-pub struct DiffEntryIter<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
+impl Entry for CommonEntry {
+    const SIZE: usize = COMMON_ENTRY_SIZE;
+    const KEY_OFFSET: usize = 8;
 
-impl Iterator for DiffEntryIter<'_> {
-    type Item = DiffEntry;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let end = self.pos + DIFF_ENTRY_SIZE;
-        if end > self.data.len() {
-            return None;
-        }
-        let arr: &[u8; DIFF_ENTRY_SIZE] = self.data[self.pos..end].try_into().ok()?;
-        self.pos = end;
-        Some(DiffEntry::from_bytes(arr))
-    }
-}
-
-// ── CommonEntryReader ─────────────────────────────────────────────────────────
-
-/// Reader for `common.bin`.
-pub struct CommonEntryReader<'a> {
-    data: &'a [u8],
-}
-
-impl<'a> CommonEntryReader<'a> {
-    /// Create a validated reader from a byte slice.
-    pub fn from_ref(data: &'a [u8]) -> Result<Self, HprofError> {
-        if !data.len().is_multiple_of(COMMON_ENTRY_SIZE) {
-            return Err(HprofError::InvalidIndexFile);
-        }
-        Ok(Self { data })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_slice(data: &'a [u8]) -> Self {
-        debug_assert!(data.len().is_multiple_of(COMMON_ENTRY_SIZE));
-        Self { data }
-    }
-
-    /// Number of entries in the file.
-    pub fn len(&self) -> usize {
-        self.data.len() / COMMON_ENTRY_SIZE
-    }
-
-    /// Returns `true` if there are no entries.
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-
-    /// Return the entry at position `i`, or `None` when `i >= len()`.
-    pub fn entry_at(&self, i: usize) -> Option<CommonEntry> {
-        let start = i * COMMON_ENTRY_SIZE;
-        let end = start + COMMON_ENTRY_SIZE;
-        if end > self.data.len() {
-            return None;
-        }
-        let arr: &[u8; COMMON_ENTRY_SIZE] = self.data[start..end].try_into().ok()?;
-        Some(CommonEntry::from_bytes(arr))
-    }
-
-    /// Iterate all entries in ascending `object_id` order.
-    pub fn iter(&self) -> CommonEntryIter<'a> {
-        CommonEntryIter {
-            data: self.data,
-            pos: 0,
+    fn from_bytes(b: &[u8]) -> Self {
+        Self {
+            tag: b[0],
+            changed: b[1] != 0,
+            object_id: read_u64_le(b, 8),
+            position1: read_u64_le(b, 16),
+            position2: read_u64_le(b, 24),
         }
     }
-}
 
-/// Iterator over [`CommonEntry`] values.
-pub struct CommonEntryIter<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
+    fn write_to(&self, out: &mut [u8]) {
+        out.copy_from_slice(&self.to_bytes());
+    }
 
-impl Iterator for CommonEntryIter<'_> {
-    type Item = CommonEntry;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let end = self.pos + COMMON_ENTRY_SIZE;
-        if end > self.data.len() {
-            return None;
-        }
-        let arr: &[u8; COMMON_ENTRY_SIZE] = self.data[self.pos..end].try_into().ok()?;
-        self.pos = end;
-        Some(CommonEntry::from_bytes(arr))
+    fn key(&self) -> u64 {
+        self.object_id
     }
 }
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::heap_index::sub_record::{
+        TAG_CLASS_DUMP, TAG_INSTANCE_DUMP, TAG_OBJ_ARRAY_DUMP, TAG_PRIM_ARRAY_DUMP,
+    };
 
     #[test]
     fn diff_entry_round_trip() {
@@ -495,8 +322,9 @@ mod tests {
     }
 
     #[test]
-    fn diff_entry_reader_iter() {
-        let entries = vec![
+    fn entries_read_back_through_record_file() {
+        use crate::index::RecordFile;
+        let diffs = [
             DiffEntry {
                 tag: TAG_INSTANCE_DUMP,
                 object_id: 10,
@@ -508,18 +336,12 @@ mod tests {
                 position: 200,
             },
         ];
-        let mut data = Vec::new();
-        for e in &entries {
-            data.extend_from_slice(&e.to_bytes());
-        }
-        let reader = DiffEntryReader::from_slice(&data);
-        let collected: Vec<DiffEntry> = reader.iter().collect();
-        assert_eq!(collected, entries);
-    }
+        let data: Vec<u8> = diffs.iter().flat_map(|e| e.to_bytes()).collect();
+        let file = RecordFile::<DiffEntry>::new(&data).unwrap();
+        assert_eq!(file.iter().collect::<Vec<_>>(), diffs);
+        assert_eq!(file.find(20), Some(diffs[1]));
 
-    #[test]
-    fn common_entry_reader_iter() {
-        let entries = vec![
+        let commons = [
             CommonEntry {
                 tag: TAG_OBJ_ARRAY_DUMP,
                 changed: false,
@@ -535,12 +357,14 @@ mod tests {
                 position2: 1500,
             },
         ];
-        let mut data = Vec::new();
-        for e in &entries {
-            data.extend_from_slice(&e.to_bytes());
-        }
-        let reader = CommonEntryReader::from_slice(&data);
-        let collected: Vec<CommonEntry> = reader.iter().collect();
-        assert_eq!(collected, entries);
+        let data: Vec<u8> = commons.iter().flat_map(|e| e.to_bytes()).collect();
+        let file = RecordFile::<CommonEntry>::new(&data).unwrap();
+        assert_eq!(file.iter().collect::<Vec<_>>(), commons);
+    }
+
+    #[test]
+    fn diff_directory_sits_next_to_the_first_dump() {
+        let dir = diff_dir_for_hprofs(Path::new("/d/a.hprof"), Path::new("/e/b.hprof"));
+        assert_eq!(dir, Path::new("/d/a_vs_b.diff_indexes"));
     }
 }

@@ -25,14 +25,10 @@
 //! | `array_long.bin`    | `long[]`    |
 //! | `array_object.bin`  | `Object[]`  |
 
-use crate::heap_index::sub_record::{
-    SUB_INDEX_ENTRY_SIZE, TAG_OBJ_ARRAY_DUMP, TAG_PRIM_ARRAY_DUMP,
-};
+use crate::heap_index::sub_record::{SubIndexEntry, TAG_OBJ_ARRAY_DUMP, TAG_PRIM_ARRAY_DUMP};
 use crate::hprof::record::read_u32_be;
-use crate::hprof::{HprofError, HprofFile};
-use crate::vfs::MMapWriter;
-use rayon::prelude::*;
-use std::io::Write;
+use crate::hprof::{BasicType, HprofError, HprofFile};
+use crate::index::{Entry, IndexStore, RecordFile, RecordIter, RecordWriter, names, read_u64_le};
 
 // ── ArrayKind ─────────────────────────────────────────────────────────────────
 
@@ -128,18 +124,18 @@ impl ArrayKind {
         }
     }
 
-    /// Output file name for this kind.
-    pub fn file_name(self) -> &'static str {
+    /// The hprof basic type of this kind's elements.
+    pub fn basic_type(self) -> BasicType {
         match self {
-            Self::Boolean => "array_boolean.bin",
-            Self::Char => "array_char.bin",
-            Self::Float => "array_float.bin",
-            Self::Double => "array_double.bin",
-            Self::Byte => "array_byte.bin",
-            Self::Short => "array_short.bin",
-            Self::Int => "array_int.bin",
-            Self::Long => "array_long.bin",
-            Self::Object => "array_object.bin",
+            Self::Boolean => BasicType::Boolean,
+            Self::Char => BasicType::Char,
+            Self::Float => BasicType::Float,
+            Self::Double => BasicType::Double,
+            Self::Byte => BasicType::Byte,
+            Self::Short => BasicType::Short,
+            Self::Int => BasicType::Int,
+            Self::Long => BasicType::Long,
+            Self::Object => BasicType::Object,
         }
     }
 
@@ -147,30 +143,16 @@ impl ArrayKind {
     ///
     /// For `Object` arrays, pass the hprof `id_size` (4 or 8).
     pub fn elem_size(self, id_size: u32) -> u64 {
-        match self {
-            Self::Boolean | Self::Byte => 1,
-            Self::Char | Self::Short => 2,
-            Self::Float | Self::Int => 4,
-            Self::Double | Self::Long => 8,
-            Self::Object => u64::from(id_size),
-        }
+        self.basic_type().size(id_size as usize) as u64
     }
 
     /// Construct from an hprof primitive `element_type` byte.
     ///
     /// Returns `None` for unknown/object type codes.
     pub fn from_prim_element_type(et: u8) -> Option<Self> {
-        match et {
-            4 => Some(Self::Boolean),
-            5 => Some(Self::Char),
-            6 => Some(Self::Float),
-            7 => Some(Self::Double),
-            8 => Some(Self::Byte),
-            9 => Some(Self::Short),
-            10 => Some(Self::Int),
-            11 => Some(Self::Long),
-            _ => None,
-        }
+        Self::ALL
+            .into_iter()
+            .find(|k| k.basic_type().is_primitive() && k.basic_type().code() == et)
     }
 }
 
@@ -226,193 +208,140 @@ impl ArraySizeEntry {
 
 // ── Builder ───────────────────────────────────────────────────────────────────
 
-/// Scan all heap arrays in `combined_source` and write one size-sorted index
-/// per array kind to the corresponding `MMapWriter` in `outputs`.
+/// Scan all heap arrays in `combined_mmap` and write one size-sorted index
+/// per array kind into `store`, under the names in [`names::ARRAYS`]
+/// ([`ArrayKind::ALL`] order).
 ///
-/// `outputs` must be an array of 9 `MMapWriter`s in [`ArrayKind::ALL`] order
-/// (Boolean=0, Char=1, …, Object=8).
-///
-/// Arrays with the same element type are grouped together and sorted descending
-/// by their total element byte size (largest first).
+/// Each entry is streamed straight into the writer for its kind as the
+/// object store is scanned, then every writer is sorted in place descending
+/// by byte size (largest first) and committed.  Nothing proportional to the
+/// number of arrays is held in process memory.
 ///
 /// Returns the number of entries written for each [`ArrayKind`] in canonical
 /// order (same order as [`ArrayKind::ALL`]).
 pub fn build_array_size_indexes(
     hprof_source: &[u8],
     combined_mmap: &[u8],
-    outputs: &mut [impl MMapWriter; 9],
+    store: &dyn IndexStore,
 ) -> Result<[u64; 9], HprofError> {
     let hprof = HprofFile::from_ref(hprof_source)?;
-    let id_size = hprof.header.id_size as usize;
+    let id_size = hprof.id_size() as usize;
     let hprof_data = hprof.data();
 
-    if !combined_mmap.len().is_multiple_of(SUB_INDEX_ENTRY_SIZE) {
-        return Err(HprofError::InvalidIndexFile);
-    }
+    let combined = RecordFile::<SubIndexEntry>::new(combined_mmap)?;
 
-    // One accumulator per ArrayKind.
-    let mut buckets: [Vec<ArraySizeEntry>; 9] = std::array::from_fn(|_| Vec::new());
+    let writers: Vec<RecordWriter<ArraySizeEntry>> = names::ARRAYS
+        .iter()
+        .map(|n| Ok(RecordWriter::new(store.create(n)?)))
+        .collect::<Result<_, HprofError>>()?;
+    let mut writers: [RecordWriter<ArraySizeEntry>; 9] = writers
+        .try_into()
+        .map_err(|_| HprofError::Internal("expected 9 array writers".to_owned()))?;
 
-    let n_entries = combined_mmap.len() / SUB_INDEX_ENTRY_SIZE;
-    for i in 0..n_entries {
-        let start = i * SUB_INDEX_ENTRY_SIZE;
-        let tag = combined_mmap[start];
-
-        match tag {
+    for entry in combined.iter() {
+        let position = entry.position as usize;
+        // Both array layouts start: subtag(1) + array_id(id_size) + stack_serial(4) + num_elements(4)
+        let num_off = position + 1 + id_size + 4;
+        match entry.tag {
             TAG_PRIM_ARRAY_DUMP => {
-                let object_id = read_le_u64(combined_mmap, start + 8);
-                let position = read_le_u64(combined_mmap, start + 16) as usize;
-
-                // PrimArrayDump layout at `position` in the hprof file:
-                //   subtag(1) + array_id(id_size) + stack_serial(4) + num_elements(4) + elem_type(1)
-                let num_off = position + 1 + id_size + 4;
+                // ... then elem_type(1)
                 if num_off + 5 > hprof_data.len() {
                     continue;
                 }
-                let num_elements = read_u32_be(hprof_data, num_off) as u64;
+                let num_elements = u64::from(read_u32_be(hprof_data, num_off));
                 let elem_type = hprof_data[num_off + 4];
-
                 if let Some(kind) = ArrayKind::from_prim_element_type(elem_type) {
-                    let elem_size = kind.elem_size(hprof.header.id_size);
-                    buckets[kind.index()].push(ArraySizeEntry {
-                        object_id,
-                        position: position as u64,
+                    let elem_size = kind.elem_size(hprof.id_size());
+                    writers[kind.index()].push(&ArraySizeEntry {
+                        object_id: entry.object_id,
+                        position: entry.position,
                         byte_size: num_elements * elem_size,
-                    });
+                    })?;
                 }
             }
             TAG_OBJ_ARRAY_DUMP => {
-                let object_id = read_le_u64(combined_mmap, start + 8);
-                let position = read_le_u64(combined_mmap, start + 16) as usize;
-
-                // ObjArrayDump layout at `position` in the hprof file:
-                //   subtag(1) + array_id(id_size) + stack_serial(4) + num_elements(4) + elem_class_id(id_size)
-                let num_off = position + 1 + id_size + 4;
+                // ... then array_class_id(id_size)
                 if num_off + 4 > hprof_data.len() {
                     continue;
                 }
-                let num_elements = read_u32_be(hprof_data, num_off) as u64;
-                let byte_size = num_elements * id_size as u64;
-                buckets[ArrayKind::Object.index()].push(ArraySizeEntry {
-                    object_id,
-                    position: position as u64,
-                    byte_size,
-                });
+                let num_elements = u64::from(read_u32_be(hprof_data, num_off));
+                writers[ArrayKind::Object.index()].push(&ArraySizeEntry {
+                    object_id: entry.object_id,
+                    position: entry.position,
+                    byte_size: num_elements * id_size as u64,
+                })?;
             }
             _ => {}
         }
     }
 
-    // Sort each bucket descending by byte_size and write via outputs.
     let mut counts = [0u64; 9];
-    for (i, bucket) in buckets.iter_mut().enumerate() {
-        bucket.par_sort_unstable_by(|a, b| b.byte_size.cmp(&a.byte_size));
-
-        let mut writer = outputs[i].create_writer()?;
-        for entry in bucket.iter() {
-            writer.write_all(&entry.to_bytes())?;
-        }
-        counts[i] = bucket.len() as u64;
+    for (i, w) in writers.into_iter().enumerate() {
+        counts[i] = w.finish_sorted_desc()?;
     }
-
     Ok(counts)
 }
 
-/// Read a little-endian u64 from `data` at `offset`.
-///
-/// Panics if `offset + 8 > data.len()`.
-fn read_le_u64(data: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes([
-        data[offset],
-        data[offset + 1],
-        data[offset + 2],
-        data[offset + 3],
-        data[offset + 4],
-        data[offset + 5],
-        data[offset + 6],
-        data[offset + 7],
-    ])
+/// Array size entries are sorted **descending** by `byte_size`, so the
+/// key-based lookups of [`RecordFile`] must not be used on them; only
+/// iteration is meaningful.
+impl Entry for ArraySizeEntry {
+    const SIZE: usize = ARRAY_SIZE_ENTRY_SIZE;
+    const KEY_OFFSET: usize = 16;
+
+    fn from_bytes(b: &[u8]) -> Self {
+        Self {
+            object_id: read_u64_le(b, 0),
+            position: read_u64_le(b, 8),
+            byte_size: read_u64_le(b, 16),
+        }
+    }
+
+    fn write_to(&self, out: &mut [u8]) {
+        out.copy_from_slice(&self.to_bytes());
+    }
+
+    fn key(&self) -> u64 {
+        self.byte_size
+    }
 }
 
 // ── Reader ────────────────────────────────────────────────────────────────────
 
+/// Iterator over entries in an array size index file, largest first.
+pub type ArraySizeIter<'a> = RecordIter<'a, ArraySizeEntry>;
+
 /// Read-only handle to a single array size index file.
 ///
 /// Entries are in descending `byte_size` order (largest arrays first).
+#[derive(Clone, Copy)]
 pub struct ArraySizeReader<'a> {
-    data: &'a [u8],
+    file: RecordFile<'a, ArraySizeEntry>,
 }
 
 impl<'a> ArraySizeReader<'a> {
     /// Create a validated reader from a byte slice.
     pub fn from_ref(data: &'a [u8]) -> Result<Self, HprofError> {
-        if !data.len().is_multiple_of(ARRAY_SIZE_ENTRY_SIZE) {
-            return Err(HprofError::InvalidIndexFile);
-        }
-        Ok(Self { data })
+        Ok(Self {
+            file: RecordFile::new(data)?,
+        })
     }
 
     /// Create a reader from a slice already known to be valid.
     pub(crate) fn from_slice(data: &'a [u8]) -> Self {
-        debug_assert!(data.len().is_multiple_of(ARRAY_SIZE_ENTRY_SIZE));
-        Self { data }
-    }
-
-    fn as_slice(&self) -> &[u8] {
-        self.data
+        Self {
+            file: RecordFile::from_slice(data),
+        }
     }
 
     /// Total number of entries in this index.
     pub fn len(&self) -> usize {
-        self.as_slice().len() / ARRAY_SIZE_ENTRY_SIZE
-    }
-
-    /// Returns `true` if this index contains no entries.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Return the entry at index `idx`, or `None` if out of range.
-    pub fn entry_at(&self, idx: usize) -> Option<ArraySizeEntry> {
-        let data = self.as_slice();
-        let start = idx * ARRAY_SIZE_ENTRY_SIZE;
-        let end = start + ARRAY_SIZE_ENTRY_SIZE;
-        if end > data.len() {
-            return None;
-        }
-        let bytes: &[u8; ARRAY_SIZE_ENTRY_SIZE] = (&data[start..end]).try_into().ok()?;
-        Some(ArraySizeEntry::from_bytes(bytes))
+        self.file.len()
     }
 
     /// Iterate all entries in descending byte-size order.
     pub fn iter(&self) -> ArraySizeIter<'a> {
-        ArraySizeIter {
-            data: self.data,
-            pos: 0,
-        }
-    }
-}
-
-/// Iterator over entries in an array size index file.
-///
-/// Yields entries in descending `byte_size` order (largest first).
-pub struct ArraySizeIter<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl Iterator for ArraySizeIter<'_> {
-    type Item = ArraySizeEntry;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let end = self.pos + ARRAY_SIZE_ENTRY_SIZE;
-        if end > self.data.len() {
-            return None;
-        }
-        let bytes: &[u8; ARRAY_SIZE_ENTRY_SIZE] = (&self.data[self.pos..end]).try_into().ok()?;
-        let entry = ArraySizeEntry::from_bytes(bytes);
-        self.pos = end;
-        Some(entry)
+        self.file.iter()
     }
 }
 

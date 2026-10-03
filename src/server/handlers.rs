@@ -11,20 +11,17 @@
 //! stored in any `Arc` or returned across the spawn boundary — every handler
 //! converts results to owned `String`s before returning.
 
-use super::{
-    AppState, SYNTHETIC_OBJ_ARRAY, SYNTHETIC_PRIM_ARRAY, class_link, esc, fmt_bytes,
-    instances_key_for_class, is_synthetic, obj_link, page, parse_hex_id, prim_desc_to_elem_type,
-    prim_type_name,
-};
+use super::{AppState, class_link, esc, fmt_bytes, obj_link, page, parse_hex_id};
 use crate::array_index::ArrayKind;
-use crate::diff_index::{CommonEntryReader, DiffEntry, DiffEntryReader};
-use crate::heap_index::sub_record::SubIndexEntry;
+use crate::class_key::ClassKey;
+use crate::graph::{PathOutcome, RootPathLimits};
+use crate::heap_index::sub_record::TAG_OBJ_ARRAY_DUMP;
 use crate::heap_parser::FieldValue;
 use crate::heap_parser::SubRecord;
-use crate::hprof::HprofError;
-use crate::query::{ROOT_PATH_SEARCH_LIMIT, RootPathResult};
+use crate::hprof::{BasicType, HprofError};
+use crate::query::{Page, ScanWindow};
 use crate::root_index::GcRootType;
-use crate::vfs::MMapReader;
+use crate::search::{Matcher, SearchMode, SearchQuery};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -74,6 +71,224 @@ pub struct PageParams {
 
 fn default_limit() -> usize {
     200
+}
+
+/// Query params for the searchable, paged lists (`/histogram`, `/allClasses`,
+/// `/threads`): a [`PageParams`] plus the search fields.
+#[derive(serde::Deserialize, Default)]
+pub struct SearchParams {
+    /// The text to search for; absent or empty means no filter.
+    pub q: Option<String>,
+    /// A [`SearchMode::name`]; default `contains`.
+    pub mode: Option<String>,
+    /// `1` for a case-sensitive search; absent (an unticked box) for not.
+    pub case: Option<String>,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+}
+
+impl SearchParams {
+    fn page(&self) -> Page {
+        Page::new(self.offset, self.limit)
+    }
+
+    fn text(&self) -> &str {
+        self.q.as_deref().unwrap_or("").trim()
+    }
+
+    fn case_sensitive(&self) -> bool {
+        self.case.as_deref() == Some("1")
+    }
+
+    fn mode(&self) -> Result<SearchMode, HprofError> {
+        match self.mode.as_deref() {
+            None | Some("") => Ok(SearchMode::Contains),
+            Some(name) => SearchMode::from_name(name).ok_or_else(|| {
+                HprofError::InvalidArgument(format!(
+                    "unknown search mode `{name}`; use contains, exact, regex or fuzzy"
+                ))
+            }),
+        }
+    }
+
+    /// The compiled search, or `None` when there is no text to search for.
+    fn matcher(&self) -> Result<Option<Matcher>, HprofError> {
+        if self.text().is_empty() {
+            return Ok(None);
+        }
+        let query =
+            SearchQuery::new(self.text(), self.mode()?).case_sensitive(self.case_sensitive());
+        Matcher::new(&query).map(Some)
+    }
+
+    /// The `&q=…&mode=…&case=1` tail that paging links carry, or nothing
+    /// when there is no search.
+    fn query_suffix(&self) -> String {
+        if self.text().is_empty() {
+            return String::new();
+        }
+        let mut tail = format!(
+            "&q={}&mode={}",
+            url_encode(self.text()),
+            self.mode().map_or("contains", SearchMode::name)
+        );
+        if self.case_sensitive() {
+            tail.push_str("&case=1");
+        }
+        tail
+    }
+}
+
+/// Query params for `/strings`: a search over a bounded, resumable scan.
+#[derive(serde::Deserialize, Default)]
+pub struct StringsParams {
+    pub q: Option<String>,
+    pub mode: Option<String>,
+    pub case: Option<String>,
+    #[serde(default)]
+    pub cursor: usize,
+    pub max_scan: Option<usize>,
+    pub max_results: Option<usize>,
+}
+
+impl StringsParams {
+    fn search(&self) -> SearchParams {
+        SearchParams {
+            q: self.q.clone(),
+            mode: self.mode.clone(),
+            case: self.case.clone(),
+            offset: 0,
+            limit: 0,
+        }
+    }
+
+    fn window(&self) -> ScanWindow {
+        ScanWindow::new(
+            self.cursor,
+            self.max_scan
+                .unwrap_or(ScanWindow::DEFAULT_MAX_SCAN)
+                .clamp(1, ScanWindow::MAX_SCAN_LIMIT),
+            self.max_results
+                .unwrap_or(ScanWindow::DEFAULT_MAX_RESULTS)
+                .clamp(1, ScanWindow::MAX_RESULTS_LIMIT),
+        )
+    }
+}
+
+/// Percent-encode `s` for a query-string value (everything outside the
+/// unreserved set).
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(char::from(b));
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Prev/Next links for the page of `route` starting at `offset`: `shown`
+/// rows of `total`, `limit` per page.  `extra` is a `&k=v…` tail every link
+/// keeps (a class filter, a search).  Either link is empty when there is
+/// nothing in that direction.
+fn pager(
+    route: &str,
+    offset: usize,
+    limit: usize,
+    shown: usize,
+    total: usize,
+    extra: &str,
+) -> (String, String) {
+    let prev = if offset > 0 {
+        format!(
+            "<p><a href=\"{route}?offset={}&limit={limit}{extra}\">← Prev {limit}</a></p>",
+            offset.saturating_sub(limit)
+        )
+    } else {
+        String::new()
+    };
+    let next = if offset + shown < total {
+        format!(
+            "<p><a href=\"{route}?offset={}&limit={limit}{extra}\">Next {limit} →</a></p>",
+            offset + limit
+        )
+    } else {
+        String::new()
+    };
+    (prev, next)
+}
+
+/// The search form at the top of a searchable page, offering `modes`, with
+/// the current search filled in and `error` (a bad pattern) shown above it.
+fn search_form(
+    route: &str,
+    p: &SearchParams,
+    modes: &[SearchMode],
+    error: Option<&str>,
+    hidden: &str,
+) -> String {
+    let current = p.mode().unwrap_or_default();
+    let options: String = modes
+        .iter()
+        .map(|m| {
+            format!(
+                "<option value=\"{}\"{}>{}</option>",
+                m.name(),
+                if *m == current { " selected" } else { "" },
+                m.name()
+            )
+        })
+        .collect();
+    let error = error.map_or_else(String::new, |e| format!("<p class=\"warn\">{}</p>", esc(e)));
+    let clear = if p.text().is_empty() {
+        String::new()
+    } else {
+        format!(" <a href=\"{route}\">clear</a>")
+    };
+    format!(
+        "{error}<form method=\"get\" action=\"{route}\" class=\"search\">\
+         <input type=\"text\" name=\"q\" value=\"{}\" size=\"40\" placeholder=\"search\"> \
+         <select name=\"mode\">{options}</select> \
+         <label><input type=\"checkbox\" name=\"case\" value=\"1\"{}> match case</label> \
+         {hidden}<button type=\"submit\">Search</button>{clear}</form>",
+        esc(p.text()),
+        if p.case_sensitive() { " checked" } else { "" },
+    )
+}
+
+/// A page whose search could not be compiled: 400, with the form shown
+/// again so the pattern can be corrected.
+fn search_error(
+    title: &str,
+    route: &str,
+    p: &SearchParams,
+    modes: &[SearchMode],
+    error: &HprofError,
+) -> (StatusCode, String) {
+    (
+        StatusCode::BAD_REQUEST,
+        page(
+            title,
+            &search_form(route, p, modes, Some(&error.to_string()), ""),
+        ),
+    )
+}
+
+/// Turn a blocking task's outcome into a response: the rendered page with
+/// its status, or 500.
+fn rendered(
+    result: Result<Result<(StatusCode, String), HprofError>, tokio::task::JoinError>,
+) -> axum::response::Response {
+    match result {
+        Ok(Ok((status, html))) => (status, Html(html)).into_response(),
+        Ok(Err(e)) => internal(e).into_response(),
+        Err(e) => internal(e).into_response(),
+    }
 }
 
 /// Query params for the diff list pages (`/diff/removed`, `/diff/added`, `/diff/common`).
@@ -148,29 +363,34 @@ pub async fn summary(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 pub async fn histogram(
     State(state): State<Arc<AppState>>,
-    Query(p): Query<PageParams>,
+    Query(p): Query<SearchParams>,
 ) -> impl IntoResponse {
-    let result = tokio::task::spawn_blocking(move || -> Result<String, HprofError> {
-        let hist = state.histogram()?;
-        let total: u64 = hist.iter().map(|e| e.instance_count).sum();
-        let total_bytes: u64 = hist.iter().map(|e| e.shallow_bytes).sum();
-        let page_entries = hist.iter().skip(p.offset).take(p.limit);
+    let result = tokio::task::spawn_blocking(move || -> Result<(StatusCode, String), HprofError> {
+        let q = &state.query;
+        let matcher = match p.matcher() {
+            Ok(m) => m,
+            Err(e) => return Ok(search_error("Histogram", "/histogram", &p, &SearchMode::ALL, &e)),
+        };
+        let hist = match &matcher {
+            Some(m) => q.class_histogram_filtered(m, p.page()),
+            None => q.class_histogram(p.page()),
+        };
 
         let mut rows = String::new();
-        for entry in page_entries {
-            let id_hex = format!("{:x}", entry.class_id);
+        for entry in &hist.items {
             // Primitive array types link directly to the size-sorted /arrays/:kind view.
-            let link = if (entry.class_id & SYNTHETIC_PRIM_ARRAY) == SYNTHETIC_PRIM_ARRAY {
-                let et = (entry.class_id & 0xFF) as u8;
-                let slug = ArrayKind::from_prim_element_type(et)
-                    .map(|k| k.slug())
-                    .unwrap_or("unknown");
-                format!("<a href=\"/arrays/{slug}\">{}</a>", esc(&entry.class_name))
-            } else {
-                format!(
-                    "<a href=\"/instances/{id_hex}\">{}</a>",
+            let link = match entry.key {
+                ClassKey::PrimArray(t) => {
+                    let slug = ArrayKind::from_prim_element_type(t)
+                        .map(|k| k.slug())
+                        .unwrap_or("unknown");
+                    format!("<a href=\"/arrays/{slug}\">{}</a>", esc(&entry.class_name))
+                }
+                key => format!(
+                    "<a href=\"/instances/{:x}\">{}</a>",
+                    key.to_u64(),
                     esc(&entry.class_name)
-                )
+                ),
             };
             rows.push_str(&format!(
                 "<tr><td>{link}</td><td class=\"num\">{}</td><td class=\"num\">{}</td></tr>",
@@ -179,139 +399,112 @@ pub async fn histogram(
             ));
         }
 
-        let note = if hist.len() > p.offset + p.limit {
+        let heading = if matcher.is_some() {
             format!(
-                "<p><a href=\"/histogram?offset={}&limit={}\">Next {} →</a></p>",
-                p.offset + p.limit,
-                p.limit,
-                p.limit
+                "<p>{} of {} classes match “{}”</p>",
+                hist.total,
+                q.histogram_len(),
+                esc(p.text())
             )
         } else {
-            String::new()
-        };
-
-        let prev = if p.offset > 0 {
+            let (total, total_bytes) = q.histogram_totals();
             format!(
-                "<p><a href=\"/histogram?offset={}&limit={}\">← Prev {}</a></p>",
-                p.offset.saturating_sub(p.limit),
-                p.limit,
-                p.limit
+                "<p>{} classes &nbsp;·&nbsp; {total} total instances &nbsp;·&nbsp; {} total shallow bytes</p>",
+                hist.total,
+                fmt_bytes(total_bytes)
             )
-        } else {
-            String::new()
         };
-
-        let warn = if hist.is_empty() {
-            "<p class=\"muted\">Histogram is still being computed — refresh in a moment.</p>"
-                .to_owned()
-        } else {
-            String::new()
-        };
-
+        let (prev, next) = pager(
+            "/histogram",
+            p.offset,
+            p.limit,
+            hist.items.len(),
+            hist.total,
+            &p.query_suffix(),
+        );
+        let hidden = format!("<input type=\"hidden\" name=\"limit\" value=\"{}\">", p.limit);
         let content = format!(
-            r#"{warn}
-<p>{} classes &nbsp;·&nbsp; {total} total instances &nbsp;·&nbsp; {} total shallow bytes</p>
+            r#"{form}
+{heading}
 {prev}
 <table>
 <tr><th>Class</th><th>Instances</th><th>Shallow size</th></tr>
 {rows}
 </table>
-{note}"#,
-            hist.len(),
-            fmt_bytes(total_bytes)
+{next}"#,
+            form = search_form("/histogram", &p, &SearchMode::ALL, None, &hidden),
         );
-        Ok(page("Histogram", &content))
+        Ok((StatusCode::OK, page("Histogram", &content)))
     })
     .await;
-
-    match result {
-        Ok(Ok(html)) => ok(html).into_response(),
-        Ok(Err(e)) => internal(e).into_response(),
-        Err(e) => internal(e).into_response(),
-    }
+    rendered(result)
 }
 
 // ── /allClasses — Class list ──────────────────────────────────────────────────
 
 pub async fn all_classes(
     State(state): State<Arc<AppState>>,
-    Query(p): Query<PageParams>,
+    Query(p): Query<SearchParams>,
 ) -> impl IntoResponse {
-    let result = tokio::task::spawn_blocking(move || -> Result<String, HprofError> {
-        let hist = state.histogram()?;
-        // Collect only real (non-synthetic) entries, sorted by name.
-        let mut entries: Vec<_> = hist.iter().filter(|e| !is_synthetic(e.class_id)).collect();
-        entries.sort_by(|a, b| a.class_name.cmp(&b.class_name));
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<(StatusCode, String), HprofError> {
+            let q = &state.query;
+            let matcher = match p.matcher() {
+                Ok(m) => m,
+                Err(e) => {
+                    return Ok(search_error(
+                        "All Classes",
+                        "/allClasses",
+                        &p,
+                        &SearchMode::ALL,
+                        &e,
+                    ));
+                }
+            };
+            let classes = match &matcher {
+                Some(m) => q.search_classes(m, p.page()),
+                None => q.find_classes("", p.page()),
+            };
 
-        // Build a map from synthetic key → instance_count for O(1) array-count lookup.
-        let synthetic_counts: std::collections::HashMap<u64, u64> = hist
-            .iter()
-            .filter(|e| is_synthetic(e.class_id))
-            .map(|e| (e.class_id, e.instance_count))
-            .collect();
+            let mut rows = String::new();
+            for c in &classes.items {
+                rows.push_str(&format!(
+                    "<tr><td>{}</td><td class=\"num\">{}</td></tr>",
+                    class_link(c.class_id, &c.name),
+                    c.instance_count,
+                ));
+            }
 
-        let mut rows = String::new();
-        for entry in entries.iter().skip(p.offset).take(p.limit) {
-            // For primitive-array class objects (e.g. "class [B"), show the count of
-            // actual array instances from the corresponding synthetic histogram entry.
-            let display_count = entry
-                .class_name
-                .strip_prefix("class [")
-                .and_then(|rest| {
-                    if rest.len() == 1 {
-                        let elem_type = rest.chars().next().and_then(prim_desc_to_elem_type)?;
-                        let key = SYNTHETIC_PRIM_ARRAY | u64::from(elem_type);
-                        Some(*synthetic_counts.get(&key).unwrap_or(&0))
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(entry.instance_count);
-            rows.push_str(&format!(
-                "<tr><td>{}</td><td class=\"num\">{display_count}</td></tr>",
-                class_link(entry.class_id, &entry.class_name),
-            ));
-        }
-
-        let note = if entries.len() > p.offset + p.limit {
-            format!(
-                "<p><a href=\"/allClasses?offset={}&limit={}\">Next {} →</a></p>",
-                p.offset + p.limit,
+            let heading = if matcher.is_some() {
+                format!("<p>{} classes match “{}”</p>", classes.total, esc(p.text()))
+            } else {
+                format!("<p>{} classes</p>", classes.total)
+            };
+            let (prev, next) = pager(
+                "/allClasses",
+                p.offset,
                 p.limit,
+                classes.items.len(),
+                classes.total,
+                &p.query_suffix(),
+            );
+            let hidden = format!(
+                "<input type=\"hidden\" name=\"limit\" value=\"{}\">",
                 p.limit
-            )
-        } else {
-            String::new()
-        };
-
-        let prev = if p.offset > 0 {
-            format!(
-                "<p><a href=\"/allClasses?offset={}&limit={}\">← Prev {}</a></p>",
-                p.offset.saturating_sub(p.limit),
-                p.limit,
-                p.limit
-            )
-        } else {
-            String::new()
-        };
-
-        let content = format!(
-            r#"<p>{} classes</p>{prev}
+            );
+            let content = format!(
+                r#"{form}
+{heading}{prev}
 <table>
 <tr><th>Class name</th><th>Instance count</th></tr>
 {rows}
-</table>{note}"#,
-            entries.len()
-        );
-        Ok(page("All Classes", &content))
-    })
-    .await;
-
-    match result {
-        Ok(Ok(html)) => ok(html).into_response(),
-        Ok(Err(e)) => internal(e).into_response(),
-        Err(e) => internal(e).into_response(),
-    }
+</table>{next}"#,
+                form = search_form("/allClasses", &p, &SearchMode::ALL, None, &hidden),
+            );
+            Ok((StatusCode::OK, page("All Classes", &content)))
+        })
+        .await;
+    rendered(result)
 }
 
 // ── /class/{id} — Class detail ────────────────────────────────────────────────
@@ -327,8 +520,8 @@ pub async fn class_detail(
 
     let result = tokio::task::spawn_blocking(move || -> Result<String, HprofError> {
         let q = &state.query;
-        let record = match q.find_class(class_id)? {
-            Some(r) => r,
+        let cd = match q.class(class_id)? {
+            Some(cd) => cd,
             None => {
                 return Ok(page(
                     "Class not found",
@@ -337,23 +530,11 @@ pub async fn class_detail(
             }
         };
 
-        let SubRecord::ClassDump(cd) = record else {
-            return Ok(page("Not a class", "<p>Object is not a CLASS_DUMP.</p>"));
-        };
-
-        let class_name = q
-            .class_name(cd.class_id)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| format!("0x{:x}", cd.class_id));
+        let class_name = q.class_label(cd.class_id);
         let super_name = if cd.super_class_id == 0 {
             "<span class=\"muted\">(none)</span>".to_owned()
         } else {
-            let n = q
-                .class_name(cd.super_class_id)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| format!("0x{:x}", cd.super_class_id));
+            let n = q.class_label(cd.super_class_id);
             class_link(cd.super_class_id, &n)
         };
 
@@ -377,7 +558,7 @@ pub async fn class_detail(
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| format!("?{:x}", fd.name_id));
-            let type_name = field_type_name(fd.field_type);
+            let type_name = BasicType::name_of_code(fd.field_type);
             inst_fields.push_str(&format!(
                 "<tr><td>{}</td><td>{type_name}</td></tr>",
                 esc(&name)
@@ -396,7 +577,7 @@ pub async fn class_detail(
             format!("<table><tr><th>Instance field</th><th>Type</th></tr>{inst_fields}</table>")
         };
 
-        let instances_id = instances_key_for_class(&class_name, cd.class_id, q);
+        let instances_id = q.class_key_for(&class_name, cd.class_id).to_u64();
         let content = format!(
             r#"<table>
 <tr><td>Object ID</td><td>{}</td></tr>
@@ -441,35 +622,11 @@ pub async fn instances_of_class(
     let result = tokio::task::spawn_blocking(move || -> Result<String, HprofError> {
         let q = &state.query;
 
-        // Determine display title
-        let title = if is_synthetic(target_id) {
-            // Synthetic ID: derive name from histogram cache if available
-            state
-                .histogram_cache
-                .lock()
-                .ok()
-                .and_then(|g| {
-                    g.as_ref().and_then(|h| {
-                        h.iter()
-                            .find(|e| e.class_id == target_id)
-                            .map(|e| e.class_name.clone())
-                    })
-                })
-                .unwrap_or_else(|| "array type".to_owned())
-        } else {
-            q.class_name(target_id)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| format!("0x{target_id:x}"))
-        };
-
-        let is_prim_array = (target_id & SYNTHETIC_PRIM_ARRAY) == SYNTHETIC_PRIM_ARRAY;
-        let is_obj_array = (target_id & SYNTHETIC_OBJ_ARRAY) != 0 && !is_prim_array;
-        let elem_class_id = target_id & !SYNTHETIC_OBJ_ARRAY;
+        let key = ClassKey::from_u64(target_id);
+        let title = q.key_name(key);
 
         // ── Primitive arrays: use size-sorted index directly ──────────────────
-        if is_prim_array {
-            let prim_type = (target_id & 0xFF) as u8;
+        if let ClassKey::PrimArray(prim_type) = key {
             let kind = match ArrayKind::from_prim_element_type(prim_type) {
                 Some(k) => k,
                 None => return Ok(page(&format!("Instances of {title}"), "<p>Unknown primitive type.</p>")),
@@ -482,7 +639,7 @@ pub async fn instances_of_class(
 
             let mut rows = String::new();
             for entry in q.iter_arrays_by_size(kind).skip(offset).take(shown) {
-                let num_elements = if elem_size > 0 { entry.byte_size / elem_size } else { 0 };
+                let num_elements = entry.byte_size.checked_div(elem_size).unwrap_or(0);
                 rows.push_str(&format!(
                     "<tr><td>{}</td><td class=\"num\">{num_elements}</td><td class=\"num\">{}</td></tr>",
                     obj_link(entry.object_id),
@@ -490,18 +647,7 @@ pub async fn instances_of_class(
                 ));
             }
 
-            let note = if offset + shown < total {
-                format!(
-                    "<p><a href=\"/instances/{id_str}?offset={}&limit={}\">Next {} →</a></p>",
-                    offset + p.limit, p.limit, p.limit
-                )
-            } else { String::new() };
-            let prev = if offset > 0 {
-                format!(
-                    "<p><a href=\"/instances/{id_str}?offset={}&limit={}\">← Prev {}</a></p>",
-                    offset.saturating_sub(p.limit), p.limit, p.limit
-                )
-            } else { String::new() };
+            let (prev, note) = pager(&format!("/instances/{id_str}"), offset, p.limit, shown, total, "");
 
             let content = format!(
                 "<p>{total} arrays total, showing {offset}–{} by size (largest first)</p>\
@@ -513,50 +659,32 @@ pub async fn instances_of_class(
             return Ok(page(&format!("Instances of {title}"), &content));
         }
 
-        // ── Object arrays: full scan, collect all, sort by size ───────────────
-        if is_obj_array {
-            // Collect (array_id, num_elements) for every matching object array.
-            let mut all_matches: Vec<(u64, u32)> = Vec::new();
-            for result in q.iter_objects() {
-                if let SubRecord::ObjArrayDump(a) = result?
-                    && a.element_class_id == elem_class_id
-                {
-                    all_matches.push((a.array_id, a.num_elements));
-                }
-            }
-            let total = all_matches.len();
-            // Sort descending by element count (proxy for size, since id_size is fixed).
-            all_matches.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-
+        // ── Object arrays: per-class index range, sizes parsed per page ───────
+        if let ClassKey::ObjArray(_) = key {
+            let total = q.instance_count(key);
             let id_size = q.id_size() as u64;
             let offset = p.offset.min(total);
             let shown = p.limit.min(total.saturating_sub(offset));
 
             let mut rows = String::new();
-            for (array_id, num_elements) in all_matches.into_iter().skip(offset).take(shown) {
+            for entry in q.class_entries(key).skip(offset).take(shown) {
+                let num_elements =
+                    match q.parse_entry(&entry.sub_index_entry(TAG_OBJ_ARRAY_DUMP))? {
+                        SubRecord::ObjArrayDump(a) => a.num_elements,
+                        _ => 0,
+                    };
                 let byte_size = u64::from(num_elements) * id_size;
                 rows.push_str(&format!(
                     "<tr><td>{}</td><td class=\"num\">{num_elements}</td><td class=\"num\">{}</td></tr>",
-                    obj_link(array_id),
+                    obj_link(entry.object_id),
                     fmt_bytes(byte_size),
                 ));
             }
 
-            let note = if offset + shown < total {
-                format!(
-                    "<p><a href=\"/instances/{id_str}?offset={}&limit={}\">Next {} →</a></p>",
-                    offset + p.limit, p.limit, p.limit
-                )
-            } else { String::new() };
-            let prev = if offset > 0 {
-                format!(
-                    "<p><a href=\"/instances/{id_str}?offset={}&limit={}\">← Prev {}</a></p>",
-                    offset.saturating_sub(p.limit), p.limit, p.limit
-                )
-            } else { String::new() };
+            let (prev, note) = pager(&format!("/instances/{id_str}"), offset, p.limit, shown, total, "");
 
             let content = format!(
-                "<p>{total} arrays total, showing {offset}–{} by size (largest first)</p>\
+                "<p>{total} arrays total, showing {offset}–{} (by object id)</p>\
                  {prev}\
                  <table><tr><th>Array</th><th>Elements</th><th>Size</th></tr>{rows}</table>\
                  {note}",
@@ -565,46 +693,25 @@ pub async fn instances_of_class(
             return Ok(page(&format!("Instances of {title}"), &content));
         }
 
-        // ── Regular instances: full scan, no size ordering ────────────────────
-        let mut matching: Vec<u64> = Vec::new();
-        let mut total = 0usize;
-
-        for result in q.iter_objects() {
-            if let SubRecord::InstanceDump(i) = result?
-                && i.class_id == target_id
-            {
-                total += 1;
-                if total > p.offset && matching.len() < p.limit {
-                    matching.push(i.object_id);
-                }
-            }
-        }
+        // ── Regular instances: per-class index range ──────────────────────────
+        let total = q.instance_count(key);
+        let offset = p.offset.min(total);
+        let shown = p.limit.min(total.saturating_sub(offset));
 
         let mut rows = String::new();
-        for id in &matching {
-            rows.push_str(&format!("<tr><td>{}</td></tr>", obj_link(*id)));
+        for entry in q.class_entries(key).skip(offset).take(shown) {
+            rows.push_str(&format!("<tr><td>{}</td></tr>", obj_link(entry.object_id)));
         }
 
-        let note = if total > p.offset + p.limit {
-            format!(
-                "<p><a href=\"/instances/{id_str}?offset={}&limit={}\">Next {} →</a></p>",
-                p.offset + p.limit, p.limit, p.limit
-            )
-        } else { String::new() };
-        let prev = if p.offset > 0 {
-            format!(
-                "<p><a href=\"/instances/{id_str}?offset={}&limit={}\">← Prev {}</a></p>",
-                p.offset.saturating_sub(p.limit), p.limit, p.limit
-            )
-        } else { String::new() };
+        let (prev, note) = pager(&format!("/instances/{id_str}"), offset, p.limit, shown, total, "");
 
         let content = format!(
             "<p>Total matching: {total} &nbsp; showing {}-{}</p>\
              {prev}\
              <table><tr><th>Object ID</th></tr>{rows}</table>\
              {note}",
-            p.offset + 1,
-            p.offset + matching.len()
+            offset + 1,
+            offset + shown
         );
         Ok(page(&format!("Instances of {title}"), &content))
     })
@@ -616,6 +723,9 @@ pub async fn instances_of_class(
         Err(e) => internal(e).into_response(),
     }
 }
+
+/// How many referrers the object page lists (the total is shown as a count).
+const REFS_SHOWN: usize = 50;
 
 // ── /object/{id} — Object detail ─────────────────────────────────────────────
 
@@ -629,8 +739,8 @@ pub async fn object_detail(
     };
 
     let result = tokio::task::spawn_blocking(move || -> Result<String, HprofError> {
-        let reuse_warning = if let Some(dq) = state.diff_query.as_ref() {
-            match (state.query.find(object_id)?, dq.find(object_id)?) {
+        let reuse_warning = if let Some(dq) = state.diff_query() {
+            match (state.query.object(object_id)?, dq.object(object_id)?) {
                 (Some(r1), Some(r2)) if object_fingerprint(&r1) != object_fingerprint(&r2) => {
                     ADDRESS_REUSE_WARNING
                 }
@@ -660,19 +770,18 @@ fn render_object_page(
     q: &crate::query::HeapQuery,
     header_html: &str,
 ) -> Result<String, HprofError> {
-    let record = match q.find(object_id)? {
+    let record = match q.object(object_id)? {
         Some(r) => r,
         None => return Ok(page("Object not found", "<p>No object with that ID.</p>")),
     };
 
-    let refs_to = q.refs_to(object_id);
+    let refs_page = q.refs_to(object_id, Page::first(REFS_SHOWN));
+    let refs_to = &refs_page.items;
     let root_types = q.root_types_of(object_id);
 
     let mut refs_html = String::new();
-    for from_id in &refs_to {
-        let type_name = q
-            .object_type_name(*from_id)
-            .unwrap_or_else(|_| "?".to_owned());
+    for from_id in refs_to {
+        let type_name = q.object_type_name(*from_id);
         refs_html.push_str(&format!(
             "<li>{} <span class=\"muted\">{}</span></li>",
             obj_link(*from_id),
@@ -696,7 +805,7 @@ fn render_object_page(
             .map(|rt| {
                 format!(
                     "<a href=\"/roots/{}\">{}</a>",
-                    gc_root_slug(*rt),
+                    rt.slug(),
                     gc_root_label(*rt)
                 )
             })
@@ -706,11 +815,7 @@ fn render_object_page(
 
     let body = match record {
         SubRecord::InstanceDump(inst) => {
-            let class_name = q
-                .class_name(inst.class_id)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| format!("0x{:x}", inst.class_id));
+            let class_name = q.class_label(inst.class_id);
 
             let resolved_value_html = match q.resolve_value(inst.object_id) {
                 Ok(jv) => render_java_value_banner(&jv),
@@ -721,7 +826,7 @@ fn render_object_page(
             let mut field_rows = String::new();
             for f in &fields {
                 let val = render_field_value(&f.value, q);
-                let type_display = resolve_field_type(f.field_type, &f.value, q);
+                let type_display = resolve_field_type(f.ty, &f.value, q);
                 field_rows.push_str(&format!(
                     "<tr><td>{}</td><td>{}</td><td>{val}</td></tr>",
                     esc(&f.name),
@@ -751,11 +856,7 @@ fn render_object_page(
             )
         }
         SubRecord::ClassDump(cd) => {
-            let name = q
-                .class_name(cd.class_id)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| format!("0x{:x}", cd.class_id));
+            let name = q.class_label(cd.class_id);
             format!(
                 r#"<table>
 <tr><td>Type</td><td>class</td></tr>
@@ -771,11 +872,7 @@ fn render_object_page(
             )
         }
         SubRecord::ObjArrayDump(arr) => {
-            let elem_name = q
-                .class_name(arr.element_class_id)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| format!("0x{:x}", arr.element_class_id));
+            let array_type = crate::classes::display_type_name(&q.class_label(arr.array_class_id));
             let mut elems = String::new();
             for (i, id) in arr.elements().enumerate().take(50) {
                 if id == 0 {
@@ -796,19 +893,19 @@ fn render_object_page(
                 r#"<table>
 <tr><td>Type</td><td>object array</td></tr>
 <tr><td>Array ID</td><td>0x{:x}</td></tr>
-<tr><td>Element type</td><td>{}</td></tr>
+<tr><td>Array type</td><td>{}</td></tr>
 <tr><td>Length</td><td>{}</td></tr>
 </table>
 <h2>Elements (first 50)</h2>
 <ul>{elems}{more}</ul>"#,
                 arr.array_id,
-                class_link(arr.element_class_id, &elem_name),
+                class_link(arr.array_class_id, &array_type),
                 arr.num_elements,
             )
         }
         SubRecord::PrimArrayDump(arr) => {
-            let tn = prim_type_name(arr.element_type);
-            let preview = decode_prim_array(arr.element_type, arr.data, arr.num_elements);
+            let tn = BasicType::name_of_code(arr.element_type);
+            let preview = prim_array_preview(q, arr.array_id)?;
             format!(
                 r#"<table>
 <tr><td>Type</td><td>primitive array</td></tr>
@@ -881,9 +978,7 @@ fn render_object_page(
             None => "<span class=\"muted\">not reachable</span>".to_owned(),
             Some(0) => "<span class=\"muted\">(GC root — virtual root)</span>".to_owned(),
             Some(dom_id) => {
-                let dom_type = q
-                    .object_type_name(dom_id)
-                    .unwrap_or_else(|_| "?".to_owned());
+                let dom_type = q.object_type_name(dom_id);
                 format!(
                     "{} <span class=\"muted\">{}</span>",
                     obj_link(dom_id),
@@ -929,7 +1024,7 @@ pub async fn raw_string(
     let result = tokio::task::spawn_blocking(move || -> Result<Option<String>, HprofError> {
         let q = &state.query;
         match q.resolve_value(object_id)? {
-            crate::heap_query::JavaValue::String(_, s) => Ok(Some(s)),
+            crate::resolved::Value::String(_, s) => Ok(Some(s)),
             _ => Ok(None),
         }
     })
@@ -963,14 +1058,8 @@ pub async fn raw_prim_array(
 
     let result = tokio::task::spawn_blocking(move || -> Result<Option<String>, HprofError> {
         let q = &state.query;
-        match q.find(object_id)? {
-            Some(SubRecord::PrimArrayDump(arr)) => Ok(Some(decode_prim_array_full(
-                arr.element_type,
-                arr.data,
-                arr.num_elements,
-            ))),
-            _ => Ok(None),
-        }
+        Ok(q.prim_array(object_id, Page::new(0, usize::MAX))?
+            .map(|w| w.elements.to_strings(false).join(",")))
     })
     .await;
 
@@ -1001,25 +1090,29 @@ pub async fn root_path_page(
     let result = tokio::task::spawn_blocking(move || -> Result<String, HprofError> {
         let q = &state.query;
 
-        let path_result = q.path_to_root(object_id);
+        let limits = RootPathLimits::default();
+        let path_result = q.path_to_root(object_id, &limits);
 
-        let content = match path_result {
-            RootPathResult::NotReachable => "<p class=\"muted\">No path to a GC root found. \
+        let content = match path_result.outcome {
+            PathOutcome::NotReachable => "<p class=\"muted\">No path to a GC root found. \
                  The object may be unreachable or form a reference cycle \
                  with no live root.</p>"
                 .to_owned(),
-            RootPathResult::LimitReached => {
+            PathOutcome::LimitReached => {
                 format!(
-                    "<p class=\"muted\">Search limit reached ({ROOT_PATH_SEARCH_LIMIT} nodes \
-                     visited) without finding a root. The path may be very long or pass \
-                     through a high-fanin object whose referrers exceed the index cap.</p>"
+                    "<p class=\"muted\">Search limit reached ({} nodes \
+                     visited) without finding a root. The path may be very long or \
+                     the object may be referenced from very many places.</p>",
+                    path_result.nodes_visited
                 )
             }
-            RootPathResult::Found(path) => {
+            PathOutcome::Found => {
+                let path = &path_result.steps;
                 let mut steps = String::new();
                 let last_idx = path.len().saturating_sub(1);
-                for (i, &id) in path.iter().enumerate() {
-                    let type_name = q.object_type_name(id).unwrap_or_else(|_| "?".to_owned());
+                for (i, step) in path.iter().enumerate() {
+                    let id = step.object_id;
+                    let type_name = q.object_type_name(id);
                     let root_types = q.root_types_of(id);
 
                     let root_badge = if !root_types.is_empty() {
@@ -1028,7 +1121,7 @@ pub async fn root_path_page(
                             .map(|rt| {
                                 format!(
                                     "<a href=\"/roots/{}\"><strong>{}</strong></a>",
-                                    gc_root_slug(*rt),
+                                    rt.slug(),
                                     gc_root_label(*rt)
                                 )
                             })
@@ -1110,7 +1203,7 @@ pub async fn arrays_by_kind(
 
         let mut rows = String::new();
         for entry in q.iter_arrays_by_size(kind).skip(offset).take(shown) {
-            let num_elements = if elem_size > 0 { entry.byte_size / elem_size } else { 0 };
+            let num_elements = entry.byte_size.checked_div(elem_size).unwrap_or(0);
             rows.push_str(&format!(
                 "<tr><td>{}</td><td class=\"num\">{num_elements}</td><td class=\"num\">{}</td></tr>",
                 obj_link(entry.object_id),
@@ -1126,27 +1219,19 @@ pub async fn arrays_by_kind(
             )
         };
 
-        let mut nav = String::new();
-        if offset > 0 {
-            let prev = offset.saturating_sub(limit);
-            nav.push_str(&format!(
-                "<a href=\"/arrays/{kind_slug}?offset={prev}&limit={limit}\">← prev</a> ",
-                kind_slug = kind.slug()
-            ));
-        }
-        if offset + shown < total {
-            let next = offset + limit;
-            nav.push_str(&format!(
-                "<a href=\"/arrays/{kind_slug}?offset={next}&limit={limit}\">next →</a>",
-                kind_slug = kind.slug()
-            ));
-        }
+        let (prev, next) = pager(
+            &format!("/arrays/{}", kind.slug()),
+            offset,
+            limit,
+            shown,
+            total,
+            "",
+        );
 
         let content = format!(
             "<p>{total} {display_name} arrays total \
              (showing {offset}–{})</p>\
-             {table}\
-             <p>{nav}</p>",
+             {prev}{table}{next}",
             offset + shown
         );
         Ok(page(&format!("{display_name} arrays by size"), &content))
@@ -1168,7 +1253,7 @@ pub async fn roots_summary(State(state): State<Arc<AppState>>) -> impl IntoRespo
         let mut rows = String::new();
         for rt in GcRootType::ALL {
             let count = q.iter_roots(rt).count();
-            let slug = gc_root_slug(rt);
+            let slug = rt.slug();
             let label = gc_root_label(rt);
             rows.push_str(&format!(
                 "<tr><td><a href=\"/roots/{slug}\">{label}</a></td><td class=\"num\">{count}</td></tr>"
@@ -1195,7 +1280,7 @@ pub async fn roots_by_type(
     Path(root_type_str): Path<String>,
     Query(p): Query<PageParams>,
 ) -> impl IntoResponse {
-    let rt = match parse_root_type(&root_type_str) {
+    let rt = match GcRootType::from_slug(&root_type_str) {
         Some(rt) => rt,
         None => return not_found(format!("Unknown root type: {root_type_str}")).into_response(),
     };
@@ -1204,43 +1289,25 @@ pub async fn roots_by_type(
         let q = &state.query;
         let label = gc_root_label(rt);
 
+        let roots = q.gc_roots(rt, Page::new(p.offset, p.limit))?;
+        let total = roots.total;
         let mut rows = String::new();
-        let mut total = 0usize;
-        for entry in q.iter_roots(rt) {
-            total += 1;
-            if total > p.offset && rows.len() < p.limit * 60 {
-                let name = q
-                    .object_type_name(entry.object_id)
-                    .unwrap_or_else(|_| "?".to_owned());
-                rows.push_str(&format!(
-                    "<tr><td>{}</td><td>{}</td></tr>",
-                    obj_link(entry.object_id),
-                    esc(&name)
-                ));
-            }
+        for root in &roots.items {
+            rows.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td></tr>",
+                obj_link(root.object_id()),
+                esc(root.type_name())
+            ));
         }
 
-        let note = if total > p.offset + p.limit {
-            format!(
-                "<p><a href=\"/roots/{root_type_str}?offset={}&limit={}\">Next {} →</a></p>",
-                p.offset + p.limit,
-                p.limit,
-                p.limit
-            )
-        } else {
-            String::new()
-        };
-
-        let prev = if p.offset > 0 {
-            format!(
-                "<p><a href=\"/roots/{root_type_str}?offset={}&limit={}\">← Prev {}</a></p>",
-                p.offset.saturating_sub(p.limit),
-                p.limit,
-                p.limit
-            )
-        } else {
-            String::new()
-        };
+        let (prev, note) = pager(
+            &format!("/roots/{root_type_str}"),
+            p.offset,
+            p.limit,
+            roots.items.len(),
+            total,
+            "",
+        );
 
         let content = format!(
             "<p>Total: {total}</p>{prev}<table><tr><th>Object ID</th><th>Type</th></tr>{rows}</table>{note}"
@@ -1258,57 +1325,126 @@ pub async fn roots_by_type(
 
 // ── /threads — Thread list ────────────────────────────────────────────────────
 
-pub async fn threads(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let result = tokio::task::spawn_blocking(move || -> Result<String, HprofError> {
-        let q = &state.query;
+pub async fn threads(
+    State(state): State<Arc<AppState>>,
+    Query(p): Query<SearchParams>,
+) -> impl IntoResponse {
+    let result = tokio::task::spawn_blocking(move || -> Result<(StatusCode, String), HprofError> {
+        let matcher = match p.matcher() {
+            Ok(m) => m,
+            Err(e) => return Ok(search_error("Threads", "/threads", &p, &SearchMode::ALL, &e)),
+        };
+        let threads = match &matcher {
+            Some(m) => state.query.threads_matching(m)?,
+            None => state.query.threads()?,
+        };
         let mut rows = String::new();
-
-        // Primary: HPROF_START_THREAD records (present in most dumps)
-        let mut found_any = false;
-        for result in q.iter_threads() {
-            found_any = true;
-            let thread = result?;
-            let resolved = q.resolve_thread(&thread)?;
-            let ended = if q.was_thread_ended(thread.thread_serial) { "ended" } else { "running" };
+        for t in &threads {
+            let group = t.group.as_deref().map_or_else(
+                || "<span class=\"muted\">—</span>".to_owned(),
+                esc,
+            );
+            let status = if t.ended { "ended" } else { "running" };
             rows.push_str(&format!(
-                "<tr><td><a href=\"/thread/{}\">{}</a></td><td>{}</td><td>{}</td><td>{ended}</td></tr>",
-                thread.thread_serial,
-                esc(&resolved.thread_name),
-                esc(&resolved.thread_group_name),
-                thread.thread_serial,
+                "<tr><td><a href=\"/thread/{s}\">{}</a></td><td>{group}</td><td>{s}</td><td>{status}</td></tr>",
+                esc(&t.name),
+                s = t.serial,
             ));
         }
-
-        // Fallback: GC_ROOT_THREAD_OBJ sub-records (present in all dumps)
-        if !found_any {
-            let mut thread_objs: Vec<(u32, u64)> = Vec::new(); // (thread_serial, thread_obj_id)
-            for result in q.iter_objects() {
-                if let SubRecord::RootThreadObj(r) = result? {
-                    thread_objs.push((r.thread_serial, r.thread_object_id));
-                }
+        let heading = match &matcher {
+            Some(_) if threads.is_empty() => {
+                format!("<p class=\"muted\">No threads match “{}”.</p>", esc(p.text()))
             }
-            thread_objs.sort_by_key(|t| t.0);
-            for (serial, obj_id) in &thread_objs {
-                let name = thread_name_from_object(q, *obj_id);
-                rows.push_str(&format!(
-                    "<tr><td><a href=\"/thread/{serial}\">{}</a></td><td class=\"muted\">—</td><td>{serial}</td><td>—</td></tr>",
-                    esc(&name),
-                ));
-            }
-        }
-
+            Some(_) => format!("<p>{} threads match “{}”</p>", threads.len(), esc(p.text())),
+            None => String::new(),
+        };
         let content = format!(
-            "<table><tr><th>Thread name</th><th>Group</th><th>Serial</th><th>Status</th></tr>{rows}</table>"
+            "{form}{heading}<table><tr><th>Thread name</th><th>Group</th><th>Serial</th><th>Status</th></tr>{rows}</table>",
+            form = search_form("/threads", &p, &SearchMode::ALL, None, ""),
         );
-        Ok(page("Threads", &content))
+        Ok((StatusCode::OK, page("Threads", &content)))
     })
     .await;
+    rendered(result)
+}
 
-    match result {
-        Ok(Ok(html)) => ok(html).into_response(),
-        Ok(Err(e)) => internal(e).into_response(),
-        Err(e) => internal(e).into_response(),
-    }
+// ── /strings — Search java.lang.String contents ──────────────────────────────
+
+/// The modes `/strings` offers: no fuzzy, see [`crate::query::HeapQuery::search_strings`].
+const STRING_MODES: [SearchMode; 3] = [SearchMode::Contains, SearchMode::Exact, SearchMode::Regex];
+
+pub async fn strings(
+    State(state): State<Arc<AppState>>,
+    Query(p): Query<StringsParams>,
+) -> impl IntoResponse {
+    let result = tokio::task::spawn_blocking(move || -> Result<(StatusCode, String), HprofError> {
+        let q = &state.query;
+        let search = p.search();
+        let window = p.window();
+        let hidden = format!(
+            "<input type=\"hidden\" name=\"max_scan\" value=\"{}\">\
+             <input type=\"hidden\" name=\"max_results\" value=\"{}\">",
+            window.max_scan, window.max_results
+        );
+        let matcher = match search.matcher() {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                let content = format!(
+                    "{}<p class=\"muted\">Searches the text of java.lang.String objects, \
+                     {} strings per page.</p>",
+                    search_form("/strings", &search, &STRING_MODES, None, &hidden),
+                    window.max_scan
+                );
+                return Ok((StatusCode::OK, page("Strings", &content)));
+            }
+            Err(e) => return Ok(search_error("Strings", "/strings", &search, &STRING_MODES, &e)),
+        };
+        let found = match q.search_strings(&matcher, window) {
+            Ok(found) => found,
+            Err(e @ HprofError::InvalidArgument(_)) => {
+                return Ok(search_error("Strings", "/strings", &search, &STRING_MODES, &e));
+            }
+            Err(e) => return Err(e),
+        };
+
+        let mut rows = String::new();
+        for s in &found.items {
+            rows.push_str(&format!(
+                "<tr><td>{}</td><td class=\"num\">{}</td><td>{}</td></tr>",
+                obj_link(s.object_id),
+                s.length_chars,
+                esc(&s.preview),
+            ));
+        }
+        let table = if rows.is_empty() {
+            "<p class=\"muted\">No matches in this window.</p>".to_owned()
+        } else {
+            format!(
+                "<table><tr><th>String</th><th>Chars</th><th>Text (first {} chars)</th></tr>{rows}</table>",
+                crate::query::StringMatch::PREVIEW_CHARS
+            )
+        };
+        let more = match found.next_cursor {
+            Some(next) => format!(
+                "<p><a href=\"/strings?cursor={next}&max_scan={}&max_results={}{}\">Continue from string {next} →</a></p>",
+                window.max_scan,
+                window.max_results,
+                search.query_suffix()
+            ),
+            None => "<p class=\"muted\">End of strings.</p>".to_owned(),
+        };
+        let content = format!(
+            "{form}<p>{} match(es) in strings {}–{} of {}</p>{table}{more}",
+            found.items.len(),
+            window.cursor,
+            window.cursor + found.scanned,
+            found.total,
+            form = search_form("/strings", &search, &STRING_MODES, None, &hidden),
+        );
+        Ok((StatusCode::OK, page("Strings", &content)))
+    })
+    .await;
+    rendered(result)
 }
 
 // ── /thread/{serial} — Thread detail ─────────────────────────────────────────
@@ -1326,69 +1462,28 @@ pub async fn thread_detail(
 
     let result = tokio::task::spawn_blocking(move || -> Result<String, HprofError> {
         let q = &state.query;
-
-        // (thread_name, thread_group, thread_obj_id, trace_serial)
-        let thread_info: Option<(String, String, u64, u32)> =
-            if let Some(t) = q.find_thread(serial)? {
-                let resolved = q.resolve_thread(&t)?;
-                Some((
-                    resolved.thread_name,
-                    resolved.thread_group_name,
-                    t.thread_id,
-                    t.stack_trace_serial,
-                ))
-            } else {
-                // Fall back: scan GC_ROOT_THREAD_OBJ sub-records
-                let mut found = None;
-                for result in q.iter_objects() {
-                    if let SubRecord::RootThreadObj(r) = result?
-                        && r.thread_serial == serial
-                    {
-                        let name = thread_name_from_object(q, r.thread_object_id);
-                        found = Some((
-                            name,
-                            String::new(),
-                            r.thread_object_id,
-                            r.stack_trace_serial,
-                        ));
-                        break;
-                    }
-                }
-                found
-            };
-
-        let (thread_name, thread_group, thread_obj_id, trace_serial) = match thread_info {
-            Some(t) => t,
-            None => {
-                return Ok(page(
-                    "Thread not found",
-                    "<p>No thread with that serial.</p>",
-                ));
-            }
+        let Some(thread) = q.thread(serial)? else {
+            return Ok(page(
+                "Thread not found",
+                "<p>No thread with that serial.</p>",
+            ));
         };
-        let trace = q.find_trace(trace_serial)?;
 
         let mut frames_html = String::new();
-        if let Some(trace) = &trace {
-            let frames = q.trace_frames(trace)?;
-            for frame in &frames {
-                let rf = q.resolve_frame(frame)?;
-                let line = match &rf.line_number {
+        for frame in q.thread_stack(&thread)? {
+            frames_html.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                esc(&frame.method),
+                esc(&frame.source_file),
+                match frame.line {
                     crate::aux_query::LineNumber::Line(n) => n.to_string(),
                     crate::aux_query::LineNumber::Native => "native".to_owned(),
                     crate::aux_query::LineNumber::Compiled => "compiled".to_owned(),
                     crate::aux_query::LineNumber::Unknown
                     | crate::aux_query::LineNumber::NoInfo => "?".to_owned(),
-                };
-                frames_html.push_str(&format!(
-                    "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
-                    esc(&rf.method_name),
-                    esc(&rf.source_file),
-                    line
-                ));
-            }
+                }
+            ));
         }
-
         let frames_section = if frames_html.is_empty() {
             "<p class=\"muted\">No stack frames available.</p>".to_owned()
         } else {
@@ -1397,22 +1492,24 @@ pub async fn thread_detail(
             )
         };
 
+        let object = thread.object_id.map_or_else(String::new, obj_link);
+        let trace = thread
+            .stack_trace_serial
+            .map_or_else(String::new, |t| t.to_string());
         let content = format!(
             r#"<table>
 <tr><td>Thread name</td><td>{}</td></tr>
 <tr><td>Thread group</td><td>{}</td></tr>
 <tr><td>Serial</td><td>{serial}</td></tr>
-<tr><td>Thread object</td><td>{}</td></tr>
-<tr><td>Trace serial</td><td>{}</td></tr>
+<tr><td>Thread object</td><td>{object}</td></tr>
+<tr><td>Trace serial</td><td>{trace}</td></tr>
 </table>
 <h2>Stack trace</h2>
 {frames_section}"#,
-            esc(&thread_name),
-            esc(&thread_group),
-            obj_link(thread_obj_id),
-            trace_serial,
+            esc(&thread.name),
+            esc(thread.group.as_deref().unwrap_or("")),
         );
-        Ok(page(&format!("Thread: {thread_name}"), &content))
+        Ok(page(&format!("Thread: {}", thread.name), &content))
     })
     .await;
 
@@ -1426,39 +1523,41 @@ pub async fn thread_detail(
 // ── Helper: banner for resolved Java wrapper values ───────────────────────────
 
 /// If `jv` is a recognised wrapper type, returns an HTML callout showing the
-/// resolved value.  Returns an empty string for `JavaValue::Object` (unknown
-/// type) and `JavaValue::Null`.
-fn render_java_value_banner(jv: &crate::heap_query::JavaValue) -> String {
-    use crate::heap_query::JavaValue;
+/// resolved value.  Returns an empty string for `Value::Object` (unknown
+/// type) and `Value::Null`.
+fn render_java_value_banner(jv: &crate::resolved::Value) -> String {
+    use crate::resolved::Value as JavaValue;
 
     let text = match jv {
         JavaValue::String(id, s) => {
             // Truncate very long strings so the page stays readable.
             const MAX: usize = 2000;
             let raw_link = format!(" <a href=\"/object/{id:x}/raw-string\">raw</a>");
-            if s.len() > MAX {
+            let chars = s.chars().count();
+            if chars > MAX {
+                // Cut on a character boundary: `s` may hold multi-byte text.
+                let head: String = s.chars().take(MAX).collect();
                 format!(
-                    "\"{}\" <span class=\"muted\">… ({} chars total)</span>{raw_link}",
-                    esc(&s[..MAX]),
-                    s.chars().count()
+                    "\"{}\" <span class=\"muted\">… ({chars} chars total)</span>{raw_link}",
+                    esc(&head),
                 )
             } else {
                 format!("\"{}\"  {raw_link}", esc(s))
             }
         }
-        JavaValue::Boolean(_, b) => b.to_string(),
-        JavaValue::Byte(_, b) => format!("{b}"),
-        JavaValue::Short(_, s) => format!("{s}"),
-        JavaValue::Character(_, c) => {
+        JavaValue::BoxedBoolean(_, b) => b.to_string(),
+        JavaValue::BoxedByte(_, b) => format!("{b}"),
+        JavaValue::BoxedShort(_, s) => format!("{s}"),
+        JavaValue::BoxedCharacter(_, c) => {
             let ch = char::from_u32(u32::from(*c)).unwrap_or('?');
             format!("'{}' (U+{:04X})", esc(&ch.to_string()), c)
         }
-        JavaValue::Integer(_, i) => format!("{i}"),
-        JavaValue::Long(_, l) => format!("{l}L"),
-        JavaValue::Float(_, f) => format!("{f}f"),
-        JavaValue::Double(_, d) => format!("{d}"),
-        // Not a recognised wrapper — no banner.
-        JavaValue::Object(_) | JavaValue::Null => return String::new(),
+        JavaValue::BoxedInt(_, i) => format!("{i}"),
+        JavaValue::BoxedLong(_, l) => format!("{l}L"),
+        JavaValue::BoxedFloat(_, f) => format!("{f}f"),
+        JavaValue::BoxedDouble(_, d) => format!("{d}"),
+        // Not a recognised wrapper (or a bare primitive) — no banner.
+        _ => return String::new(),
     };
 
     format!(
@@ -1476,17 +1575,17 @@ fn render_field_value(v: &FieldValue, q: &crate::query::HeapQuery) -> String {
             // Try to resolve as a known wrapper type
             let resolved = q.resolve_value(*id).ok();
             match resolved {
-                Some(crate::heap_query::JavaValue::String(sid, s)) => {
+                Some(crate::resolved::Value::String(sid, s)) => {
                     format!(
                         "{} <span class=\"muted\">\"{}\"</span> <a href=\"/object/{sid:x}/raw-string\">raw</a>",
                         obj_link(sid),
                         esc(&s)
                     )
                 }
-                Some(crate::heap_query::JavaValue::Integer(oid, n)) => {
+                Some(crate::resolved::Value::BoxedInt(oid, n)) => {
                     format!("{} <span class=\"muted\">= {n}</span>", obj_link(oid))
                 }
-                Some(crate::heap_query::JavaValue::Long(oid, n)) => {
+                Some(crate::resolved::Value::BoxedLong(oid, n)) => {
                     format!("{} <span class=\"muted\">= {n}L</span>", obj_link(oid))
                 }
                 _ => obj_link(*id),
@@ -1512,203 +1611,35 @@ fn render_field_value(v: &FieldValue, q: &crate::query::HeapQuery) -> String {
 /// For Object-typed fields with a non-null reference, looks up the actual
 /// runtime class of the referenced object (one O(log n) binary search).
 /// For null references or primitives, falls back to the static type name.
-fn resolve_field_type(type_code: u8, value: &FieldValue, q: &crate::query::HeapQuery) -> String {
-    if type_code != 2 {
-        return field_type_name(type_code).to_owned();
+fn resolve_field_type(ty: BasicType, value: &FieldValue, q: &crate::query::HeapQuery) -> String {
+    if ty != BasicType::Object {
+        return ty.java_name().to_owned();
     }
     let id = match value {
         FieldValue::Object(id) if *id != 0 => *id,
         _ => return "Object".to_owned(),
     };
     q.object_type_name(id)
-        .unwrap_or_else(|_| "Object".to_owned())
 }
 
-// ── Helper: thread name from Thread object ────────────────────────────────────
+// ── Helper: primitive array text ──────────────────────────────────────────────
 
-/// Try to resolve a human-readable thread name from a `java.lang.Thread`
-/// instance by following its `name` field to the backing String/char[].
-/// Falls back to the hex object ID if the name cannot be resolved.
-fn thread_name_from_object(q: &crate::query::HeapQuery, thread_obj_id: u64) -> String {
-    let inst = match q.find_instance(thread_obj_id) {
-        Ok(Some(SubRecord::InstanceDump(inst))) => inst,
-        _ => return format!("0x{thread_obj_id:x}"),
-    };
-    let fields = match q.instance_fields(&inst) {
-        Ok(f) => f,
-        Err(_) => return format!("0x{thread_obj_id:x}"),
-    };
-    let name_ref = fields
-        .iter()
-        .find(|f| f.name == "name" && f.field_type == 2)
-        .and_then(|f| match &f.value {
-            FieldValue::Object(id) if *id != 0 => Some(*id),
-            _ => None,
-        });
-    if let Some(name_id) = name_ref
-        && let Ok(crate::heap_query::JavaValue::String(_, s)) = q.resolve_value(name_id)
-    {
-        return s;
-    }
-    format!("0x{thread_obj_id:x}")
-}
-
-// ── Helper: decode primitive array bytes → display string ────────────────────
-
-/// Decode big-endian primitive array bytes into a human-readable `[v1, v2, …]`
-/// string.  Shows up to `MAX_SHOW` elements; appends `…` if truncated.
-fn decode_prim_array(element_type: u8, data: &[u8], num_elements: u32) -> String {
+/// `[v1, v2, …]` for the first `MAX_SHOW` elements, with a "… (n more)" tail.
+fn prim_array_preview(q: &crate::query::HeapQuery, array_id: u64) -> Result<String, HprofError> {
     const MAX_SHOW: usize = 256;
-
-    macro_rules! decode_elements {
-        ($size:expr, $fmt:expr, $conv:expr) => {{
-            let shown = (num_elements as usize).min(MAX_SHOW);
-            let mut parts: Vec<String> = data
-                .chunks_exact($size)
-                .take(shown)
-                .map(|chunk| {
-                    let arr: [u8; $size] = chunk.try_into().unwrap_or([0u8; $size]);
-                    format!($fmt, $conv(arr))
-                })
-                .collect();
-            if num_elements as usize > MAX_SHOW {
-                parts.push(format!("… ({} more)", num_elements as usize - MAX_SHOW));
-            }
-            format!("[{}]", parts.join(", "))
-        }};
+    let Some(w) = q.prim_array(array_id, Page::first(MAX_SHOW))? else {
+        return Ok(String::new());
+    };
+    let mut parts = w.elements.to_strings(true);
+    if w.has_more() {
+        parts.push(format!("… ({} more)", w.total - w.elements.len()));
     }
-
-    match element_type {
-        4 /* boolean */ => {
-            let shown = (num_elements as usize).min(MAX_SHOW);
-            let mut parts: Vec<String> = data
-                .iter()
-                .take(shown)
-                .map(|b| if *b != 0 { "true".to_owned() } else { "false".to_owned() })
-                .collect();
-            if num_elements as usize > MAX_SHOW {
-                parts.push(format!("… ({} more)", num_elements as usize - MAX_SHOW));
-            }
-            format!("[{}]", parts.join(", "))
-        }
-        5 /* char */ => {
-            let shown = (num_elements as usize).min(MAX_SHOW);
-            let mut parts: Vec<String> = data
-                .chunks_exact(2)
-                .take(shown)
-                .map(|c| {
-                    let cp = u16::from_be_bytes([c[0], c[1]]);
-                    let ch = char::from_u32(u32::from(cp)).unwrap_or('\u{FFFD}');
-                    format!("'{}'", ch)
-                })
-                .collect();
-            if num_elements as usize > MAX_SHOW {
-                parts.push(format!("… ({} more)", num_elements as usize - MAX_SHOW));
-            }
-            format!("[{}]", parts.join(", "))
-        }
-        6  /* float  */ => decode_elements!(4, "{}", |a: [u8; 4]| f32::from_be_bytes(a)),
-        7  /* double */ => decode_elements!(8, "{}", |a: [u8; 8]| f64::from_be_bytes(a)),
-        8  /* byte   */ => {
-            let shown = (num_elements as usize).min(MAX_SHOW);
-            let mut parts: Vec<String> = data
-                .iter()
-                .take(shown)
-                .map(|b| format!("{}", *b as i8))
-                .collect();
-            if num_elements as usize > MAX_SHOW {
-                parts.push(format!("… ({} more)", num_elements as usize - MAX_SHOW));
-            }
-            format!("[{}]", parts.join(", "))
-        }
-        9  /* short  */ => decode_elements!(2, "{}", |a: [u8; 2]| i16::from_be_bytes(a)),
-        10 /* int    */ => decode_elements!(4, "{}", |a: [u8; 4]| i32::from_be_bytes(a)),
-        11 /* long   */ => decode_elements!(8, "{}", |a: [u8; 8]| i64::from_be_bytes(a)),
-        _ => {
-            data.iter()
-                .take(64)
-                .map(|b| format!("{b:02x}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        }
-    }
+    Ok(format!("[{}]", parts.join(", ")))
 }
 
-// ── Helper: decode primitive array bytes → full comma-delimited string ────────
+// ── Helper: GC root type labels ───────────────────────────────────────────────
 
-/// Decode big-endian primitive array bytes into a comma-delimited string with
-/// no truncation, suitable for serving as raw text.
-fn decode_prim_array_full(element_type: u8, data: &[u8], num_elements: u32) -> String {
-    macro_rules! decode_all {
-        ($size:expr, $fmt:expr, $conv:expr) => {{
-            data.chunks_exact($size)
-                .take(num_elements as usize)
-                .map(|chunk| {
-                    let arr: [u8; $size] = chunk.try_into().unwrap_or([0u8; $size]);
-                    format!($fmt, $conv(arr))
-                })
-                .collect::<Vec<_>>()
-                .join(",")
-        }};
-    }
-
-    match element_type {
-        4 /* boolean */ => data
-            .iter()
-            .take(num_elements as usize)
-            .map(|b| if *b != 0 { "true" } else { "false" })
-            .collect::<Vec<_>>()
-            .join(","),
-        5 /* char */ => data
-            .chunks_exact(2)
-            .take(num_elements as usize)
-            .map(|c| {
-                let cp = u16::from_be_bytes([c[0], c[1]]);
-                char::from_u32(u32::from(cp))
-                    .unwrap_or('\u{FFFD}')
-                    .to_string()
-            })
-            .collect::<Vec<_>>()
-            .join(","),
-        6  /* float  */ => decode_all!(4, "{}", |a: [u8; 4]| f32::from_be_bytes(a)),
-        7  /* double */ => decode_all!(8, "{}", |a: [u8; 8]| f64::from_be_bytes(a)),
-        8  /* byte   */ => data
-            .iter()
-            .take(num_elements as usize)
-            .map(|b| format!("{}", *b as i8))
-            .collect::<Vec<_>>()
-            .join(","),
-        9  /* short  */ => decode_all!(2, "{}", |a: [u8; 2]| i16::from_be_bytes(a)),
-        10 /* int    */ => decode_all!(4, "{}", |a: [u8; 4]| i32::from_be_bytes(a)),
-        11 /* long   */ => decode_all!(8, "{}", |a: [u8; 8]| i64::from_be_bytes(a)),
-        _ => data
-            .iter()
-            .take(num_elements as usize)
-            .map(|b| format!("{b:02x}"))
-            .collect::<Vec<_>>()
-            .join(","),
-    }
-}
-
-// ── Helper: hprof type code → display name ────────────────────────────────────
-
-fn field_type_name(type_code: u8) -> &'static str {
-    match type_code {
-        2 => "Object",
-        4 => "boolean",
-        5 => "char",
-        6 => "float",
-        7 => "double",
-        8 => "byte",
-        9 => "short",
-        10 => "int",
-        11 => "long",
-        _ => "?",
-    }
-}
-
-// ── Helper: GC root type labels / slugs ──────────────────────────────────────
-
+/// Display label for a GC root kind (URLs use [`GcRootType::slug`]).
 pub(crate) fn gc_root_label(rt: GcRootType) -> &'static str {
     match rt {
         GcRootType::Unknown => "Unknown",
@@ -1721,75 +1652,6 @@ pub(crate) fn gc_root_label(rt: GcRootType) -> &'static str {
         GcRootType::MonitorUsed => "Monitor used",
         GcRootType::ThreadObject => "Thread object",
     }
-}
-
-pub(crate) fn gc_root_slug(rt: GcRootType) -> &'static str {
-    match rt {
-        GcRootType::Unknown => "unknown",
-        GcRootType::JniGlobal => "jni_global",
-        GcRootType::JniLocal => "jni_local",
-        GcRootType::JavaFrame => "java_frame",
-        GcRootType::NativeStack => "native_stack",
-        GcRootType::StickyClass => "sticky_class",
-        GcRootType::ThreadBlock => "thread_block",
-        GcRootType::MonitorUsed => "monitor_used",
-        GcRootType::ThreadObject => "thread_object",
-    }
-}
-
-pub(crate) fn parse_root_type(s: &str) -> Option<GcRootType> {
-    match s {
-        "unknown" => Some(GcRootType::Unknown),
-        "jni_global" => Some(GcRootType::JniGlobal),
-        "jni_local" => Some(GcRootType::JniLocal),
-        "java_frame" => Some(GcRootType::JavaFrame),
-        "native_stack" => Some(GcRootType::NativeStack),
-        "sticky_class" => Some(GcRootType::StickyClass),
-        "thread_block" => Some(GcRootType::ThreadBlock),
-        "monitor_used" => Some(GcRootType::MonitorUsed),
-        "thread_object" => Some(GcRootType::ThreadObject),
-        _ => None,
-    }
-}
-
-// ── Diff navigation helpers ───────────────────────────────────────────────────
-
-/// Get the synthetic class-bucket key for a `DiffEntry` by parsing the record.
-fn diff_entry_class_key(entry: &DiffEntry, query: &crate::query::HeapQuery) -> Option<u64> {
-    let sub = SubIndexEntry {
-        tag: entry.tag,
-        object_id: entry.object_id,
-        position: entry.position,
-    };
-    let record = query.parse_entry(&sub).ok()?;
-    match record {
-        SubRecord::InstanceDump(inst) => Some(inst.class_id),
-        SubRecord::ClassDump(cd) => Some(cd.class_id),
-        SubRecord::ObjArrayDump(arr) => Some(SYNTHETIC_OBJ_ARRAY | arr.element_class_id),
-        SubRecord::PrimArrayDump(arr) => Some(SYNTHETIC_PRIM_ARRAY | u64::from(arr.element_type)),
-        _ => None,
-    }
-}
-
-/// Resolve a display class name for a class-bucket key.
-fn diff_class_name(class_key: u64, query: &crate::query::HeapQuery) -> String {
-    if (class_key & SYNTHETIC_PRIM_ARRAY) == SYNTHETIC_PRIM_ARRAY {
-        return format!("{}[]", prim_type_name((class_key & 0xFF) as u8));
-    }
-    if class_key & SYNTHETIC_OBJ_ARRAY != 0 {
-        let elem_id = class_key & !SYNTHETIC_OBJ_ARRAY;
-        let elem = query
-            .class_name(elem_id)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| format!("0x{elem_id:x}"));
-        return format!("{elem}[]");
-    }
-    query
-        .class_name(class_key)
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| format!("0x{class_key:x}"))
 }
 
 // ── Helper: object fingerprint for address-reuse detection ───────────────────
@@ -1824,7 +1686,7 @@ pub async fn diff_object_detail(
     };
 
     let result = tokio::task::spawn_blocking(move || -> Result<String, HprofError> {
-        let q = match state.diff_query.as_ref() {
+        let q = match state.diff_query() {
             Some(q) => q,
             None => {
                 return Ok(page(
@@ -1833,7 +1695,7 @@ pub async fn diff_object_detail(
                 ));
             }
         };
-        let reuse_warning = match (state.query.find(object_id)?, q.find(object_id)?) {
+        let reuse_warning = match (state.query.object(object_id)?, q.object(object_id)?) {
             (Some(r1), Some(r2)) if object_fingerprint(&r1) != object_fingerprint(&r2) => {
                 ADDRESS_REUSE_WARNING
             }
@@ -1854,83 +1716,72 @@ pub async fn diff_object_detail(
     }
 }
 
-// ── /diff/removed — removed instances list ────────────────────────────────────
+// ── /diff/removed, /diff/added, /diff/common — object lists ──────────────────
+
+/// Shared paging chrome for the three diff list pages.
+#[allow(clippy::too_many_arguments)]
+fn diff_list_page(
+    route: &str,
+    title: &str,
+    heading: &str,
+    columns: &str,
+    rows: &str,
+    total: usize,
+    p: &DiffListParams,
+    extra_params: &str,
+) -> String {
+    let offset = p.offset.min(total);
+    let shown = p.limit.min(total.saturating_sub(offset));
+    let (prev, next) = pager(route, offset, p.limit, shown, total, extra_params);
+    let content = format!(
+        "<style>.removed{{color:#cc0000}}</style>\
+         <p>{total} {heading}; showing {offset}–{}</p>\
+         {prev}<table>{columns}{rows}</table>{next}",
+        offset + shown,
+    );
+    page(title, &content)
+}
 
 pub async fn diff_removed(
     State(state): State<Arc<AppState>>,
     Query(p): Query<DiffListParams>,
 ) -> impl IntoResponse {
     let result = tokio::task::spawn_blocking(move || -> Result<String, HprofError> {
-        let paths = match state.diff_index_paths.as_ref() {
-            Some(p) => p,
-            None => return Ok(page("Diff: Removed", "<p>No diff configured.</p>")),
+        let Some(diff) = state.diff.as_ref().map(|d| &d.heap) else {
+            return Ok(page("Diff: Removed", "<p>No diff configured.</p>"));
         };
-        let removed_mmap = paths.removed.open_mmap()?;
-        let reader = DiffEntryReader::from_ref(removed_mmap.as_ref())?;
-        let q = &state.query;
-        let class_filter = p.class.as_deref().and_then(parse_hex_id);
-
-        let mut entries: Vec<(u64, String)> = Vec::new(); // (object_id, class_name)
-        for entry in reader.iter() {
-            let class_key = diff_entry_class_key(&entry, q);
-            if let Some(filter) = class_filter
-                && class_key != Some(filter)
-            {
-                continue;
-            }
-            let class_name = class_key.map(|k| diff_class_name(k, q)).unwrap_or_default();
-            entries.push((entry.object_id, class_name));
-        }
-
-        let total = entries.len();
-        let offset = p.offset.min(total);
-        let shown = p.limit.min(total.saturating_sub(offset));
+        let class = p
+            .class
+            .as_deref()
+            .and_then(parse_hex_id)
+            .map(ClassKey::from_u64);
+        let list = diff.removed(class, Page::new(p.offset, p.limit))?;
 
         let mut rows = String::new();
-        for (oid, class_name) in entries.iter().skip(offset).take(shown) {
+        for o in &list.items {
             rows.push_str(&format!(
                 "<tr><td>{}</td><td>{}</td></tr>",
-                obj_link(*oid),
-                esc(class_name),
+                obj_link(o.object_id),
+                esc(&o.class_name),
             ));
         }
-
-        let class_param = class_filter
-            .map(|c| format!("&class={c:x}"))
+        let class_param = class
+            .map(|c| format!("&class={:x}", c.to_u64()))
             .unwrap_or_default();
-        let title = class_filter
-            .map(|ck| format!("Removed: {}", diff_class_name(ck, q)))
-            .unwrap_or_else(|| "Removed Instances".to_owned());
-
-        let prev = if offset > 0 {
-            format!(
-                "<p><a href=\"/diff/removed?offset={}&limit={}{class_param}\">← Prev {}</a></p>",
-                offset.saturating_sub(p.limit),
-                p.limit,
-                p.limit
-            )
-        } else {
-            String::new()
-        };
-        let next = if offset + shown < total {
-            format!(
-                "<p><a href=\"/diff/removed?offset={}&limit={}{class_param}\">Next {} →</a></p>",
-                offset + p.limit,
-                p.limit,
-                p.limit
-            )
-        } else {
-            String::new()
-        };
-
-        let content = format!(
-            "<p>{total} removed; showing {offset}–{}</p>\
-             {prev}\
-             <table><tr><th>Object (dump 1)</th><th>Class</th></tr>{rows}</table>\
-             {next}",
-            offset + shown,
+        let title = class.map_or_else(
+            || "Removed Instances".to_owned(),
+            |ck| format!("Removed: {}", diff.key_name(ck)),
         );
-        Ok(page(&title, &content))
+        Ok(diff_list_page(
+            "/diff/removed",
+            &title,
+            "removed",
+            "<tr><th>Object (dump 1)</th><th>Class</th></tr>",
+            &rows,
+            list.total,
+            &p,
+            &class_param,
+        ))
     })
     .await;
 
@@ -1940,89 +1791,48 @@ pub async fn diff_removed(
         Err(e) => internal(e).into_response(),
     }
 }
-
-// ── /diff/added — added instances list ───────────────────────────────────────
 
 pub async fn diff_added(
     State(state): State<Arc<AppState>>,
     Query(p): Query<DiffListParams>,
 ) -> impl IntoResponse {
     let result = tokio::task::spawn_blocking(move || -> Result<String, HprofError> {
-        let paths = match state.diff_index_paths.as_ref() {
-            Some(p) => p,
-            None => return Ok(page("Diff: Added", "<p>No diff configured.</p>")),
+        let Some(diff) = state.diff.as_ref().map(|d| &d.heap) else {
+            return Ok(page("Diff: Added", "<p>No diff configured.</p>"));
         };
-        let added_mmap = paths.added.open_mmap()?;
-        let reader = DiffEntryReader::from_ref(added_mmap.as_ref())?;
-        // Added objects live in dump 2; use diff_query for class resolution.
-        let q = match state.diff_query.as_ref() {
-            Some(q) => q,
-            None => return Ok(page("Diff: Added", "<p>No diff configured.</p>")),
-        };
-        let class_filter = p.class.as_deref().and_then(parse_hex_id);
-
-        let mut entries: Vec<(u64, String)> = Vec::new();
-        for entry in reader.iter() {
-            let class_key = diff_entry_class_key(&entry, q);
-            if let Some(filter) = class_filter
-                && class_key != Some(filter)
-            {
-                continue;
-            }
-            let class_name = class_key.map(|k| diff_class_name(k, q)).unwrap_or_default();
-            entries.push((entry.object_id, class_name));
-        }
-
-        let total = entries.len();
-        let offset = p.offset.min(total);
-        let shown = p.limit.min(total.saturating_sub(offset));
+        let class = p
+            .class
+            .as_deref()
+            .and_then(parse_hex_id)
+            .map(ClassKey::from_u64);
+        let list = diff.added(class, Page::new(p.offset, p.limit))?;
 
         let mut rows = String::new();
-        for (oid, class_name) in entries.iter().skip(offset).take(shown) {
-            // Added objects are in dump 2, so link to /diff/object/:id
-            let link = format!("<a href=\"/diff/object/{oid:x}\">0x{oid:x}</a>");
+        for o in &list.items {
             rows.push_str(&format!(
-                "<tr><td>{link}</td><td>{}</td></tr>",
-                esc(class_name),
+                "<tr><td><a href=\"/diff/object/{:x}\">0x{:x}</a></td><td>{}</td></tr>",
+                o.object_id,
+                o.object_id,
+                esc(&o.class_name),
             ));
         }
-
-        let class_param = class_filter
-            .map(|c| format!("&class={c:x}"))
+        let class_param = class
+            .map(|c| format!("&class={:x}", c.to_u64()))
             .unwrap_or_default();
-        let title = class_filter
-            .map(|ck| format!("Added: {}", diff_class_name(ck, q)))
-            .unwrap_or_else(|| "Added Instances".to_owned());
-
-        let prev = if offset > 0 {
-            format!(
-                "<p><a href=\"/diff/added?offset={}&limit={}{class_param}\">← Prev {}</a></p>",
-                offset.saturating_sub(p.limit),
-                p.limit,
-                p.limit
-            )
-        } else {
-            String::new()
-        };
-        let next = if offset + shown < total {
-            format!(
-                "<p><a href=\"/diff/added?offset={}&limit={}{class_param}\">Next {} →</a></p>",
-                offset + p.limit,
-                p.limit,
-                p.limit
-            )
-        } else {
-            String::new()
-        };
-
-        let content = format!(
-            "<p>{total} added; showing {offset}–{}</p>\
-             {prev}\
-             <table><tr><th>Object (dump 2)</th><th>Class</th></tr>{rows}</table>\
-             {next}",
-            offset + shown,
+        let title = class.map_or_else(
+            || "Added Instances".to_owned(),
+            |ck| format!("Added: {}", diff.key_name(ck)),
         );
-        Ok(page(&title, &content))
+        Ok(diff_list_page(
+            "/diff/added",
+            &title,
+            "added",
+            "<tr><th>Object (dump 2)</th><th>Class</th></tr>",
+            &rows,
+            list.total,
+            &p,
+            &class_param,
+        ))
     })
     .await;
 
@@ -2033,124 +1843,60 @@ pub async fn diff_added(
     }
 }
 
-// ── /diff/common — common instances list ─────────────────────────────────────
-
 pub async fn diff_common(
     State(state): State<Arc<AppState>>,
     Query(p): Query<DiffListParams>,
 ) -> impl IntoResponse {
     let result = tokio::task::spawn_blocking(move || -> Result<String, HprofError> {
-        let paths = match state.diff_index_paths.as_ref() {
-            Some(p) => p,
-            None => return Ok(page("Diff: Common", "<p>No diff configured.</p>")),
+        let Some(diff) = state.diff.as_ref().map(|d| &d.heap) else {
+            return Ok(page("Diff: Common", "<p>No diff configured.</p>"));
         };
-        let common_mmap = paths.common.open_mmap()?;
-        let reader = CommonEntryReader::from_ref(common_mmap.as_ref())?;
-        let q = &state.query;
-        let class_filter = p.class.as_deref().and_then(parse_hex_id);
+        let class = p.class.as_deref().and_then(parse_hex_id).map(ClassKey::from_u64);
         // changed filter: "0" = unchanged only, "1" = changed only, absent = all
-        let changed_filter: Option<bool> = match p.changed.as_deref() {
+        let changed: Option<bool> = match p.changed.as_deref() {
             Some("0") => Some(false),
             Some("1") => Some(true),
             _ => None,
         };
-
-        // For common entries we need DiffEntry-compatible lookup; use the object_id
-        // and position1 (dump 1 position) for class resolution.
-        let mut entries: Vec<(u64, bool, String)> = Vec::new(); // (object_id, changed, class_name)
-        for entry in reader.iter() {
-            if let Some(cf) = changed_filter
-                && entry.changed != cf
-            {
-                continue;
-            }
-            let stub = DiffEntry {
-                tag: entry.tag,
-                object_id: entry.object_id,
-                position: entry.position1,
-            };
-            let class_key = diff_entry_class_key(&stub, q);
-            if let Some(filter) = class_filter
-                && class_key != Some(filter)
-            {
-                continue;
-            }
-            let class_name = class_key.map(|k| diff_class_name(k, q)).unwrap_or_default();
-            entries.push((entry.object_id, entry.changed, class_name));
-        }
-
-        let total = entries.len();
-        let offset = p.offset.min(total);
-        let shown = p.limit.min(total.saturating_sub(offset));
+        let list = diff.common(changed, class, Page::new(p.offset, p.limit))?;
 
         let mut rows = String::new();
-        for (oid, changed, class_name) in entries.iter().skip(offset).take(shown) {
-            let changed_badge = if *changed {
+        for o in &list.items {
+            let is_changed = diff.object_changed(o.object_id).unwrap_or(false);
+            let badge = if is_changed {
                 "<span class=\"removed\">changed</span>"
             } else {
                 "<span class=\"muted\">unchanged</span>"
             };
-            let dump2_link = format!("<a href=\"/diff/object/{oid:x}\">dump 2</a>");
             rows.push_str(&format!(
-                "<tr><td>{}</td><td>{dump2_link}</td><td>{changed_badge}</td><td>{}</td></tr>",
-                obj_link(*oid),
-                esc(class_name),
+                "<tr><td>{}</td><td><a href=\"/diff/object/{:x}\">dump 2</a></td><td>{badge}</td><td>{}</td></tr>",
+                obj_link(o.object_id),
+                o.object_id,
+                esc(&o.class_name),
             ));
         }
 
-        let changed_param = p
-            .changed
-            .as_deref()
-            .map(|v| format!("&changed={v}"))
-            .unwrap_or_default();
-        let class_param = class_filter
-            .map(|c| format!("&class={c:x}"))
-            .unwrap_or_default();
+        let changed_param = p.changed.as_deref().map(|v| format!("&changed={v}")).unwrap_or_default();
+        let class_param = class.map(|c| format!("&class={:x}", c.to_u64())).unwrap_or_default();
         let extra_params = format!("{changed_param}{class_param}");
-
-        let filter_desc = match (changed_filter, class_filter) {
+        let filter_desc = match (changed, class) {
             (Some(true), None) => " (changed only)".to_owned(),
             (Some(false), None) => " (unchanged only)".to_owned(),
-            (None, Some(ck)) => format!(" — {}", diff_class_name(ck, q)),
-            (Some(true), Some(ck)) => format!(" — {} (changed)", diff_class_name(ck, q)),
-            (Some(false), Some(ck)) => format!(" — {} (unchanged)", diff_class_name(ck, q)),
+            (None, Some(ck)) => format!(" — {}", diff.key_name(ck)),
+            (Some(true), Some(ck)) => format!(" — {} (changed)", diff.key_name(ck)),
+            (Some(false), Some(ck)) => format!(" — {} (unchanged)", diff.key_name(ck)),
             (None, None) => String::new(),
         };
-        let title = format!("Common Instances{filter_desc}");
-
-        let prev = if offset > 0 {
-            format!(
-                "<p><a href=\"/diff/common?offset={}&limit={}{extra_params}\">← Prev {}</a></p>",
-                offset.saturating_sub(p.limit),
-                p.limit,
-                p.limit
-            )
-        } else {
-            String::new()
-        };
-        let next = if offset + shown < total {
-            format!(
-                "<p><a href=\"/diff/common?offset={}&limit={}{extra_params}\">Next {} →</a></p>",
-                offset + p.limit,
-                p.limit,
-                p.limit
-            )
-        } else {
-            String::new()
-        };
-
-        let content = format!(
-            "<style>.removed{{color:#cc0000}}</style>\
-             <p>{total} entries{filter_desc}; showing {offset}–{}</p>\
-             {prev}\
-             <table>\
-             <tr><th>Object (dump 1)</th><th>Dump 2</th><th>Status</th><th>Class</th></tr>\
-             {rows}\
-             </table>\
-             {next}",
-            offset + shown,
-        );
-        Ok(page(&title, &content))
+        Ok(diff_list_page(
+            "/diff/common",
+            &format!("Common Instances{filter_desc}"),
+            &format!("entries{filter_desc}"),
+            "<tr><th>Object (dump 1)</th><th>Dump 2</th><th>Status</th><th>Class</th></tr>",
+            &rows,
+            list.total,
+            &p,
+            &extra_params,
+        ))
     })
     .await;
 
@@ -2165,7 +1911,7 @@ pub async fn diff_common(
 
 pub async fn diff_summary(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let result = tokio::task::spawn_blocking(move || -> Result<String, HprofError> {
-        let diff_path = match state.diff_path.as_ref() {
+        let diff_path = match state.diff_path() {
             Some(p) => p.display().to_string(),
             None => {
                 let content = r#"<p>No second heap dump configured.</p>
@@ -2174,7 +1920,7 @@ pub async fn diff_summary(State(state): State<Arc<AppState>>) -> impl IntoRespon
             }
         };
 
-        let summary = match state.diff() {
+        let summary = match state.diff_summary() {
             Some(r) => r?,
             None => {
                 return Ok(page(
@@ -2188,7 +1934,7 @@ pub async fn diff_summary(State(state): State<Arc<AppState>>) -> impl IntoRespon
 
         let mut rows = String::new();
         for entry in &summary.by_class {
-            let cid = entry.class_id;
+            let cid = entry.key.to_u64();
             let change = entry.net_change();
             let change_class = if change > 0 {
                 "added"
@@ -2293,20 +2039,15 @@ pub async fn retained_histogram(
             return Ok(page("Retained Heap", content));
         }
 
-        // Collect all (retained_bytes, object_id) pairs and sort descending.
-        let iter = q.iter_retained().ok_or(HprofError::InvalidIndexFile)?;
-        let mut entries: Vec<(u64, u64)> = iter.map(|(id, ret)| (ret, id)).collect();
-        entries.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-
-        let total_count = entries.len();
-        let page_entries: Vec<(u64, u64)> =
-            entries.into_iter().skip(p.offset).take(p.limit).collect();
+        // Served from the pre-sorted retained_by_size index: O(page).
+        let ranked = q
+            .retained_top(Page::new(p.offset, p.limit))
+            .ok_or(HprofError::NotIndexed("retained heap"))?;
+        let total_count = ranked.total;
 
         let mut rows = String::new();
-        for (retained_bytes, object_id) in &page_entries {
-            let type_name = q
-                .object_type_name(*object_id)
-                .unwrap_or_else(|_| "?".to_owned());
+        for (object_id, retained_bytes) in &ranked.items {
+            let type_name = q.object_type_name(*object_id);
             let dom_cell = match q.dominator_of(*object_id) {
                 None | Some(0) => "<span class=\"muted\">(root)</span>".to_owned(),
                 Some(dom_id) => obj_link(dom_id),
@@ -2319,27 +2060,14 @@ pub async fn retained_histogram(
             ));
         }
 
-        let note = if total_count > p.offset + p.limit {
-            format!(
-                "<p><a href=\"/retained?offset={}&limit={}\">Next {} →</a></p>",
-                p.offset + p.limit,
-                p.limit,
-                p.limit
-            )
-        } else {
-            String::new()
-        };
-
-        let prev = if p.offset > 0 {
-            format!(
-                "<p><a href=\"/retained?offset={}&limit={}\">← Prev {}</a></p>",
-                p.offset.saturating_sub(p.limit),
-                p.limit,
-                p.limit
-            )
-        } else {
-            String::new()
-        };
+        let (prev, note) = pager(
+            "/retained",
+            p.offset,
+            p.limit,
+            ranked.items.len(),
+            total_count,
+            "",
+        );
 
         let content = format!(
             r#"<p>{total_count} reachable objects with retained size data</p>
